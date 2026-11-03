@@ -1,0 +1,15 @@
+{
+  "issue": 7,
+  "feature": "S-1",
+  "kind": "feature",
+  "declared_model": "synthetic-model",
+  "branch": "run-issue-7",
+  "base_sha": "0000000000000000000000000000000000000000",
+  "phase": "unadmitted",
+  "time_limit": "60m",
+  "operation_limit": 40,
+  "supervision": {
+    "supervision_turns": "not enforced; operator supervision only",
+    "supervision_writes": "not enforced; the factory never claims file-write counts"
+  }
+}

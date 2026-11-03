@@ -1,0 +1,17 @@
+#!/bin/sh
+set -eu
+case "$0" in
+    */*) script=$0 ;;
+    *) script=$(command -v -- "$0" 2>/dev/null || printf '%s' "$0") ;;
+esac
+if command -v readlink >/dev/null 2>&1; then
+    resolved=$(readlink -f -- "$script" 2>/dev/null || true)
+    if [ -n "$resolved" ]; then
+        script=$resolved
+    fi
+fi
+root=$(CDPATH= cd -- "$(dirname -- "$script")/.." && pwd)
+PYTHONPATH="$root${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONPATH
+export PYTHONDONTWRITEBYTECODE=1
+exec python3 -P -m factory "$@"
