@@ -49,8 +49,14 @@ class GateConfig:
         paths = data.get("paths", [])
         if not isinstance(argv, list) or not all(isinstance(item, str) and item for item in argv):
             raise CorruptState("gate argv must be a list of non-empty strings")
-        if not isinstance(paths, list) or not all(isinstance(item, str) and item.strip() for item in paths):
-            raise CorruptState("gate paths must be a list of non-empty strings")
+        if argv and not argv[0].strip():
+            raise CorruptState("gate argv[0] must not be blank")
+        if not isinstance(paths, list) or not all(isinstance(item, str) for item in paths):
+            raise CorruptState("gate paths must be a list of strings")
+        for item in paths:
+            issue = protected_entry_issue(item)
+            if issue is not None:
+                raise CorruptState(f"gate path {item!r} {issue}")
         timeout = data.get("timeout_seconds", DEFAULT_TIMEOUT)
         if isinstance(timeout, bool) or not isinstance(timeout, int) or not 1 <= timeout <= MAX_TIMEOUT:
             raise CorruptState("gate timeout must be 1..900 seconds")
@@ -283,10 +289,24 @@ def with_week(config: Config, week: str, spend: WeekSpend) -> Config:
     return replace(config, budget=replace(config.budget, weeks={**config.budget.weeks, week: spend}))
 
 
+def protected_entry_issue(entry: str) -> str | None:
+    """Why a protected-path entry cannot name a repository path, or None when it can."""
+    if not entry.strip():
+        return "must not be blank"
+    if entry != entry.strip():
+        return "must not have leading or trailing whitespace"
+    path = PurePosixPath(entry)
+    if path.is_absolute():
+        return "must be repository-relative"
+    if ".." in path.parts:
+        return "must not contain a parent traversal"
+    return None
+
+
 def protected_match(relative: str, protected: tuple[str, ...]) -> bool:
     path = PurePosixPath(relative)
     for item in protected:
-        entry = PurePosixPath(item.strip("/"))
+        entry = PurePosixPath(item)
         if path == entry or entry in path.parents:
             return True
     return False

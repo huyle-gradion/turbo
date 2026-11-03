@@ -81,9 +81,9 @@ The unit suite and both smoke scripts use disposable synthetic repositories. The
 
 ### Initial import verification staging
 
-The initial import stack has one narrow, one-time exception to verification. It does not change the size limit. Intermediate source slices cannot run the complete 199-test suite or both smoke scripts because the tree is not assembled yet. Each intermediate slice records the checks available in that slice, such as syntax checks and byte comparisons for files imported verbatim from the predecessor line.
+The initial import stack has one narrow, one-time exception to verification. It does not change the size limit. Intermediate source slices cannot run the complete test suite or both smoke scripts because the tree is not assembled yet. Each intermediate slice records the checks available in that slice, such as syntax checks and byte comparisons for files imported verbatim from the predecessor line.
 
-Do not claim full-suite, smoke, or CI success on an intermediate slice. The entire chain is mandatory: the final import pull request must run the complete 199-test suite and both smoke scripts after the full tree is assembled. The GitHub Actions workflow is introduced in the last pull request, not earlier. Future normal changes require all tests.
+Do not claim full-suite, smoke, or CI success on an intermediate slice. The entire chain is mandatory: the final import pull request must run the complete test suite and both smoke scripts after the full tree is assembled. The GitHub Actions workflow is introduced in the last pull request, not earlier. Future normal changes require all tests.
 
 ## Contribution size
 

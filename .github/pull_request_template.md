@@ -43,7 +43,7 @@ State whether this is a patch, minor, or breaking change under the policy in `CO
 - [ ] The counted diff is at or below the 1000-line hard limit counted conservatively.
 - [ ] Normal change: the full unit suite and both smoke scripts pass.
 - [ ] Staged import slice: the available syntax checks and source byte-equivalence checks are recorded. Full-suite, smoke, and CI success are not claimed for this slice.
-- [ ] Final import PR: the complete 199-test suite and both smoke scripts pass after the full tree is assembled, and the CI workflow is introduced here.
+- [ ] Final import PR: the complete test suite and both smoke scripts pass after the full tree is assembled, and the CI workflow is introduced here.
 - [ ] Documentation matches the behavior.
 - [ ] No credentials, private state, personal logs, or machine-specific paths are included.
 - [ ] An independent reviewer other than the author has reviewed the change.

@@ -244,7 +244,7 @@ The packet is optional when you drive the helper CLI directly. The bundled [`run
 - Agent turns and file writes are supervision notes only. The helper does not observe or count them.
 - A stopped run is not always resumable. Exhausted time or operation limits cannot be extended in place, and a gate-digest or profile change on a stopped run has no re-stage path. `resume` marks those runs `superseded`; counters are preserved, and there is no reset API.
 - The helper makes no model calls and no network calls. It does not measure time or cost savings.
-- The helper test suite is a unit suite of 199 tests over the Python code and synthetic Git repositories. The imported source contributed 197; two portable packaging checks were added. It is not an agent evaluation and says nothing about coding-agent quality.
+- The helper tests exercise Python code and synthetic Git repositories. They include the 197 predecessor tests, portable packaging checks, and review regressions. They are not agent evaluations and do not establish coding-agent quality.
 - The `native-turbo` profile is the original Antigravity workflow. The runtime attestation statement names Antigravity even when the `--attest-native-turbo` label differs. Other hosts are not supported or verified. Use `manual` unless an operator evaluates an adaptation in a later issue.
 - The live host path and the pilot workflow remain unverified. Antigravity CLI (`agy`) behavior, sandbox restrictions, provider billing, and protected-write denial are unknown.
 

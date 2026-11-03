@@ -27,7 +27,8 @@ def matches_red(run: Run, record: ReplayEvidence, *, passing: bool) -> bool:
     if passing and record.exit != 0:
         return False
     return (
-        record.head_sha == run.expected_green_sha
+        record.provenance == integrity.OBSERVED
+        and record.head_sha == run.expected_green_sha
         and record.gate_digest == run.gate_digest
         and record.test_blob_sha256 == run.red.test.blob_sha256
         and record.selector == run.red.test.selector
@@ -40,7 +41,8 @@ def require_passing(run: Run) -> ReplayEvidence:
         raise PolicyError("no replay recorded; run `factory replay --issue N` on the staged commit")
     if not matches_red(run, run.replay, passing=True):
         raise PolicyError(
-            "the recorded replay is not a passing replay of the exact red argv, selector, test blob, and gate digest on the staged commit"
+            "the recorded replay is not an observed passing replay of the exact red argv, selector, "
+            "test blob, and gate digest on the staged commit"
         )
     return run.replay
 

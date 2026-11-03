@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from pathlib import Path
 
 from factory import admission, budget, config as config_module, doctor, gates, lifecycle, store
 from factory import green as green_module, manifest as manifest_module, redstage, replay as replay_module
@@ -28,6 +27,8 @@ def _configure_gate(paths: RuntimePaths, args: argparse.Namespace) -> int:
     if name in ("1", "2"):
         if not argv or any(not item for item in argv):
             raise UsageError(f"gate {name} needs a non-empty argv after --")
+        if not argv[0].strip():
+            raise UsageError(f"gate {name} executable argv[0] must not be blank")
         declarations = [flag for flag, given in (
             (profile_module.HOST_DENIES_WRITES, args.declare_host_deny),
             (profile_module.HOST_POLICY_PROBED, args.declare_host_probed),
@@ -59,8 +60,9 @@ def _configure_gate(paths: RuntimePaths, args: argparse.Namespace) -> int:
         if not protected:
             raise UsageError("gate 3 needs at least one --protected path")
         for item in protected:
-            if not item.strip() or Path(item).is_absolute() or ".." in Path(item).parts:
-                raise UsageError(f"protected path must be a non-empty relative path: {item!r}")
+            issue = config_module.protected_entry_issue(item)
+            if issue is not None:
+                raise UsageError(f"protected path {item!r} {issue}")
         gate = GateConfig(kind="protected-paths", label=args.label or "protected-path invariance", paths=protected)
     else:
         raise UsageError(f"unknown gate: {name}")
