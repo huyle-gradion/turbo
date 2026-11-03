@@ -1,0 +1,32 @@
+# Operator state, evidence, and private runtime
+/runtime/
+.factory/
+*.factory-home/
+archives/
+verification/
+logs/
+
+# Secrets and local environment
+.env
+.env.*
+!.env.example
+
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pyright/
+*.egg-info/
+.venv/
+venv/
+
+# Editor and OS files
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Logs and captures outside the ignored evidence directory
+*.log
