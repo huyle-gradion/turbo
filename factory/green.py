@@ -17,7 +17,8 @@ from factory.store import require_run, save_run
 GATES = ("1", "2", "3")
 
 
-def _require_current(paths: RuntimePaths, run: Run) -> str:
+def require_current(paths: RuntimePaths, run: Run) -> str:
+    """The repository must still be the recorded green commit with the same red test."""
     if gitio.status_porcelain(paths.repo):
         raise PolicyError("working tree is dirty; green needs a clean tree")
     if gitio.branch(paths.repo) != run.branch:
@@ -26,6 +27,10 @@ def _require_current(paths: RuntimePaths, run: Run) -> str:
     expected = run.green_sha or run.expected_green_sha
     if head != expected:
         raise PolicyError(f"HEAD {head} does not match the recorded commit {expected}")
+    if run.red is not None:
+        raw = gitio.file_at_head(paths.repo, run.red.test.file)
+        if hashlib.sha256(raw).hexdigest() != run.red.test.blob_sha256:
+            raise PolicyError("the red test changed since capture; green parity failed")
     return head
 
 
@@ -51,10 +56,7 @@ def green(paths: RuntimePaths, issue: int) -> GreenEvidence:
         raise UsageError("no red or staged commit; run red and stage first")
     if run.phase not in ("gates", "green", "local-verified"):
         raise UsageError(f"issue {issue} is {run.phase}; green needs a staged run")
-    head = _require_current(paths, run)
-    raw = gitio.file_at_head(paths.repo, run.red.test.file)
-    if hashlib.sha256(raw).hexdigest() != run.red.test.blob_sha256:
-        raise PolicyError("the red test changed since capture; green parity failed")
+    head = require_current(paths, run)
     if run.phase in ("green", "local-verified") and run.green is not None:
         replay_module.require_passing(run)
         integrity.require_all(run, paths.home)

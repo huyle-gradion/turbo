@@ -18,6 +18,8 @@ All notable changes to this project are documented here. The format follows [Kee
 
 - Protected-path configuration rejects padded, blank, absolute, and parent-traversing entries at both the CLI and stored-config boundaries. Command configuration rejects blank executables while preserving literal data arguments.
 - Replay reuse now requires observed provenance. A staged run re-executes an untrusted replay, while a completed run refuses it without launching a child or changing state.
+- The manifest now keeps both budget positions honest. `budget_admission` is the position at `prepare` even when declared spend rises during gates, replay, green, or verify, and `budget_current` records the position at sealing.
+- `manifest` now refuses to seal or revalidate when the repository moved after green. The working tree must be clean, the branch and HEAD must match the recorded green commit, and the red test blob at HEAD must be unchanged.
 
 ### Notes
 
