@@ -52,7 +52,7 @@ bash scripts/smoke-turbo.sh
 
 The tests and smoke scripts must not call a model, use the network, need provider credentials, or touch a real product repository.
 
-Normal changes require the full suite and both smoke scripts. For the initial import stack only, intermediate slices record the available syntax checks and byte comparisons for imported source. The final import pull request must run the complete 199-test suite and both smoke scripts after the full tree is assembled. The CI workflow arrives in the last pull request. Do not claim full-suite, smoke, or CI success on an intermediate slice. Future normal changes require all tests.
+Normal changes require the full suite and both smoke scripts. For the initial import stack only, intermediate slices record the available syntax checks and byte comparisons for imported source. The final import pull request must run the complete test suite and both smoke scripts after the full tree is assembled. The CI workflow arrives in the last pull request. Do not claim full-suite, smoke, or CI success on an intermediate slice. Future normal changes require all tests.
 
 ## Repository layout
 

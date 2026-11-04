@@ -14,6 +14,11 @@ All notable changes to this project are documented here. The format follows [Kee
 - Unit tests, two disposable smoke demonstrations, and Ubuntu Python 3.11 CI.
 - MIT license, contribution workflow, security policy, issue and pull-request templates, and this changelog.
 
+### Fixed
+
+- Protected-path configuration rejects padded, blank, absolute, and parent-traversing entries at both the CLI and stored-config boundaries. Command configuration rejects blank executables while preserving literal data arguments.
+- Replay reuse now requires observed provenance. A staged run re-executes an untrusted replay, while a completed run refuses it without launching a child or changing state.
+
 ### Notes
 
 - The predecessor line is `0.1.0`, private historical code that was never tagged or published. It has no release date in this changelog.
