@@ -9,7 +9,7 @@ from pathlib import Path
 
 from support import (
     cli, commit, config, evidence_files, git, home_dir, make_repo, marker_gate,
-    run_state, staged, staged_turbo, to_green,
+    run_state, spend_record, staged, staged_turbo, to_green,
 )
 
 from factory import config as config_module
@@ -273,6 +273,102 @@ class ReplayProvenanceTest(unittest.TestCase):
         self.assertNotEqual(green.returncode, 0)
         self.assertEqual(after_bytes, before_bytes)
         self.assertEqual(after_files, before_files)
+
+
+def manifest_payload(home: Path) -> dict:
+    state = run_state(home)
+    return json.loads(Path(str(state["manifest_path"])).read_text(encoding="utf-8"))
+
+
+class MidRunSpendTest(unittest.TestCase):
+    """The admission position is fixed at prepare; later spend belongs only to budget_current."""
+
+    def test_manual_flow_keeps_the_admission_position_when_spend_rises_before_gates(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(Path(tmp))
+            home = home_dir(Path(tmp))
+            staged(repo, home, spend=12.5)
+            self.assertEqual(spend_record(repo, home, 50.0).returncode, 0)
+            self.assertEqual(cli(repo, home, "resume", "--issue", ISSUE, "--pr", "none").returncode, 0)
+            for gate in ("1", "2", "3"):
+                self.assertEqual(cli(repo, home, "gate", "--issue", ISSUE, "--gate", gate).returncode, 0)
+            self.assertEqual(cli(repo, home, "replay", "--issue", ISSUE).returncode, 0)
+            self.assertEqual(cli(repo, home, "green", "--issue", ISSUE).returncode, 0)
+            result = cli(repo, home, "manifest", "--issue", ISSUE)
+            payload = manifest_payload(home)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(payload["budget_admission"]["usd"], 12.5)
+        self.assertEqual(payload["budget_current"]["usd"], 50.0)
+
+    def test_native_turbo_verify_keeps_the_admission_position_when_spend_rises_first(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(Path(tmp))
+            home = home_dir(Path(tmp))
+            staged_turbo(repo, home, operations=5, spend=12.5)
+            self.assertEqual(spend_record(repo, home, 50.0).returncode, 0)
+            result = cli(repo, home, "verify", "--issue", ISSUE)
+            payload = manifest_payload(home)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(payload["budget_admission"]["usd"], 12.5)
+        self.assertEqual(payload["budget_current"]["usd"], 50.0)
+
+
+class ManifestRepositoryStateTest(unittest.TestCase):
+    """Sealing and revalidating both require the repository that green recorded."""
+
+    MUTATIONS = {
+        "new commit": (
+            lambda repo: commit(repo, "notes.txt", "notes\n", "late change"),
+            "does not match the recorded commit",
+        ),
+        "dirty tree": (
+            lambda repo: (repo / "scratch.txt").write_text("scratch\n", encoding="utf-8"),
+            "working tree is dirty",
+        ),
+        "wrong branch": (
+            lambda repo: git(repo, "switch", "-q", "-c", "other"),
+            "current branch is not",
+        ),
+    }
+
+    def assert_refused(self, result) -> None:
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+
+    def test_a_changed_repository_is_refused_before_the_first_seal(self):
+        for label, (mutate, fragment) in self.MUTATIONS.items():
+            with self.subTest(label), tempfile.TemporaryDirectory() as tmp:
+                repo = make_repo(Path(tmp))
+                home = home_dir(Path(tmp))
+                to_green(repo, home)
+                mutate(repo)
+                result = cli(repo, home, "manifest", "--issue", ISSUE)
+                state = run_state(home)
+                sealed = (home / "evidence" / ISSUE / "manifest.json").exists()
+            self.assert_refused(result)
+            self.assertIn(fragment, result.stderr.lower())
+            self.assertEqual(state["phase"], "green")
+            self.assertIsNone(state["manifest_path"])
+            self.assertFalse(sealed)
+
+    def test_a_changed_repository_is_refused_on_revalidation(self):
+        for label, (mutate, fragment) in self.MUTATIONS.items():
+            with self.subTest(label), tempfile.TemporaryDirectory() as tmp:
+                repo = make_repo(Path(tmp))
+                home = home_dir(Path(tmp))
+                to_green(repo, home)
+                self.assertEqual(cli(repo, home, "manifest", "--issue", ISSUE).returncode, 0)
+                manifest = Path(str(run_state(home)["manifest_path"]))
+                before = manifest.read_bytes()
+                mutate(repo)
+                result = cli(repo, home, "manifest", "--issue", ISSUE)
+                state = run_state(home)
+                after = manifest.read_bytes()
+            self.assert_refused(result)
+            self.assertIn(fragment, result.stderr.lower())
+            self.assertEqual(before, after)
+            self.assertEqual(state["phase"], "local-verified")
+            self.assertEqual(state["manifest_path"], str(manifest))
 
 
 if __name__ == "__main__":

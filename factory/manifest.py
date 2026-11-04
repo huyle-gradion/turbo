@@ -9,6 +9,7 @@ from dataclasses import asdict, replace
 from pathlib import Path
 
 from factory import budget as budget_module, config as config_module, integrity
+from factory import green as green_module
 from factory import profile as profile_module
 from factory import replay as replay_module
 from factory.config import Config, now
@@ -94,6 +95,7 @@ def manifest(paths: RuntimePaths, issue: int) -> Path:
     required = _required_paths(run)
     replay_module.require_passing(run)
     integrity.require_all(run, paths.home)
+    green_module.require_current(paths, run)
     if run.manifest_path:
         payload = integrity.read_manifest(run.manifest_path, paths.home)
         integrity.validate_manifest(payload, run, required)

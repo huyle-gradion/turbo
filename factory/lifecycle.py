@@ -14,7 +14,6 @@ from factory.model import (
     RECOVERABLE_STOPS,
     STOP_REASONS,
     TERMINAL_STOPS,
-    BudgetPosition,
     Run,
 )
 from factory.paths import RuntimePaths
@@ -112,16 +111,15 @@ def verify_elapsed(paths: RuntimePaths, run: Run) -> Run:
 
 
 def require_budget(paths: RuntimePaths, run: Run) -> Run:
+    """Refuse when the live position no longer admits the run; leave the admission snapshot alone."""
     conf = config_module.load(paths)
     config_module.require_binding(conf, paths)
     config_module.require_complete(conf)
     try:
-        current = budget.attestation(conf.budget, run.kind)
+        budget.attestation(conf.budget, run.kind)
     except PolicyError as exc:
         stop_with(paths, run, "budget", str(exc))
         raise
-    if run.budget != current:
-        return save_run(paths, replace(run, budget=current))
     return run
 
 
@@ -175,22 +173,21 @@ def _recover(paths: RuntimePaths, run: Run) -> tuple[bool, str | None]:
     return True, None
 
 
-def _current_position(paths: RuntimePaths, run: Run, reasons: list[str]) -> BudgetPosition | None:
+def _check_budget(paths: RuntimePaths, run: Run, reasons: list[str]) -> None:
     if run.phase not in ACTIVE:
-        return None
+        return
     try:
         conf = config_module.load(paths)
         config_module.require_binding(conf, paths)
         config_module.require_complete(conf)
         if config_module.digest(conf) != run.gate_digest:
             reasons.append("config: gate configuration changed (digest mismatch)")
-            return None
-        return budget.attestation(conf.budget, run.kind)
+            return
+        budget.attestation(conf.budget, run.kind)
     except UsageError as exc:
         reasons.append(f"config: {exc}")
     except PolicyError as exc:
         reasons.append(f"budget: {exc}")
-    return None
 
 
 def resume(paths: RuntimePaths, issue: int, pr_state: str) -> ResumeEntry:
@@ -229,8 +226,8 @@ def resume(paths: RuntimePaths, issue: int, pr_state: str) -> ResumeEntry:
         case unreachable:
             raise UsageError(f"unknown PR state: {pr_state}")
 
-    refreshed = _current_position(paths, run, reasons)
-    base = run if refreshed is None else replace(run, budget=refreshed)
+    _check_budget(paths, run, reasons)
+    base = run
 
     if run.phase in ACTIVE:
         exhausted = check_limits(run)
