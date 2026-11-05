@@ -4,62 +4,68 @@ This glossary describes Turbo's target software factory, not the current evidenc
 
 ## Language
 
+**Orchestrator**:
+The user-facing factory coordinator that drives a parent task across its prepared sub-tasks through builder, automated QA, security, and independent reviewer roles until the integrated feature pull request awaits human acceptance.
+_Avoid_: Cloud scheduler, task decomposer
+
 **Work ticket**:
-A bounded requirement intended to produce one pull request, represented initially by an Asana sub-task.
+A bounded requirement that produces one pull request, represented by a prepared Asana sub-task.
 _Avoid_: Epic, product specification
 
 **Task**:
-A feature defined by the PM with QA and SWE input, with its own acceptance criteria and decomposed by the SWE team into sub-tasks. Completion requires all criteria to pass, approval from AI review, QA, and the assigned SWE reviewer, and human merge into main; completed sub-tasks alone do not establish completion.
+A parent feature defined by the PM with QA and SWE input, carrying feature acceptance criteria, an assigned SWE reviewer, and prepared sub-tasks. Completion requires all parent criteria to pass on the integrated feature pull request, approval from AI review, QA, and the parent task's assigned SWE reviewer, and human merge into main.
+_Avoid_: Sub-task, epic
 
 **Sub-task**:
-An SWE-created atomic work ticket belonging to a task, with one or more acceptance criteria verifiable without human judgment and one associated pull request. Completion requires all its criteria to pass and AI review, approval, and merge into its parent feature branch, without human approval.
+A prepared atomic work ticket under a parent task, created by an SWE for implementation or by an SWE or PM for a feature repair, with acceptance criteria verifiable without human judgment and one child pull request. Completion requires its criteria and CI checks to pass and AI review, approval, and merge into its parent feature branch without human approval.
+_Avoid_: Parent task, autonomously generated ticket
 
 **Ready sub-task**:
-A sub-task with acceptance criteria, a target repository, necessary context, and an assigned SWE reviewer. An SWE's explicit launch authorizes execution.
+A prepared sub-task with verifiable acceptance criteria, a target repository, required context, explicit dependencies, and an assigned SWE reviewer for readiness and escalation.
 
 **Feature branch**:
-The integration branch for one task's sub-tasks, kept separate from main until feature acceptance and human merge.
+The integration branch for one task's merged sub-task pull requests, kept separate from main until feature acceptance and human merge.
 
 **Task acceptance record**:
-Evidence for a task's acceptance criteria tied to one integrated build, with the evidence method suited to each criterion. AI, QA, and assigned SWE approvals apply to that same frozen candidate; repairs require renewed approvals, and no criterion may remain failed or unverified at completion.
+The shared Asana and feature pull request evidence tying every parent criterion and same-revision AI, QA, and assigned SWE approvals to one frozen integrated build.
 
 **Delivery team**:
 One team of three software engineers, one PM, and one non-technical QA teammate. The two current teams build Chat Bridge independently.
 
 **Engineering QC**:
-The technical quality checks owned by the software engineers, including tests and review before merge.
+The technical quality checks covering builder verification, automated QA, security checks, CI user-story tests, and independent AI review before merge.
 _Avoid_: Acceptance QA
 
 **Acceptance QA**:
-The non-technical QA teammate's assessment of whether the delivered product meets its acceptance criteria.
+The non-technical QA teammate's assessment of whether the integrated feature candidate satisfies the parent task's acceptance criteria.
 _Avoid_: Engineering QC, code review
 
 **Delivery run**:
-An unattended attempt to turn one ready work ticket into a pull request, including implementation and engineering QC.
+An unattended factory execution launched on a parent task that coordinates its prepared sub-tasks into merged child pull requests and an integrated feature pull request awaiting human acceptance.
 
 **Repair run**:
-An attempt to address explicitly requested changes on an existing pull request and verify the updated result. Ordinary discussion is not a repair request.
+A bounded execution that updates an existing open pull request to resolve review findings or an authorized repair request and re-verifies the updated revision before merge.
 
 **Assigned SWE reviewer**:
-The software engineer designated to consolidate PR feedback and authorize a repair run. QA and other reviewers may contribute feedback, but only this reviewer can finalize the repair request.
+The software engineer designated on a task or sub-task to own readiness, review escalation, and `/turbo repair` authorization, and on a parent task to approve the frozen feature candidate.
 
 **Repair request**:
-An explicit `/turbo repair` instruction authorized by the assigned SWE reviewer for a defined batch of PR feedback.
+An explicit `/turbo repair` instruction authorized by the assigned SWE reviewer for a defined batch of pull request feedback.
 
 **Feature repair sub-task**:
-An Asana sub-task created by an SWE or PM to address a feature-level repair request. Its child PR targets the feature branch and requires the assigned SWE reviewer's finalized repair authorization.
+An Asana sub-task created by an SWE or PM to address an authorized `/turbo repair` batch on a feature candidate through a new child pull request into the feature branch.
 
 **Dependency handoff**:
-An explicit communication of a prerequisite's delivered contract, merged revision, and supporting evidence to dependent work. Workers do not rely on shared mutable working notes or uncommitted files for coordination.
+An explicit record of a prerequisite sub-task's delivered contract, merged revision, and supporting evidence passed to dependent sub-tasks.
 
 **Merge approval**:
-Authorization to integrate a reviewed change into its target branch. AI authorizes sub-task merges into a feature branch; a feature requires AI, QA, and assigned SWE approval before a human merges it into main.
+Authorization to integrate a reviewed pull request into its target branch. AI authorizes child pull request merges into a feature branch, whereas a feature pull request requires AI, QA, and parent assigned SWE approval before a human merges it into main.
 
 **Run measurements**:
-Usage and quality observations linked to a work ticket and exact revision, used to evaluate and improve the factory. Reported usage, estimated cost, and unavailable data remain distinct.
+Usage, elapsed time, and quality observations linked to a work ticket and exact revision to evaluate and improve the factory. Reported usage, estimated cost, and unavailable data remain distinct.
 
 **Durable lesson**:
-A reviewed finding approved to guide future factory runs. An automatically recorded observation is not a durable lesson until a human approves it.
+A reviewed finding approved by a human to guide future factory runs. Automatically recorded observations are not durable lessons until a human approves them.
 
 **Factory maintainer**:
-The person responsible for approving shared checks and factory improvements. The project's owner is the primary maintainer; contributors propose changes through issues and pull requests.
+The person responsible for approving shared checks and factory improvements. The project's owner is the primary maintainer, and contributors propose changes through issues and pull requests.
