@@ -207,6 +207,7 @@ A fresh verification after red needs four child operations. Red already cost one
 | `prompt` | Print the next operator instructions with the run's own issue and branch. |
 | `stop` | Stop with one reason. Counters are preserved. |
 | `resume` | Offline consistency check. No reset, no deletion, no `gh`. |
+| `worker` | Execute one bounded, isolated `agy` worker task in a disposable worktree with safety probes and structured telemetry. |
 
 Exit codes are `0` success, `1` policy refusal or failed gate, and `2` invalid usage, missing configuration, unsafe path, or corrupt state.
 

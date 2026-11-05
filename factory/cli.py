@@ -8,7 +8,7 @@ import sys
 
 from factory import admission, budget, config as config_module, doctor, gates, lifecycle, store
 from factory import green as green_module, manifest as manifest_module, redstage, replay as replay_module
-from factory import profile as profile_module, verify as verify_module
+from factory import profile as profile_module, verify as verify_module, worker as worker_module
 from factory.args import build_parser
 from factory.config import GateConfig
 from factory.errors import PolicyError, UsageError
@@ -241,6 +241,13 @@ def _dispatch(paths: RuntimePaths, args: argparse.Namespace) -> int:
                 return 0
             print(f"resume refused: {', '.join(entry.reasons)}")
             return 1
+        case "worker":
+            result = worker_module.run_from_cli(paths, args)
+            if args.json:
+                print(json.dumps(result.to_dict(), indent=2, sort_keys=True))
+            else:
+                print(f"worker {result.task_id}: {result.status} ({result.artifact['relative_path']})")
+            return 0 if result.completed else 1
         case unreachable:
             raise AssertionError(unreachable)
 
