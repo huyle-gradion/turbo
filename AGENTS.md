@@ -87,3 +87,20 @@ A release is prepared in a reviewed pull request. A human merges it. Do not auto
 - Spend declarations are not verified billing.
 - The pilot has not run on a live product issue. The five cases in `pilot/agent-evals.md` are manual agent-evaluation instructions, not helper unit tests.
 - Do not add private logs, runtime state, credentials, personal paths, or historical archives to the repository.
+
+## Agent skills
+
+### Issue tracker
+
+Track Turbo development in GitHub Issues for huyle-gradion/turbo.
+See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Use the five canonical triage labels.
+See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Use the single-context layout with root CONTEXT.md and docs/adr/.
+See `docs/agents/domain.md`.
