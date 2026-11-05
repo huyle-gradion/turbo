@@ -150,6 +150,13 @@ class WorkerExecutionTest(unittest.TestCase):
             res, _ = _run_fake_worker(f"import pathlib; pathlib.Path({str(marker)!r}).write_text('ran')\n", "--agy-arg=--dangerously-skip-permissions")
             self.assertEqual((res.returncode, marker.exists()), (2, False))
             self.assertIn("bypass", res.stderr.lower())
+            fake_home = Path(tmp) / "source-home"
+            (fake_home / "Library" / "Keychains").mkdir(parents=True)
+            worker_dir = Path(tmp) / "factory-home" / "workers" / "t1"
+            with mock.patch("platform.system", return_value="Darwin"):
+                isolated = worker_module._prepare_isolated_home(worker_dir, fake_home)
+                self.assertTrue((isolated / "Library" / "Keychains").is_symlink())
+                self.assertEqual((isolated / "Library" / "Keychains").resolve(), (fake_home / "Library" / "Keychains").resolve())
         for system_name, release, machine in (("Darwin", "24.1.0", "arm64"), ("Linux", "6.12.0", "x86_64")):
             with self.subTest(system=system_name), mock.patch("platform.system", return_value=system_name), mock.patch("platform.release", return_value=release), mock.patch("platform.machine", return_value=machine):
                 info = worker_module.platform_info()

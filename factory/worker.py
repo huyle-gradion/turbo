@@ -91,6 +91,11 @@ def _prepare_isolated_home(worker_dir: Path, source_home: Path) -> Path:
             if candidate.is_file() and not candidate.is_symlink():
                 shutil.copy2(candidate, agy_dst / name)
                 os.chmod(agy_dst / name, 0o600)
+    keychains_src = source_home / "Library" / "Keychains"
+    if platform.system() == "Darwin" and keychains_src.is_dir() and not keychains_src.is_symlink():
+        keychains_dst = safe_dir(isolated_home / "Library", create=True, root=worker_dir.parents[1]) / "Keychains"
+        if not keychains_dst.exists() and not keychains_dst.is_symlink():
+            keychains_dst.symlink_to(keychains_src)
     return isolated_home
 
 
