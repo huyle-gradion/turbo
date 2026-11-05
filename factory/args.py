@@ -100,4 +100,15 @@ def build_parser() -> argparse.ArgumentParser:
     resume = sub.add_parser("resume", help="offline consistency check; never calls gh")
     resume.add_argument("--issue", type=int, required=True)
     resume.add_argument("--pr", choices=("none", "exists", "unknown"), default="unknown")
+
+    worker = sub.add_parser("worker", help="run one bounded, isolated agy worker task")
+    worker.add_argument("--task-id", required=True)
+    worker.add_argument("--prompt", required=True)
+    worker.add_argument("--artifact", required=True)
+    worker.add_argument("--time-limit", required=True)
+    worker.add_argument("--input-rate-usd-per-1m", type=float)
+    worker.add_argument("--output-rate-usd-per-1m", type=float)
+    worker.add_argument("--agy-bin", default="agy")
+    worker.add_argument("--agy-arg", action="append", default=[])
+    worker.add_argument("--json", action="store_true")
     return parser
