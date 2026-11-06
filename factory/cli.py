@@ -6,7 +6,7 @@ import argparse
 import json
 import sys
 
-from factory import admission, budget, config as config_module, doctor, gates, intake as intake_module, lifecycle, store
+from factory import admission, budget, config as config_module, deliver as deliver_module, doctor, gates, intake as intake_module, lifecycle, store
 from factory import green as green_module, manifest as manifest_module, redstage, replay as replay_module
 from factory import profile as profile_module, verify as verify_module, worker as worker_module
 from factory.args import build_parser
@@ -255,6 +255,13 @@ def _dispatch(paths: RuntimePaths, args: argparse.Namespace) -> int:
             else:
                 print(f"intake {result.task_gid}: {result.status} (delivery_ready={result.delivery_ready})")
             return 0 if result.delivery_ready else 1
+        case "deliver":
+            result = deliver_module.run_from_cli(paths, args)
+            if args.json:
+                print(json.dumps(result.to_dict(), indent=2, sort_keys=True))
+            else:
+                print(f"deliver {result.task_gid}: {result.status} (pr_opened={result.pr_opened})")
+            return 0 if result.pr_opened else 1
         case unreachable:
             raise AssertionError(unreachable)
 

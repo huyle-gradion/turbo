@@ -209,6 +209,7 @@ A fresh verification after red needs four child operations. Red already cost one
 | `resume` | Offline consistency check. No reset, no deletion, no `gh`. |
 | `worker` | Execute one bounded, isolated `agy` worker task in a disposable worktree with safety probes and structured telemetry. |
 | `intake` | Read a parent Asana feature task and its prepared sub-tasks (GET-only, paginated) and report delivery readiness. |
+| `deliver` | Build one prepared child sub-task in an isolated worktree based on `feature/<feature-name>` and open its PR into the feature branch. |
 
 Exit codes are `0` success, `1` policy refusal or failed gate, and `2` invalid usage, missing configuration, unsafe path, or corrupt state.
 
@@ -249,6 +250,7 @@ The packet is optional when you drive the helper CLI directly. The bundled [`run
 - The helper tests exercise Python code and synthetic Git repositories. They include the 197 predecessor tests, portable packaging checks, and review regressions. They are not agent evaluations and do not establish coding-agent quality.
 - The `native-turbo` profile is the original Antigravity workflow. The runtime attestation statement names Antigravity even when the `--attest-native-turbo` label differs. Other hosts are not supported or verified. Use `manual` unless an operator evaluates an adaptation in a later issue.
 - The live host path and the pilot workflow remain unverified. Antigravity CLI (`agy`) behavior, sandbox restrictions, provider billing, and protected-write denial are unknown.
+- In `worker` and `deliver`, the outer OS sandbox sets `allow_network=True` for the `agy` builder so `agy` can reach the model API; preventing builder-generated commands from contacting live services relies on `agy --sandbox --mode auto` plus stripped service credentials, zero git remotes (`GIT_ALLOW_PROTOCOL=none`), and Landlock exclusion of controller/operator files, whereas controller-run child verification checks enforce kernel network denial (`allow_network=False`). Staging `.gemini/antigravity-cli` into the builder's `isolated_home` isolates the operator's home directory rather than providing credential confidentiality against the builder process itself (which can read its own staged `isolated_home`), while verification commands switch to a separate empty `verify-home` that denies reading the builder's staged auth files by absolute path. This OS sandbox is verified on Linux (`x86_64`) only; macOS (`Darwin`) `sandbox-exec` remains unverified until tested.
 
 ## Versioning
 
