@@ -115,4 +115,12 @@ def build_parser() -> argparse.ArgumentParser:
     intake = sub.add_parser("intake", help="admit a prepared Asana parent feature without creating or mutating tasks")
     intake.add_argument("--task", required=True, help="Asana parent task GID or URL")
     intake.add_argument("--json", action="store_true")
+
+    deliver = sub.add_parser("deliver", help="build one prepared child of a feature and open its PR into the feature branch")
+    deliver.add_argument("--task", required=True, help="Asana parent task GID or URL")
+    deliver.add_argument("--time-limit", default="15m")
+    deliver.add_argument("--input-rate-usd-per-1m", type=float)
+    deliver.add_argument("--output-rate-usd-per-1m", type=float)
+    deliver.add_argument("--agy-bin", default="agy")
+    deliver.add_argument("--json", action="store_true")
     return parser
