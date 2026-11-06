@@ -111,4 +111,8 @@ def build_parser() -> argparse.ArgumentParser:
     worker.add_argument("--agy-bin", default="agy")
     worker.add_argument("--agy-arg", action="append", default=[])
     worker.add_argument("--json", action="store_true")
+
+    intake = sub.add_parser("intake", help="admit a prepared Asana parent feature without creating or mutating tasks")
+    intake.add_argument("--task", required=True, help="Asana parent task GID or URL")
+    intake.add_argument("--json", action="store_true")
     return parser
