@@ -45,6 +45,7 @@ __all__ = [
     "DEFAULT_ASANA_API_URL",
     "FACTORY_ROOT",
     "IntakeResult",
+    "NoRedirectHandler",
     "_NoRedirectHandler",
     "_RetrievalError",
     "_add_unique",
@@ -69,7 +70,9 @@ __all__ = [
     "_same_api_origin",
     "_shortest_cycle_in_scc",
     "_split_sections",
+    "redact_value",
     "run_from_cli",
+    "same_api_origin",
 ]
 
 
@@ -141,22 +144,17 @@ def _same_api_origin(url: str, base_url: str) -> bool:
     return target_path == base_path or target_path.startswith(base_path + "/")
 
 
-def _get_json(
-    url: str, token: str, base_url: str, trace: list[dict[str, Any]], deadline: float | None = None
-) -> dict[str, Any]:
+def _get_json(url: str, token: str, base_url: str, trace: list[dict[str, Any]], deadline: float | None = None) -> dict[str, Any]:
     target_parsed = urlparse(url)
     if not _same_api_origin(url, base_url):
         trace.append({"method": "GET", "url": url, "status": "blocked-origin"})
         raise _RetrievalError(
             f"refused to send credentials to untrusted pagination or API destination: {url}"
         )
-    req_timeout = 15.0
-    if deadline is not None:
-        rem = deadline - time.monotonic()
-        if rem <= 0:
-            trace.append({"method": "GET", "url": url, "status": "timeout"})
-            raise _RetrievalError("Asana API request timed out")
-        req_timeout = min(15.0, rem)
+    req_timeout = 15.0 if deadline is None else min(15.0, deadline - time.monotonic())
+    if req_timeout <= 0:
+        trace.append({"method": "GET", "url": url, "status": "timeout"})
+        raise _RetrievalError("Asana API request timed out")
     headers = {"Accept": "application/json", "Authorization": f"Bearer {token}"}
     request = Request(url, headers=headers, method="GET")
     opener = build_opener(_NoRedirectHandler)
@@ -166,8 +164,12 @@ def _get_json(
             body = response.read().decode("utf-8", "replace")
     except HTTPError as exc:
         trace.append({"method": "GET", "url": url, "status": exc.code})
+        exc.close()
         raise _RetrievalError(f"Asana API HTTP {exc.code} on {target_parsed.path}: {exc.reason}") from exc
     except (URLError, OSError) as exc:
+        if isinstance(exc, TimeoutError) or (deadline is not None and time.monotonic() >= deadline) or isinstance(getattr(exc, "reason", None), TimeoutError):
+            trace.append({"method": "GET", "url": url, "status": "timeout"})
+            raise _RetrievalError("Asana API request timed out") from exc
         trace.append({"method": "GET", "url": url, "status": "network-error"})
         raise _RetrievalError(f"Asana API request failed on {target_parsed.path}: {exc}") from exc
     trace.append({"method": "GET", "url": url, "status": status_code})
@@ -240,6 +242,9 @@ def _redact_value(value: Any, secrets: tuple[str, ...]) -> Any:
     if isinstance(value, dict):
         return {key: _redact_value(val, secrets) for key, val in value.items()}
     return value
+
+
+NoRedirectHandler, same_api_origin, redact_value = _NoRedirectHandler, _same_api_origin, _redact_value
 
 
 def run_from_cli(paths: RuntimePaths, args: object) -> IntakeResult:
