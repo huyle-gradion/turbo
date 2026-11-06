@@ -141,18 +141,27 @@ def _same_api_origin(url: str, base_url: str) -> bool:
     return target_path == base_path or target_path.startswith(base_path + "/")
 
 
-def _get_json(url: str, token: str, base_url: str, trace: list[dict[str, Any]]) -> dict[str, Any]:
+def _get_json(
+    url: str, token: str, base_url: str, trace: list[dict[str, Any]], deadline: float | None = None
+) -> dict[str, Any]:
     target_parsed = urlparse(url)
     if not _same_api_origin(url, base_url):
         trace.append({"method": "GET", "url": url, "status": "blocked-origin"})
         raise _RetrievalError(
             f"refused to send credentials to untrusted pagination or API destination: {url}"
         )
+    req_timeout = 15.0
+    if deadline is not None:
+        rem = deadline - time.monotonic()
+        if rem <= 0:
+            trace.append({"method": "GET", "url": url, "status": "timeout"})
+            raise _RetrievalError("Asana API request timed out")
+        req_timeout = min(15.0, rem)
     headers = {"Accept": "application/json", "Authorization": f"Bearer {token}"}
     request = Request(url, headers=headers, method="GET")
     opener = build_opener(_NoRedirectHandler)
     try:
-        with opener.open(request, timeout=15) as response:
+        with opener.open(request, timeout=req_timeout) as response:
             status_code = getattr(response, "status", 200)
             body = response.read().decode("utf-8", "replace")
     except HTTPError as exc:
@@ -172,10 +181,10 @@ def _get_json(url: str, token: str, base_url: str, trace: list[dict[str, Any]]) 
 
 
 def _fetch_parent_and_children(
-    task_gid: str, base_url: str, token: str, trace: list[dict[str, Any]]
+    task_gid: str, base_url: str, token: str, trace: list[dict[str, Any]], deadline: float | None = None
 ) -> tuple[dict[str, Any], list[dict[str, Any]], int]:
     parent_url = f"{base_url}/tasks/{task_gid}?opt_fields=gid,name,notes,completed"
-    parent = _get_json(parent_url, token, base_url, trace).get("data")
+    parent = _get_json(parent_url, token, base_url, trace, deadline=deadline).get("data")
     if not isinstance(parent, dict) or str(parent.get("gid") or "").strip() != task_gid:
         raise _RetrievalError("Asana parent task response is missing or mismatched data.gid")
     children: list[dict[str, Any]] = []
@@ -188,7 +197,7 @@ def _fetch_parent_and_children(
         if next_offset is not None:
             query["offset"] = next_offset
         subtasks_url = f"{base_url}/tasks/{task_gid}/subtasks?{urlencode(query)}"
-        page = _get_json(subtasks_url, token, base_url, trace)
+        page = _get_json(subtasks_url, token, base_url, trace, deadline=deadline)
         pages += 1
         data = page.get("data")
         if not isinstance(data, list) or "next_page" not in page:
@@ -264,7 +273,11 @@ def run_from_cli(paths: RuntimePaths, args: object) -> IntakeResult:
     try:
         if not token:
             raise _RetrievalError("missing Asana authentication token (ASANA_ACCESS_TOKEN or ASANA_PAT)")
-        parent_raw, children_raw, pages = _fetch_parent_and_children(task_gid, base_url, token, trace)
+        raw_dl = getattr(args, "deadline", None)
+        deadline = float(raw_dl) if isinstance(raw_dl, (int, float)) and not isinstance(raw_dl, bool) else None
+        parent_raw, children_raw, pages = _fetch_parent_and_children(
+            task_gid, base_url, token, trace, deadline=deadline
+        )
     except _RetrievalError as exc:
         parent_info: dict[str, Any] = {"gid": task_gid, "name": "", "criteria": []}
         children: list[dict[str, Any]] = []
