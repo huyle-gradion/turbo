@@ -208,6 +208,7 @@ A fresh verification after red needs four child operations. Red already cost one
 | `stop` | Stop with one reason. Counters are preserved. |
 | `resume` | Offline consistency check. No reset, no deletion, no `gh`. |
 | `worker` | Execute one bounded, isolated `agy` worker task in a disposable worktree with safety probes and structured telemetry. |
+| `intake` | Read a parent Asana feature task and its prepared sub-tasks (GET-only, paginated) and report delivery readiness. |
 
 Exit codes are `0` success, `1` policy refusal or failed gate, and `2` invalid usage, missing configuration, unsafe path, or corrupt state.
 
