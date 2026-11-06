@@ -16,8 +16,17 @@ def _run_fake_worker(script: str, *extra_args: str, task_id: str = "task-test", 
         root = Path(tmp)
         repo, home = make_repo(root), home_dir(root)
         config(repo, home)
+        repo_sentinel = repo / "CONTROLLER_REPO_SENTINEL.txt"
+        repo_sentinel.write_text("REPO_INTACT\n", encoding="utf-8")
+        home_sentinel = home / "CONTROLLER_HOME_SENTINEL.txt"
+        home_sentinel.write_text("HOME_INTACT\n", encoding="utf-8")
         fake_bin = root / "fake-agy.py"
-        fake_bin.write_text("import sys\nif '--version' in sys.argv: print('1.5.0-test'); sys.exit(0)\n" + script, encoding="utf-8")
+        header = (
+            f"REPO_SENTINEL = {str(repo_sentinel)!r}\n"
+            f"HOME_SENTINEL = {str(home_sentinel)!r}\n"
+            "import sys\nif '--version' in sys.argv: print('1.5.0-test'); sys.exit(0)\n"
+        )
+        fake_bin.write_text(header + script, encoding="utf-8")
         argv = [
             sys.executable, "-P", "-m", "factory", "--repo", str(repo), "--home", str(home),
             "worker", "--task-id", task_id, "--prompt", "Execute disposable task",
@@ -26,6 +35,8 @@ def _run_fake_worker(script: str, *extra_args: str, task_id: str = "task-test", 
         ]
         run_env = {**(env_override or os.environ), "PYTHONPATH": str(ROOT), "PYTHONDONTWRITEBYTECODE": "1"}
         res = subprocess.run(argv, cwd=str(repo), capture_output=True, text=True, env=run_env, timeout=60)
+        assert repo_sentinel.read_text(encoding="utf-8") == "REPO_INTACT\n"
+        assert home_sentinel.read_text(encoding="utf-8") == "HOME_INTACT\n"
         record_file = home / "workers" / task_id / "record.json"
         payload = json.loads(record_file.read_text(encoding="utf-8")) if record_file.exists() else {}
         for k, p in (("_stored_artifact_text", payload.get("artifact", {}).get("stored_path")), ("_stdout_text", payload.get("evidence", {}).get("stdout_path")), ("_stderr_text", payload.get("evidence", {}).get("stderr_path"))):
@@ -85,33 +96,30 @@ class WorkerExecutionTest(unittest.TestCase):
         self.assertEqual((res.returncode, payload["status"], payload["completed"]), (1, "permission-denied", False))
 
     def test_timeout_terminates_owned_worker_processes_preserves_output_and_reports_incomplete(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            pid_file = Path(tmp) / "grandchild.pid"
-            script = (
-                "import json, subprocess, sys, time\n"
-                f"child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
-                f"open({str(pid_file)!r}, 'w').write(str(child.pid))\n"
-                "print(json.dumps({'event': 'init', 'conversation_id': 'c-timeout'}), flush=True)\n"
-                "sys.stderr.write('partial stderr before timeout\\n'); sys.stderr.flush(); time.sleep(60)\n"
-            )
-            started = time.monotonic()
-            res, payload = _run_fake_worker(script, task_id="task-timeout", time_limit="2s")
-            self.assertEqual((res.returncode, payload["status"], payload["completed"], payload["evidence"]["timed_out"]), (1, "timed-out", False, True))
-            self.assertLess(time.monotonic() - started, 8.0)
-            self.assertIn("c-timeout", payload["_stdout_text"])
-            self.assertIn("partial stderr before timeout", payload["_stderr_text"])
-            grandchild_pid = int(pid_file.read_text(encoding="utf-8").strip())
-            deadline, alive = time.monotonic() + 2.0, True
-            while time.monotonic() < deadline:
-                try:
-                    os.kill(grandchild_pid, 0)
-                except ProcessLookupError:
-                    alive = False; break
-                status_file = Path(f"/proc/{grandchild_pid}/status")
-                if status_file.exists() and "State:\tZ" in status_file.read_text(encoding="utf-8", errors="ignore"):
-                    alive = False; break
-                time.sleep(0.05)
-            self.assertFalse(alive, f"grandchild process {grandchild_pid} should be terminated")
+        script = (
+            "import json, subprocess, sys, time\n"
+            "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+            "print(json.dumps({'event': 'init', 'conversation_id': 'c-timeout', 'grandchild_pid': child.pid}), flush=True)\n"
+            "sys.stderr.write('partial stderr before timeout\\n'); sys.stderr.flush(); time.sleep(60)\n"
+        )
+        started = time.monotonic()
+        res, payload = _run_fake_worker(script, task_id="task-timeout", time_limit="2s")
+        self.assertEqual((res.returncode, payload["status"], payload["completed"], payload["evidence"]["timed_out"]), (1, "timed-out", False, True))
+        self.assertLess(time.monotonic() - started, 8.0)
+        self.assertIn("c-timeout", payload["_stdout_text"])
+        self.assertIn("partial stderr before timeout", payload["_stderr_text"])
+        grandchild_pid = int(json.loads(payload["_stdout_text"].splitlines()[0])["grandchild_pid"])
+        deadline, alive = time.monotonic() + 2.0, True
+        while time.monotonic() < deadline:
+            try:
+                os.kill(grandchild_pid, 0)
+            except ProcessLookupError:
+                alive = False; break
+            status_file = Path(f"/proc/{grandchild_pid}/status")
+            if status_file.exists() and "State:\tZ" in status_file.read_text(encoding="utf-8", errors="ignore"):
+                alive = False; break
+            time.sleep(0.05)
+        self.assertFalse(alive, f"grandchild process {grandchild_pid} should be terminated")
 
     def test_absent_or_null_telemetry_and_cost_provenance(self):
         script_null = "import json, pathlib\npathlib.Path('artifact.txt').write_text('ok\\n', encoding='utf-8')\nprint(json.dumps({'event': 'result', 'result': {'conversation_id': 'c-notel', 'status': 'SUCCESS', 'response': 'Done', 'usage': {'input_tokens': None, 'total_tokens': None}}}))\n"
@@ -128,21 +136,34 @@ class WorkerExecutionTest(unittest.TestCase):
         self.assertEqual((meas["cost"]["state"], meas["cost"]["usd"]), ("reported", 0.042))
 
     def test_worker_excludes_production_credentials_and_records_explicit_boundary_probes(self):
-        script = (
-            "import json, os, pathlib\n"
-            "leaked = [k for k in os.environ if k in ('PRODUCTION_DATABASE_URL', 'AWS_SECRET_ACCESS_KEY', 'OPENAI_API_KEY', 'GITHUB_TOKEN', 'ASANA_ACCESS_TOKEN')]\n"
-            "aws_exists = (pathlib.Path.home() / '.aws' / 'credentials').exists()\n"
-            "pathlib.Path('artifact.txt').write_text(f'LEAKED={\",\".join(leaked)} AWS={aws_exists}\\n', encoding='utf-8')\n"
-            "print(json.dumps({'event': 'result', 'result': {'conversation_id': 'c-safe', 'status': 'SUCCESS', 'response': 'Done'}}))\n"
-        )
-        env_with_secrets = dict(os.environ, PRODUCTION_DATABASE_URL="postgres://prod:secret@db.internal/prod", AWS_SECRET_ACCESS_KEY="wJalrXUtnFEMI", OPENAI_API_KEY="sk-prod-12345", GITHUB_TOKEN="ghp_prodtoken123", ASANA_ACCESS_TOKEN="1/12345:prodasana")
-        res, payload = _run_fake_worker(script, task_id="task-safety", env_override=env_with_secrets)
-        self.assertEqual((res.returncode, payload["_stored_artifact_text"]), (0, "LEAKED= AWS=False\n"))
-        safety = payload["safety"]
-        self.assertFalse(safety["bypass_permissions_used"])
-        self.assertTrue({"PRODUCTION_DATABASE_URL", "AWS_SECRET_ACCESS_KEY"}.issubset(safety["stripped_env_keys"]))
-        probes = {probe["name"]: probe for probe in safety["probes"]}
-        self.assertTrue(probes["forbidden_credential_access"]["denied"] and probes["external_effect_restriction"]["denied"])
+        with tempfile.TemporaryDirectory() as sentinel_tmp:
+            sentinel = Path(sentinel_tmp) / "controller_cred.sentinel"
+            sentinel.write_text("SECRET_SENTINEL_INTACT\n", encoding="utf-8")
+            script = (
+                "import json, os, pathlib, shutil, subprocess, sys\n"
+                "leaked = [k for k in os.environ if k in ('PRODUCTION_DATABASE_URL', 'AWS_SECRET_ACCESS_KEY', 'OPENAI_API_KEY', 'GITHUB_TOKEN', 'ASANA_ACCESS_TOKEN')]\n"
+                "aws_exists = (pathlib.Path.home() / '.aws' / 'credentials').exists()\n"
+                "cat_bin = shutil.which('cat') or '/bin/cat'\n"
+                f"targets = [REPO_SENTINEL, HOME_SENTINEL, {str(sentinel)!r}, f'/proc/{{os.getppid()}}/environ']\n"
+                "os.environ.clear()\n"
+                "denied_all = True\n"
+                "for t in targets:\n"
+                "    py_r = subprocess.run([sys.executable, '-I', '-S', '-c', f'open({t!r}, \"rb\").read()'], capture_output=True).returncode != 0\n"
+                "    py_w = subprocess.run([sys.executable, '-I', '-S', '-c', f'open({t!r}, \"wb\").write(b\"x\")'], capture_output=True).returncode != 0\n"
+                "    cat_r = subprocess.run([cat_bin, t], capture_output=True).returncode != 0\n"
+                "    denied_all = denied_all and py_r and py_w and cat_r\n"
+                "pathlib.Path('artifact.txt').write_text(f'LEAKED={\",\".join(leaked)} AWS={aws_exists} DENIED={denied_all}\\n', encoding='utf-8')\n"
+                "print(json.dumps({'event': 'result', 'result': {'conversation_id': 'c-safe', 'status': 'SUCCESS', 'response': 'Done'}}))\n"
+            )
+            env_with_secrets = dict(os.environ, PRODUCTION_DATABASE_URL="postgres://prod:secret@db.internal/prod", AWS_SECRET_ACCESS_KEY="wJalrXUtnFEMI", OPENAI_API_KEY="sk-prod-12345", GITHUB_TOKEN="ghp_prodtoken123", ASANA_ACCESS_TOKEN="1/12345:prodasana")
+            res, payload = _run_fake_worker(script, task_id="task-safety", env_override=env_with_secrets)
+            self.assertEqual((res.returncode, payload["_stored_artifact_text"]), (0, "LEAKED= AWS=False DENIED=True\n"))
+            self.assertEqual(sentinel.read_text(encoding="utf-8"), "SECRET_SENTINEL_INTACT\n")
+            safety = payload["safety"]
+            self.assertFalse(safety["bypass_permissions_used"])
+            self.assertTrue({"PRODUCTION_DATABASE_URL", "AWS_SECRET_ACCESS_KEY"}.issubset(safety["stripped_env_keys"]))
+            probes = {probe["name"]: probe for probe in safety["probes"]}
+            self.assertTrue(probes["forbidden_credential_access"]["denied"] and probes["external_effect_restriction"]["denied"])
 
     def test_global_permission_bypass_and_platform_gate(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -166,6 +187,31 @@ class WorkerExecutionTest(unittest.TestCase):
             self.assertFalse(info["supported"])
             with self.assertRaises(UsageError):
                 worker_module._validate_spec(worker_module.WorkerSpec(task_id="t1", prompt="p", artifact="a.txt", time_limit_seconds=10), info)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo, home = make_repo(root), home_dir(root)
+            config(repo, home)
+            marker = root / "worker_started"
+            fake_bin = root / "fake-agy.py"
+            fake_bin.write_text(f"import pathlib, sys\nif '--version' in sys.argv: print('1.5.0'); sys.exit(0)\npathlib.Path({str(marker)!r}).write_text('started')\n", encoding="utf-8")
+            spec = worker_module.WorkerSpec(
+                task_id="t-unsafe", prompt="p", artifact="a.txt", time_limit_seconds=10,
+                agy_bin=sys.executable, agy_args=(str(fake_bin),),
+            )
+            from factory.paths import RuntimePaths
+            from factory import intake as intake_module
+            paths = RuntimePaths(repo=repo, home=home)
+            with mock.patch("factory.sandbox.sandbox_available", return_value=False):
+                result = worker_module.run_worker(paths, spec)
+            self.assertEqual((result.completed, result.status, marker.exists()), (False, "unsafe-environment", False))
+            with mock.patch.dict(os.environ, {"ASANA_ACCESS_TOKEN": "tok-1"}):
+                intake_res = intake_module.run_from_cli(paths, type("Args", (), {"task": "900", "deadline": time.monotonic() - 1.0})())
+            self.assertEqual(intake_res.evidence["requests"][0]["status"], "timeout")
+            from factory import sandbox as sandbox_module
+            long_arg = "x" * 400
+            with mock.patch.object(Path, "exists", side_effect=OSError(36, "File name too long")):
+                ro_dirs, ro_files = sandbox_module._collect_argv_ro_paths((sys.executable, "-c", long_arg), {}, repo, home)
+                self.assertEqual(ro_files, [])
 
     @unittest.skipUnless(os.environ.get("TURBO_LIVE_AGY") == "1", "requires TURBO_LIVE_AGY=1 and authenticated agy")
     def test_live_authenticated_agy_worker_completes_disposable_task(self):

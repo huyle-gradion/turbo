@@ -291,6 +291,13 @@ def _parse_parent_task(task_gid: str, parent_raw: dict[str, Any]) -> tuple[dict[
 def _evaluate_child_task(raw: dict[str, Any], parent_criteria_by_id: dict[str, dict[str, Any]]) -> dict[str, Any]:
     gid = str(raw.get("gid")).strip()
     sections = _split_sections(str(raw.get("notes") or ""))
+    outcome = _normalize_field(sections.get("outcome", ""))
+    scope_fields = _parse_bullets(sections.get("scope", ""))
+    scope = {
+        "in_scope": _normalize_field(scope_fields.get("in scope", "")),
+        "out_of_scope": _normalize_field(scope_fields.get("out of scope", ""), allow_none_literal=True),
+        "constraints": _normalize_field(scope_fields.get("constraints", ""), allow_none_literal=True),
+    }
     repo, branch, reviewer, issues = _check_delivery_target(_parse_bullets(sections.get("delivery target", "")))
     dependencies = _parse_bullets(sections.get("dependencies and handoff", ""))
     context = _parse_bullets(sections.get("context", ""))
@@ -356,8 +363,8 @@ def _evaluate_child_task(raw: dict[str, Any], parent_criteria_by_id: dict[str, d
         })
 
     return {
-        "gid": gid, "name": str(raw.get("name") or ""), "repository": repo,
-        "target_feature_branch": branch, "assigned_swe_reviewer": reviewer,
+        "gid": gid, "name": str(raw.get("name") or ""), "outcome": outcome, "scope": scope,
+        "repository": repo, "target_feature_branch": branch, "assigned_swe_reviewer": reviewer,
         "criteria": parsed_criteria, "parent_coverage": coverage, "blocked_by": blocked_by,
         "required_outputs": required_outputs, "produces": produces,
         "waiting_on": list(blocked_by), "issues": issues,
