@@ -1,29 +1,63 @@
-"""Unit and behavioral tests for child scope checks, isolated verification, and PR confirmation (#19)."""
+"""Unit and behavioral tests for child scope checks, isolated verification, and PR confirmation (#19, #20)."""
 
 from __future__ import annotations
 
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-import json, os, tempfile, threading, time, unittest
+import io
+import json
+import os
 from pathlib import Path
-from typing import Any
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+from typing import Any, Callable
+import unittest
 from unittest import mock
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
+import zipfile
 
 from factory import config as config_module, deliver_checks, worker as worker_module
 from factory.errors import UsageError
 from support import config, git, home_dir, make_repo
 
 ALLOWED_PR_POST_KEYS = frozenset({"title", "head", "base", "body", "draft", "maintainer_can_modify", "issue"})
+ALLOWED_PR_PATCH_KEYS = frozenset({"title", "body", "state", "base", "maintainer_can_modify"})
+
+
+def _build_evidence_zip(
+    records: dict[str, dict[str, Any]], *, run_id: int = 700, run_attempt: int = 1,
+) -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        manifest = {"schema": 1, "workflow_run_id": run_id, "run_attempt": run_attempt, "checks": records}
+        zf.writestr("turbo-ci-evidence.json", json.dumps(manifest, indent=2))
+        for name, item in records.items():
+            zf.writestr(f"logs/{name.replace('/', '__')}.log", str(item.get("log_text") or ""))
+    return buf.getvalue()
+
 
 class _DisposableGitHubServer:
     def __init__(
         self, *, bare_repo: Path | None = None, owner: str = "example", repo: str = "chat-bridge",
         post_status: int = 201, get_status: int = 200, redirect_to: str | None = None,
-        verify_override: dict[str, Any] | None = None,
+        verify_override: dict[str, Any] | None = None, patch_status: int = 200, ci_spec: dict[str, Any] | None = None,
+        check_runs_by_sha: dict[str, list[dict[str, Any]]] | None = None,
+        artifacts_by_run: dict[int, list[dict[str, Any]]] | None = None,
+        artifact_zips: dict[int, bytes] | None = None, page_size: int = 100,
+        on_patch_pull: Callable[[dict[str, Any]], None] | None = None,
     ) -> None:
         self.bare_repo, self.owner, self.repo = bare_repo, owner, repo
         self.post_status, self.get_status, self.redirect_to = post_status, get_status, redirect_to
         self.verify_override = verify_override or {}
+        self.patch_status, self.ci_spec, self.page_size, self.on_patch_pull = patch_status, ci_spec, page_size, on_patch_pull
+        self.check_runs_by_sha = check_runs_by_sha or {}
+        self.artifacts_by_run = artifacts_by_run or {}
+        self.artifact_zips = artifact_zips or {}
+        self.artifact_redirect_by_id: dict[int, str] = {}
+        self.workflow_runs_by_id: dict[int, dict[str, Any]] = {}
+        self._next_run_id, self._next_artifact_id = 500, 900
         self.requests: list[dict[str, Any]] = []
         self.pulls: dict[int, dict[str, Any]] = {}
         self._server = ThreadingHTTPServer(("127.0.0.1", 0), self._make_handler())
@@ -37,6 +71,70 @@ class _DisposableGitHubServer:
             return git(self.bare_repo, "rev-parse", f"refs/heads/{branch}")
         except AssertionError:
             return None
+
+    def _execute_real_ci_for_pr(
+        self, pr_num: int, base_branch: str, base_sha: str, head_branch: str, head_sha: str,
+    ) -> None:
+        if self.bare_repo is None or head_sha in self.check_runs_by_sha or (self.ci_spec or {}).get("mode") == "none":
+            return
+        slug, run_id = f"{self.owner}/{self.repo}", self._next_run_id
+        self._next_run_id += 1
+        with tempfile.TemporaryDirectory() as ci_tmp:
+            ci_ws = Path(ci_tmp) / "ci-checkout"
+            subprocess.run(["git", "clone", "-q", "--shared", str(self.bare_repo), str(ci_ws)], check=True)
+            git(ci_ws, "checkout", "-q", "-B", "ci-merge", base_sha)
+            merge_proc = subprocess.run(
+                ["git", "-C", str(ci_ws), "-c", "user.name=CI", "-c", "user.email=ci@example.test", "merge", "--no-ff", "-q", "-m", "Merge", head_sha],
+                capture_output=True, text=True, check=False,
+            )
+            if merge_proc.returncode != 0:
+                return
+            tested_sha = git(ci_ws, "rev-parse", "HEAD")
+            git(ci_ws, "push", "-q", "-f", "origin", f"{tested_sha}:refs/pull/{pr_num}/merge")
+            checks_to_run = list((self.ci_spec or {}).get("checks") or [
+                ("guard/gate-1", "guard", [sys.executable, "-c", "print('gate-1 host policy ok')"]),
+                ("guard/gate-2", "guard", [sys.executable, "-m", "unittest", "discover", "-s", "tests", "-v"]),
+                ("guard/gate-3", "guard", [sys.executable, "-c", "print('gate-3 protected paths ok')"]),
+                ("criterion/AC-1", "criterion", [sys.executable, "-m", "unittest", "discover", "-s", "tests", "-p", "test_auth.py", "-v"]),
+            ])
+            runs_list, evidence_records = [], {}
+            for idx, (chk_name, chk_kind, cmd_argv) in enumerate(checks_to_run, start=1):
+                proc = subprocess.run(cmd_argv, cwd=str(ci_ws), capture_output=True, text=True, check=False, timeout=30)
+                out_text = (proc.stdout + proc.stderr).strip() + "\n"
+                conclusion = "success" if proc.returncode == 0 else "failure"
+                job_id = run_id * 100 + idx
+                html_url = f"https://github.com/{slug}/actions/runs/{run_id}/job/{job_id}"
+                evidence_records[chk_name] = {
+                    "workflow_run_id": run_id, "run_attempt": 1, "workflow_path": ".github/workflows/ci.yml",
+                    "workflow_event": "pull_request", "workflow_head_sha": head_sha, "policy_sha": base_sha,
+                    "candidate_sha": head_sha, "base_sha": base_sha, "tested_sha": tested_sha,
+                    "revision_kind": "integration-merge", "check_name": chk_name, "kind": chk_kind,
+                    "command": " ".join(cmd_argv), "exit_code": proc.returncode,
+                    "conclusion": conclusion, "html_url": html_url, "log_text": out_text,
+                }
+                summary = (
+                    f"candidate_sha={head_sha}\nbase_sha={base_sha}\npolicy_sha={base_sha}\n"
+                    f"tested_sha={tested_sha}\nrevision_kind=integration-merge\nrun_attempt=1\nexit_code={proc.returncode}"
+                )
+                runs_list.append({
+                    "id": job_id, "name": chk_name, "head_sha": head_sha, "status": "completed",
+                    "conclusion": conclusion, "started_at": "2026-11-06T10:00:00Z", "completed_at": "2026-11-06T10:00:05Z",
+                    "html_url": html_url, "details_url": html_url, "app": {"slug": "github-actions"},
+                    "output": {"title": chk_name, "summary": summary, "text": out_text},
+                })
+            art_id = self._next_artifact_id
+            self._next_artifact_id += 1
+            self.check_runs_by_sha[head_sha] = runs_list
+            self.workflow_runs_by_id[run_id] = {
+                "id": run_id, "name": "CI", "path": ".github/workflows/ci.yml", "event": "pull_request",
+                "run_attempt": 1, "head_branch": head_branch, "head_sha": head_sha, "pull_requests": [{"number": pr_num}],
+            }
+            self.artifacts_by_run[run_id] = [{
+                "id": art_id, "name": "turbo-ci-evidence", "expired": False,
+                "archive_download_url": f"{self.base_url}/repos/{slug}/actions/artifacts/{art_id}/zip",
+                "url": f"{self.base_url}/repos/{slug}/actions/artifacts/{art_id}",
+            }]
+            self.artifact_zips[art_id] = _build_evidence_zip(evidence_records, run_id=run_id, run_attempt=1)
 
     def _make_handler(self) -> type[BaseHTTPRequestHandler]:
         outer = self
@@ -65,6 +163,12 @@ class _DisposableGitHubServer:
                 self.end_headers()
                 self.wfile.write(raw)
 
+            def _paginate(self, items: list[dict[str, Any]]) -> tuple[int, list[dict[str, Any]]]:
+                qs = parse_qs(urlparse(self.path).query)
+                per_page = min(int((qs.get("per_page") or [str(outer.page_size)])[0]), outer.page_size)
+                start = (max(1, int((qs.get("page") or ["1"])[0])) - 1) * per_page
+                return len(items), items[start : start + per_page]
+
             def do_POST(self) -> None:
                 length = int(self.headers.get("Content-Length") or "0")
                 raw = self.rfile.read(length).decode("utf-8", "replace") if length else "{}"
@@ -72,6 +176,8 @@ class _DisposableGitHubServer:
                 path = self._record_or_redirect(body)
                 if path is None:
                     return
+                if path.startswith(f"/api/v3/repos/{outer.owner}/{outer.repo}/actions/runs/") and path.endswith("/cancel"):
+                    return self._send_json(202, {})
                 if path != f"/api/v3/repos/{outer.owner}/{outer.repo}/pulls":
                     self._send_json(404, {"message": "Not Found"})
                     return
@@ -101,9 +207,67 @@ class _DisposableGitHubServer:
                 outer.pulls[pr_num] = pr_obj
                 self._send_json(201, pr_obj)
 
+            def do_PATCH(self) -> None:
+                length = int(self.headers.get("Content-Length") or "0")
+                raw = self.rfile.read(length).decode("utf-8", "replace") if length else "{}"
+                body = json.loads(raw) if raw.strip() else {}
+                if (path := self._record_or_redirect(body)) is None:
+                    return
+                prefix = f"/api/v3/repos/{outer.owner}/{outer.repo}/pulls/"
+                if not path.startswith(prefix) or not (pr_obj := outer.pulls.get(int(path[len(prefix) :]))):
+                    return self._send_json(404, {"message": "Not Found"})
+                if unexpected_keys := set(body.keys()) - ALLOWED_PR_PATCH_KEYS:
+                    return self._send_json(422, {"message": f"Unsupported PR PATCH fields: {sorted(unexpected_keys)}"})
+                if outer.patch_status != 200:
+                    return self._send_json(outer.patch_status, {"message": f"GitHub PATCH HTTP {outer.patch_status} failure"})
+                for field in ("body", "title"):
+                    if field in body:
+                        pr_obj[field] = str(body[field])
+                if outer.on_patch_pull is not None:
+                    outer.on_patch_pull(pr_obj)
+                self._send_json(200, json.loads(json.dumps(pr_obj)))
+
             def do_GET(self) -> None:
                 path = self._record_or_redirect()
                 if path is None:
+                    return
+                repo_prefix = f"/api/v3/repos/{outer.owner}/{outer.repo}"
+                if path.startswith(f"{repo_prefix}/commits/") and path.endswith("/check-runs"):
+                    sha = path[len(f"{repo_prefix}/commits/") : -len("/check-runs")]
+                    if sha not in outer.check_runs_by_sha:
+                        for pnum, pobj in list(outer.pulls.items()):
+                            if pobj["head"]["sha"] == sha and pobj["base"]["sha"]:
+                                outer._execute_real_ci_for_pr(pnum, pobj["base"]["ref"], pobj["base"]["sha"], pobj["head"]["ref"], sha)
+                                break
+                    total, batch = self._paginate(outer.check_runs_by_sha.get(sha, []))
+                    return self._send_json(200, {"total_count": total, "check_runs": batch})
+                if path.startswith(f"{repo_prefix}/actions/runs/") and path.endswith("/artifacts"):
+                    run_id = int(path[len(f"{repo_prefix}/actions/runs/") : -len("/artifacts")])
+                    total, batch = self._paginate(outer.artifacts_by_run.get(run_id, []))
+                    return self._send_json(200, {"total_count": total, "artifacts": batch})
+                if path.startswith(f"{repo_prefix}/actions/runs/"):
+                    run_id = int(path[len(f"{repo_prefix}/actions/runs/") :])
+                    pr1 = outer.pulls.get(1) or {"head": {"ref": "task/101-auth", "sha": ""}}
+                    wf = outer.workflow_runs_by_id.get(run_id) or {
+                        "id": run_id, "name": "CI", "path": ".github/workflows/ci.yml", "event": "pull_request",
+                        "run_attempt": 1, "head_branch": pr1["head"]["ref"], "head_sha": pr1["head"]["sha"],
+                        "pull_requests": [{"number": 1}],
+                    }
+                    return self._send_json(200, wf)
+                if path.startswith(f"{repo_prefix}/actions/artifacts/") and path.endswith("/zip"):
+                    art_id = int(path[len(f"{repo_prefix}/actions/artifacts/") : -len("/zip")])
+                    if redirect_loc := outer.artifact_redirect_by_id.get(art_id):
+                        self.send_response(302)
+                        self.send_header("Location", redirect_loc)
+                        self.end_headers()
+                        return
+                    if (raw_zip := outer.artifact_zips.get(art_id)) is None:
+                        return self._send_json(404, {"message": "Artifact Not Found"})
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/zip")
+                    self.send_header("Content-Length", str(len(raw_zip)))
+                    self.end_headers()
+                    self.wfile.write(raw_zip)
                     return
                 prefix = f"/api/v3/repos/{outer.owner}/{outer.repo}/pulls/"
                 if not path.startswith(prefix):
@@ -116,6 +280,11 @@ class _DisposableGitHubServer:
                 if not pr_obj:
                     self._send_json(404, {"message": "PR Not Found"})
                     return
+                if outer.bare_repo is not None:
+                    if live_head := outer._resolve_branch_sha(pr_obj["head"]["ref"]):
+                        pr_obj["head"]["sha"] = live_head
+                    if live_base := outer._resolve_branch_sha(pr_obj["base"]["ref"]):
+                        pr_obj["base"]["sha"] = live_base
                 for key, val in outer.verify_override.items():
                     if key in ("head_ref", "head_sha"):
                         pr_obj["head"][key.split("_", 1)[1]] = val
@@ -143,6 +312,7 @@ class _DisposableGitHubServer:
         self._server.shutdown()
         self._server.server_close()
 
+
 class DeliverChecksTest(unittest.TestCase):
     def test_scope_evaluation_anchored_globs_and_non_path_backtick_identifiers(self) -> None:
         prose = "Update `chat_bridge.auth.validate_token` and `TokenExpiredError` for `http/1.1` and/or `user.id` in v1.2"
@@ -153,7 +323,7 @@ class DeliverChecksTest(unittest.TestCase):
             "scope": {"in_scope": prose, "out_of_scope": "billing and/or webhook retries", "constraints": "stdlib only; keep `validate_token` stable"},
         }
         ok, violations, detail = deliver_checks.evaluate_scope(
-            ("src/chat_bridge/auth.py", "tests/test_auth.py"), semantic_child, ("AGENTS.md", "docs/spec.md")
+            ("src/chat_bridge/auth.py", "tests/test_auth.py"), semantic_child, ("AGENTS.md", "docs/spec.md"),
         )
         self.assertEqual((ok, violations, detail["status"]), (True, [], "deterministic-only-semantic-unverified"))
         self.assertEqual((detail["deterministic_ok"], detail["semantic_verified"]), (True, False))
@@ -166,12 +336,12 @@ class DeliverChecksTest(unittest.TestCase):
             },
         }
         ok_glob, violations_glob, detail_glob = deliver_checks.evaluate_scope(
-            ("src/chat_bridge/auth.py", "tests/test_auth.py", "tests/unit/deep/test_token.py"), glob_child, ("AGENTS.md", "docs/spec.md")
+            ("src/chat_bridge/auth.py", "tests/test_auth.py", "tests/unit/deep/test_token.py"), glob_child, ("AGENTS.md", "docs/spec.md"),
         )
         self.assertTrue(ok_glob, violations_glob)
         self.assertEqual((detail_glob["status"], detail_glob["semantic_verified"], detail_glob["constraint_paths"]), ("deterministic-verified", True, ["docs/spec.md"]))
         ok_unanchored, violations_unanchored, _ = deliver_checks.evaluate_scope(
-            ("other/src/chat_bridge/auth.py", "src/chat_bridge/sub/nested.py"), glob_child, ("AGENTS.md", "docs/spec.md")
+            ("other/src/chat_bridge/auth.py", "src/chat_bridge/sub/nested.py"), glob_child, ("AGENTS.md", "docs/spec.md"),
         )
         self.assertEqual((ok_unanchored, len(violations_unanchored)), (False, 2))
 
@@ -193,7 +363,7 @@ class DeliverChecksTest(unittest.TestCase):
             for expected in ("AGENTS.md", "src/moved_agents.md", "src/obsolete.py"):
                 self.assertIn(expected, rename_diff["changed_paths"])
             scope_ok, violations, _ = deliver_checks.evaluate_scope(
-                tuple(rename_diff["changed_paths"]), {"scope": {"in_scope": "`src/`"}}, ("AGENTS.md",)
+                tuple(rename_diff["changed_paths"]), {"scope": {"in_scope": "`src/`"}}, ("AGENTS.md",),
             )
             self.assertFalse(scope_ok)
             self.assertTrue(any("AGENTS.md" in v for v in violations))
@@ -221,7 +391,8 @@ class DeliverChecksTest(unittest.TestCase):
                 self.assertEqual((diff["has_implementation_changes"], diff["has_test_changes"]), expected_flags, msg)
 
     def test_isolated_git_checkout_and_verification_isolation_and_missing_executable(self) -> None:
-        import socket, sys
+        import socket
+
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             repo, home = make_repo(root), home_dir(root)
@@ -258,10 +429,7 @@ class DeliverChecksTest(unittest.TestCase):
             }
             worker_env, stripped = worker_module.sanitized_env(source_env, worktree_dir, isolated_home)
             self.assertIn("SSH_AUTH_SOCK", stripped)
-            self.assertEqual(
-                (worker_env["SSH_AUTH_SOCK"], worker_env["GIT_ALLOW_PROTOCOL"], worker_env["GIT_CONFIG_SYSTEM"]),
-                ("", "none", "/dev/null"),
-            )
+            self.assertEqual((worker_env["SSH_AUTH_SOCK"], worker_env["GIT_ALLOW_PROTOCOL"], worker_env["GIT_CONFIG_SYSTEM"]), ("", "none", "/dev/null"))
             accepted: list[int] = []
             listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             listener.bind(("127.0.0.1", 0))
@@ -325,7 +493,7 @@ class DeliverChecksTest(unittest.TestCase):
                 accept_thread.join(timeout=1.0)
             missing_bin_child = {"gid": "101", "name": "Missing", "criteria": [{"id": "AC-1", "verification": "pytest -q"}]}
             ok_miss, checks_miss, failures_miss = deliver_checks.run_child_verifications(
-                worktree_dir, missing_bin_child, conf, child_dir, home, {**worker_env, "PATH": "/nonexistent-bin"}, deadline, 30
+                worktree_dir, missing_bin_child, conf, child_dir, home, {**worker_env, "PATH": "/nonexistent-bin"}, deadline, 30,
             )
             self.assertEqual((ok_miss, checks_miss[0]["ok"], checks_miss[0]["executed"]), (False, False, False))
             self.assertTrue(any("pytest" in f for f in failures_miss))
@@ -363,7 +531,7 @@ class DeliverChecksTest(unittest.TestCase):
 
             with _DisposableGitHubServer(bare_repo=bare) as gh:
                 pr = _confirm(gh.base_url)
-                self.assertEqual((pr["verified"], pr["head_sha"]), (True, candidate_sha))
+                self.assertEqual((pr["pr_confirmed"], pr["ci_verified"], pr["head_sha"]), (True, False, candidate_sha))
                 self.assertEqual(set(gh.requests[0]["body"].keys()), {"title", "head", "base", "body"})
             for label, override in (
                 ("missing-base-repo", {"repo_full_name": ""}), ("missing-head-repo", {"head_repo_full_name": ""}),
@@ -391,6 +559,102 @@ class DeliverChecksTest(unittest.TestCase):
                 with mock.patch.dict(os.environ, {"TURBO_GITHUB_API_URL": bad_url}):
                     with self.assertRaises(UsageError):
                         deliver_checks.resolve_github_api()
+
+    def test_artifact_download_bounds_redirect_errors_size_caps_and_signed_url_redaction(self) -> None:
+        class _BlobRedirectHandler(BaseHTTPRequestHandler):
+            mode = "ok"
+            payload = b""
+            seen_auth: list[str | None] = []
+
+            def log_message(self, fmt: str, *args: object) -> None:
+                return
+
+            def do_GET(self) -> None:
+                _BlobRedirectHandler.seen_auth.append(self.headers.get("Authorization"))
+                if _BlobRedirectHandler.mode == "503":
+                    self.send_response(503)
+                    self.end_headers()
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", "application/zip")
+                self.send_header("Content-Length", str(len(_BlobRedirectHandler.payload)))
+                self.end_headers()
+                self.wfile.write(_BlobRedirectHandler.payload)
+
+        blob_srv = ThreadingHTTPServer(("127.0.0.1", 0), _BlobRedirectHandler)
+        blob_thread = threading.Thread(target=blob_srv.serve_forever, kwargs={"poll_interval": 0.02}, daemon=True)
+        blob_thread.start()
+        try:
+            blob_port = blob_srv.server_port
+            with _DisposableGitHubServer() as gh:
+                valid_zip = _build_evidence_zip({"guard/gate-1": {"check_name": "guard/gate-1", "log_text": "ok\n"}})
+                _BlobRedirectHandler.mode = "ok"
+                _BlobRedirectHandler.payload = valid_zip
+                _BlobRedirectHandler.seen_auth.clear()
+                signed_url = f"http://127.0.0.1:{blob_port}/blob/artifact.zip?sig=SECRET_SAS_SIGNATURE_999&se=2026"
+                gh.artifact_redirect_by_id[901] = signed_url
+                dl_url = f"{gh.base_url}/repos/example/chat-bridge/actions/artifacts/901/zip"
+                trace: list[dict[str, Any]] = []
+                raw = deliver_checks._download_zip_bytes(dl_url, "ghp_tok", gh.base_url, trace, time.monotonic() + 10.0, 10)
+                self.assertEqual(raw, valid_zip)
+                self.assertEqual(_BlobRedirectHandler.seen_auth, [None])
+                self.assertNotIn("SECRET_SAS_SIGNATURE_999", json.dumps(trace))
+
+                _BlobRedirectHandler.mode = "503"
+                trace_err: list[dict[str, Any]] = []
+                with self.assertRaises(deliver_checks.GitHubError) as ctx_503:
+                    deliver_checks._download_zip_bytes(dl_url, "ghp_tok", gh.base_url, trace_err, time.monotonic() + 10.0, 10)
+                self.assertNotIn("SECRET_SAS_SIGNATURE_999", str(ctx_503.exception))
+                self.assertNotIn("SECRET_SAS_SIGNATURE_999", json.dumps(trace_err))
+
+                with mock.patch.object(deliver_checks, "MAX_ARTIFACT_ZIP_BYTES", 32):
+                    _BlobRedirectHandler.mode = "ok"
+                    _BlobRedirectHandler.payload = b"x" * 128
+                    with self.assertRaises(deliver_checks.GitHubError) as ctx_cap:
+                        deliver_checks._download_zip_bytes(dl_url, "ghp_tok", gh.base_url, [], time.monotonic() + 10.0, 10)
+                    self.assertIn("exceeds maximum size", str(ctx_cap.exception))
+
+                gh.artifact_redirect_by_id.pop(901, None)
+                gh.artifacts_by_run[700] = [{
+                    "id": 901, "name": "turbo-ci-evidence", "expired": False,
+                    "archive_download_url": dl_url, "url": f"{gh.base_url}/repos/example/chat-bridge/actions/artifacts/901",
+                }]
+                gh.artifact_zips[901] = valid_zip
+                with mock.patch.object(deliver_checks, "MAX_EVIDENCE_JSON_BYTES", 10):
+                    _, issues = deliver_checks._fetch_run_evidence_artifacts(
+                        gh.base_url, "ghp_tok", "example/chat-bridge", {700: 1}, [], time.monotonic() + 10.0, 10,
+                    )
+                    self.assertTrue(any("exceeds maximum size" in i for i in issues), issues)
+
+                r_ok = {
+                    "id": 1, "status": "completed", "conclusion": "success", "run_attempt": 1,
+                    "started_at": "2026-11-06T10:00:00Z", "completed_at": "2026-11-06T10:00:05Z",
+                    "html_url": "https://github.com/example/chat-bridge/actions/runs/700/job/1",
+                }
+                r_queued = {
+                    "id": 2, "status": "queued", "conclusion": None, "run_attempt": 2,
+                    "started_at": "", "completed_at": "",
+                    "html_url": "https://github.com/example/chat-bridge/actions/runs/700/job/2",
+                }
+                sel_q, _, _, err_q = deliver_checks._select_authoritative_check_run(
+                    "criterion/AC-1", [r_ok, r_queued], gh.base_url, "ghp_tok", "example/chat-bridge",
+                    {700: {"id": 700, "run_attempt": 2}}, [], time.monotonic() + 10.0, 10,
+                )
+                self.assertEqual((sel_q["id"], err_q), (2, None))
+                r_bad = {
+                    "id": 3, "status": "completed", "conclusion": "success", "run_attempt": 2,
+                    "started_at": "2026-11-06T09:00:00Z", "completed_at": "2026-11-06T09:00:05Z",
+                    "html_url": "https://github.com/example/chat-bridge/actions/runs/700/job/3",
+                }
+                _, _, _, err_c = deliver_checks._select_authoritative_check_run(
+                    "criterion/AC-1", [r_ok, r_bad], gh.base_url, "ghp_tok", "example/chat-bridge",
+                    {700: {"id": 700, "run_attempt": 2}}, [], time.monotonic() + 10.0, 10,
+                )
+                self.assertIn("contradictory rerun ordering", str(err_c))
+        finally:
+            blob_srv.shutdown()
+            blob_srv.server_close()
+
 
 if __name__ == "__main__":
     unittest.main()
