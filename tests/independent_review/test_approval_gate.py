@@ -333,7 +333,23 @@ class ApprovalGateGroup1Test(unittest.TestCase):
                 review_record=rev_b, prior_approval=gate_a, repo=repo, home=home, child_dir=child_dir, child=PARSED_CHILD, conf=conf,
             )
             self.assertEqual((gate_b["delivery_approved"], gate_b["approved_revision"], gate_b["superseded_approved_revision"]), (True, cand_b, cand_a))
+            self.assertTrue(independent_review.verify_candidate_approval(cand_b, base_sha, gate_b, repo=repo, home=home)["delivery_approved"])
             self.assertFalse(independent_review.verify_candidate_approval(cand_b, base_sha, gate_a, repo=repo, home=home)["delivery_approved"])
+            fab_min = {
+                "role": "delivery-approval-gate", "verification_scope": independent_review.APPROVAL_GATE_SCOPE_NOTE,
+                "approved_revision": cand_b, "candidate_sha": cand_b, "base_sha": base_sha, "tested_sha": cand_b,
+                "revision_kind": "fast-forward-head", "delivery_approved": True, "status": "approved", "outcome": "approved", "blockers": [],
+                "prerequisites": {k: {"verified": True, "candidate_sha": cand_b, "base_sha": base_sha} for k in ("ci", "automated_qa", "security_review", "independent_review")},
+            }
+            for label, bad_ap in (
+                ("minimal-fabricated", fab_min),
+                ("relabelled-gate-a", json.loads(json.dumps(gate_a).replace(cand_a, cand_b))),
+                ("unresolved-hist-claim", {**gate_b, "historical_blockers": {"total": 1, "resolved_ids": [], "unresolved_ids": ["REV-1"], "all_verified_resolved": False}}),
+                ("fabricated-tested-sha", {**gate_b, "tested_sha": "f" * 40, "revision_kind": "integration-merge"}),
+            ):
+                self.assertFalse(independent_review.verify_candidate_approval(cand_b, base_sha, bad_ap, repo=repo, home=home)["delivery_approved"], f"M3 {label}")
+            (child_dir / "prior-blockers.json").write_text(json.dumps({"schema": 1, "updated_in_round": 1, "reviewed_revision": cand_a, "findings": [{"finding_id": "REV-UNRES-M3", "category": "bug", "severity": "high", "blocking": True, "target": "src/chat_bridge/auth.py", "rule": "r", "title": "t", "evidence": "e", "actionable_correction": "c", "status": "open", "introduced_in_round": 1, "introduced_in_revision": cand_a, "last_seen_round": 1, "last_seen_revision": cand_a}]}), encoding="utf-8")
+            self.assertFalse(independent_review.verify_candidate_approval(cand_b, base_sha, gate_b, repo=repo, home=home)["delivery_approved"], "M3 persisted-unresolved-history")
 
     def test_ac4_integrated_rejection_rules(self) -> None:
         from unittest import mock

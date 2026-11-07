@@ -429,7 +429,7 @@ def evaluate_approval_gate(
     child: dict[str, Any] | None = None, conf: config_module.Config | None = None, builder_session_id: str | None = None,
     builder_summary: str = "", prior_findings: list[dict[str, Any]] | None = None, prior_approval: dict[str, Any] | None = None,
     round_num: int | None = None, agy_bin: str | None = None, load_from_child_dir: bool = False,
-    deadline: float | None = None, limit_s: int = 30,
+    _persist: bool = True, deadline: float | None = None, limit_s: int = 30,
 ) -> dict[str, Any]:
     secrets = collect_redaction_secrets()
     if load_from_child_dir and child_dir is not None and home is not None:
@@ -480,11 +480,16 @@ def evaluate_approval_gate(
     unres_ids = [str(pf.get("finding_id")) for pf in hist_list if str(pf.get("finding_id")) not in set(res_ids)] if not rev_eval["verified"] else []
     tested_sha = ci_eval.get("tested_sha") if ci_eval["verified"] else (qa_eval.get("tested_sha") if qa_eval["verified"] else None)
     rev_kind = ci_eval.get("revision_kind") if ci_eval["verified"] else (qa_eval.get("revision_kind") if qa_eval["verified"] else None)
+    prov = None
+    if _persist and child_dir is not None and home is not None:
+        inp_p = child_dir / f"approval-gate-inputs-round-{eff_round}.json"
+        atomic_json(inp_p, {"candidate_sha": candidate_sha, "base_sha": base_sha, "tested_sha": tested_sha, "revision_kind": rev_kind, "round": eff_round, "child_dir": str(child_dir), "child": child, "ci_record": ci_record, "qa_record": qa_record, "security_record": security_record, "review_record": review_record, "prior_findings": prior_findings, "builder_session_id": builder_session_id}, home)
+        prov = {"child_dir": str(child_dir), "inputs_path": str(inp_p), "inputs_sha256": runner.digest_text(inp_p.read_text(encoding="utf-8", errors="replace"))}
     record = redact_value({
         "schema": 1, "role": "delivery-approval-gate", "verification_scope": APPROVAL_GATE_SCOPE_NOTE, "round": eff_round,
         "status": gate_status, "outcome": "approved" if all_verified else "rejected", "delivery_approved": bool(all_verified),
         "approved_revision": candidate_sha if all_verified else None, "candidate_sha": candidate_sha, "base_sha": base_sha,
-        "tested_sha": tested_sha, "revision_kind": rev_kind,
+        "tested_sha": tested_sha, "revision_kind": rev_kind, "provenance": prov,
         "superseded_approved_revision": prior_ap_rev if prior_ap_stale else None, "prior_approval_rejected": prior_ap_stale,
         "prerequisites": {
             "ci": dict(ci_eval), "automated_qa": dict(qa_eval), "security_review": dict(sec_eval),
@@ -493,7 +498,7 @@ def evaluate_approval_gate(
         "historical_blockers": {"total": len(hist_list), "resolved_ids": res_ids, "unresolved_ids": unres_ids, "all_verified_resolved": rev_eval["verified"], "resolutions": res_list},
         "blockers": blockers, "recorded_at": now(),
     }, secrets)
-    if child_dir is not None and home is not None:
+    if _persist and child_dir is not None and home is not None:
         atomic_json(child_dir / "approval-gate.json", record, home)
         atomic_json(child_dir / f"approval-gate-round-{eff_round}.json", record, home)
     return record
@@ -516,15 +521,30 @@ def verify_candidate_approval(
         return _rej("stale-candidate-revision", f"approval for ({ap_rev or ap_cand}, base={ap_base}) is rejected for candidate ({candidate_sha}, base={base_sha})", stale_approved_revision=ap_rev or ap_cand)
     if approval_record.get("delivery_approved") is not True or approval_record.get("status") != "approved" or approval_record.get("outcome") != "approved" or bool(approval_record.get("blockers")):
         return _rej(str(approval_record.get("status") or "rejected"), list(approval_record.get("blockers") or ["approval record is not approved"]))
-    prereqs = approval_record.get("prerequisites")
+    prereqs, hb = approval_record.get("prerequisites"), approval_record.get("historical_blockers")
     if not isinstance(prereqs, dict) or any(not isinstance(prereqs.get(k), dict) or prereqs[k].get("verified") is not True or prereqs[k].get("candidate_sha") != candidate_sha or prereqs[k].get("base_sha") != base_sha for k in ("ci", "automated_qa", "security_review", "independent_review")):
         return _rej("prerequisite-unverified", "approval record is missing verified candidate-bound prerequisites")
+    if not isinstance(hb, dict) or hb.get("all_verified_resolved") is not True or hb.get("unresolved_ids") != [] or type(hb.get("total")) is not int or hb.get("total") < 0 or not isinstance(hb.get("resolved_ids"), list) or len(hb["resolved_ids"]) != hb["total"]:
+        return _rej("unresolved-historical-blockers", "approval record has unverified or inconsistent historical_blockers")
     t_sha, r_kind = approval_record.get("tested_sha"), approval_record.get("revision_kind")
-    if not isinstance(t_sha, str) or not ci_gate.SHA40_RE.fullmatch(t_sha) or r_kind not in ("fast-forward-head", "integration-merge") or (t_sha == candidate_sha and r_kind != "fast-forward-head") or (t_sha != candidate_sha and r_kind != "integration-merge"):
+    if not isinstance(t_sha, str) or not ci_gate.SHA40_RE.fullmatch(t_sha) or r_kind not in ("fast-forward-head", "integration-merge") or (t_sha == candidate_sha) != (r_kind == "fast-forward-head"):
         return _rej("stale-candidate-revision", "approval record has invalid tested_sha or revision_kind binding")
-    if any(x is not None for x in (ci_record, qa_record, security_record, review_record)):
-        return evaluate_approval_gate(
-            candidate_sha=candidate_sha, base_sha=base_sha, ci_record=ci_record, qa_record=qa_record, security_record=security_record,
-            review_record=review_record, repo=repo, home=home, child_dir=child_dir, child=child, conf=conf, deadline=deadline, limit_s=limit_s,
-        )
+    prior_f, b_sid, prov = None, None, approval_record.get("provenance")
+    if isinstance(prov, dict) and home is not None and _verify_file_digest(prov.get("inputs_path"), prov.get("inputs_sha256"), home, "approval provenance") is None:
+        inp = read_json(Path(str(prov["inputs_path"])), home)
+        if isinstance(inp, dict) and (inp.get("candidate_sha"), inp.get("base_sha"), inp.get("tested_sha"), inp.get("revision_kind")) == (candidate_sha, base_sha, t_sha, r_kind):
+            child_dir = child_dir or (Path(str(inp["child_dir"])) if inp.get("child_dir") else None)
+            child = child if child is not None else inp.get("child")
+            ci_record, qa_record = (ci_record if ci_record is not None else inp.get("ci_record")), (qa_record if qa_record is not None else inp.get("qa_record"))
+            security_record, review_record = (security_record if security_record is not None else inp.get("security_record")), (review_record if review_record is not None else inp.get("review_record"))
+            prior_f, b_sid = inp.get("prior_findings"), inp.get("builder_session_id")
+    if conf is None and repo is not None and home is not None and (repo / ".factory" / "config.toml").is_file():
+        conf = config_module.load(config_module.RuntimePaths(repo=repo, home=home))
+    reval = evaluate_approval_gate(
+        candidate_sha=candidate_sha, base_sha=base_sha, ci_record=ci_record, qa_record=qa_record, security_record=security_record,
+        review_record=review_record, repo=repo, home=home, child_dir=child_dir, child=child, conf=conf,
+        builder_session_id=b_sid, prior_findings=prior_f, load_from_child_dir=True, _persist=False, deadline=deadline, limit_s=limit_s,
+    )
+    if not reval["delivery_approved"] or reval.get("tested_sha") != t_sha or reval.get("revision_kind") != r_kind:
+        return _rej(str(reval.get("status") if not reval["delivery_approved"] else "stale-candidate-revision"), list(reval.get("blockers") or ["underlying prerequisite revalidation failed"]))
     return approval_record
