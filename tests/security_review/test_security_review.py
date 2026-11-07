@@ -14,9 +14,10 @@ for _p in (str(ROOT), str(ROOT / "tests")):
 from factory import config as config_module, deliver_checks, security_review
 from factory.paths import RuntimePaths
 from support import git
-from test_deliver import PARENT_TASK, READY_CHILD, _make_disposable_product_workspace, _make_fake_agy
+from test_deliver import PARENT_TASK, _make_disposable_product_workspace, _make_fake_agy
 from test_deliver_checks import _DisposableGitHubServer
 from test_intake import _DisposableAsanaServer
+from tests.security_review.test_reviewer import CLEAN_AUTH_PY, EXPIRED_TEST_APPEND, PARSED_CHILD, READY_CHILD, REVIEWER_SCRIPT
 
 
 class _SyncingGitHubServer(_DisposableGitHubServer):
@@ -28,26 +29,6 @@ class _SyncingGitHubServer(_DisposableGitHubServer):
         return sha
 
 
-CLEAN_AUTH_PY = (
-    "class TokenExpiredError(Exception): pass\ndef validate_token(token: str) -> dict[str, str]:\n"
-    "    if token.startswith('expired:'): raise TokenExpiredError('expired')\n    return {'sub': token}\n"
-)
-EXPIRED_TEST_APPEND = (
-    "\n    def test_expired(self) -> None:\n        from chat_bridge.auth import TokenExpiredError\n"
-    "        with self.assertRaises(TokenExpiredError): validate_token('expired:1')\n"
-)
-REVIEWER_SCRIPT = (
-    "import json, pathlib, sys\nprompt = sys.argv[sys.argv.index('--print') + 1] if '--print' in sys.argv else ''\n"
-    "for req in ('Role: security-reviewer', 'Applicable security policies:', 'SEC-POL-01', 'Sub-task constraints:', 'Required JSON response schema:'):\n"
-    "    assert req in prompt, f'missing {req} in reviewer prompt'\n"
-    "af = pathlib.Path('src/chat_bridge/auth.py'); txt = af.read_text(encoding='utf-8') if af.is_file() else ''\n"
-    "findings = [{'policy_id': 'SEC-POL-01', 'rule': 'hardcoded-secret', 'severity': 'critical', 'blocking': True, 'title': 'Hardcoded secret',\n"
-    "             'file_path': 'src/chat_bridge/auth.py', 'line': 2, 'evidence': 'BACKDOOR_SECRET', 'actionable_correction': 'Remove BACKDOOR_SECRET',\n"
-    "             'verification_command': 'python3 -m factory.security_review --verify-file src/chat_bridge/auth.py --rule hardcoded-secret'}] if 'BACKDOOR_SECRET' in txt else []\n"
-    "print(json.dumps({'event': 'result', 'result': {'conversation_id': 'sec-reviewer-1', 'status': 'SUCCESS', 'response': json.dumps({'outcome': 'changes-requested' if findings else 'approved', 'findings': findings})}}))\n"
-)
-
-
 def _make_builder_script(mode: str) -> str:
     vuln_block = (
         "    af.write_text('class TokenExpiredError(Exception): pass\\nBACKDOOR_SECRET = \"seed-bypass-token\"\\n"
@@ -56,7 +37,7 @@ def _make_builder_script(mode: str) -> str:
         "    tf.write_text(tf.read_text(encoding='utf-8') + '\\n    def test_expired(self):\\n"
         "        from chat_bridge.auth import TokenExpiredError\\n        with self.assertRaises(TokenExpiredError): validate_token(\"expired:x\")\\n', encoding='utf-8')\n"
         "    subprocess.run(['git', 'add', '.'], check=True); subprocess.run(['git', 'commit', '-q', '-m', 'vuln'], check=True)\n"
-        "    res = {'conversation_id': 'builder-round-0', 'status': 'SUCCESS', 'response': 'ok', 'usage': {'input_tokens': 100, 'output_tokens': 50, 'total_tokens': 150}}\n"
+        "    res = {'conversation_id': 'builder-round-0', 'status': 'SUCCESS', 'response': 'ok', 'usage': {'input_tokens': 100, 'output_tokens': 50, 'thinking_tokens': 10, 'cache_read_tokens': 5, 'total_tokens': 165}}\n"
     )
     repair_blocks = {
         "fix": (
@@ -66,10 +47,11 @@ def _make_builder_script(mode: str) -> str:
             "    res = {'conversation_id': 'builder-repair-1', 'status': 'SUCCESS', 'response': 'ok'}\n"
         ),
         "fix-with-usage": (
+            "    import tempfile\n    with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8') as tf_tmp: tf_tmp.write('ok')\n"
             "    af.write_text('class TokenExpiredError(Exception): pass\\ndef validate_token(token: str) -> dict[str, str]:\\n"
             "    if token.startswith(\"expired:\"): raise TokenExpiredError(\"expired\")\\n    return {\"sub\": token}\\n', encoding='utf-8')\n"
             "    subprocess.run(['git', 'add', 'src/chat_bridge/auth.py'], check=True); subprocess.run(['git', 'commit', '-q', '-m', 'fix'], check=True)\n"
-            "    res = {'conversation_id': 'builder-repair-1', 'status': 'SUCCESS', 'response': 'ok', 'usage': {'input_tokens': 200, 'output_tokens': 80, 'total_tokens': 280}}\n"
+            "    res = {'conversation_id': 'builder-repair-1', 'status': 'SUCCESS', 'response': 'ok', 'usage': {'input_tokens': 200, 'output_tokens': 80, 'thinking_tokens': 20, 'cache_read_tokens': 15, 'total_tokens': 315}}\n"
         ),
         "stubborn": (
             "    af.write_text('# claim fixed\\n' + af.read_text(encoding='utf-8'), encoding='utf-8')\n"
@@ -91,17 +73,15 @@ def _make_builder_script(mode: str) -> str:
             "    print(json.dumps({'event': 'step', 'step_update': {'state': 'PERMISSION_DENIED', 'error': 'permission denied by sandbox'}}))\n"
             "    res = {'conversation_id': 'builder-denied', 'status': 'ERROR', 'error': 'permission denied'}\n"
         ),
+        "malformed-output": "    print('not-json-at-all'); sys.exit(0)\n",
     }
     return (
         "import json, pathlib, subprocess, sys\n"
         "prompt = sys.argv[sys.argv.index('--print') + 1] if '--print' in sys.argv else ''\n"
         "af, tf = pathlib.Path('src/chat_bridge/auth.py'), pathlib.Path('tests/test_auth.py')\n"
         f"if 'SECURITY REPAIR' not in prompt:\n{vuln_block}else:\n{repair_blocks[mode]}"
-        "print(json.dumps({'event': 'result', 'result': res}))\n"
+        + ("" if mode == "malformed-output" else "print(json.dumps({'event': 'result', 'result': res}))\n")
     )
-
-
-VULN_THEN_FIX_SCRIPT = _make_builder_script("fix")
 
 
 def run_disposable_demo(tmp: Path) -> dict[str, Any]:
@@ -124,10 +104,10 @@ def run_disposable_demo(tmp: Path) -> dict[str, Any]:
         "{'outcome':'approved','findings':[{'policy_id':'SEC-POL-04','rule':'strip-token','blocking':False,'severity':'low',"
         "'title':'Optional whitespace normalization','file_path':'src/chat_bridge/auth.py','line':4}]})}}))\n")
     clean_rev = security_review.review_candidate_security(
-        repo=repo, home=home, child_dir=child_dir, child=READY_CHILD, conf=conf,
+        repo=repo, home=home, child_dir=child_dir, child=PARSED_CHILD, conf=conf,
         base_sha=base_sha, candidate_sha=cand1_sha, round_num=1, agy_bin=str(rev_agy), deadline=time.monotonic() + 30.0, limit_s=30)
     sugg_rev = security_review.review_candidate_security(
-        repo=repo, home=home, child_dir=child_dir, child=READY_CHILD, conf=conf, base_sha=base_sha,
+        repo=repo, home=home, child_dir=child_dir, child=PARSED_CHILD, conf=conf, base_sha=base_sha,
         candidate_sha=cand1_sha, round_num=1, agy_bin=str(sugg_agy), deadline=time.monotonic() + 30.0, limit_s=30)
     repair_agy = _make_fake_agy(tmp, "agy-repair", _make_builder_script("fix"))
     stubborn_agy = _make_fake_agy(tmp, "agy-stubborn", _make_builder_script("stubborn"))
@@ -137,11 +117,11 @@ def run_disposable_demo(tmp: Path) -> dict[str, Any]:
           unittest.mock.patch.dict(os.environ, {"TURBO_ASANA_API_URL": asana.base_url, "ASANA_ACCESS_TOKEN": "tok-a",
                                                 "TURBO_GITHUB_API_URL": gh.base_url, "TURBO_GITHUB_TOKEN": "tok-g"})):
         pr_info = deliver_checks.open_and_confirm_pr(
-            gh.base_url, "tok-g", "example/chat-bridge", PARENT_TASK, READY_CHILD,
+            gh.base_url, "tok-g", "example/chat-bridge", PARENT_TASK, PARSED_CHILD,
             "task/101-auth", cand1_sha, "feature/chat-auth", [], scope_detail, [], time.monotonic() + 30.0, 30)
         ev = lambda rec, sha=cand1_sha: security_review.evaluate_child_pr_with_security_gate(
             repo=repo, home=home, child_dir=child_dir, base_url=gh.base_url, token="tok-g", repo_slug="example/chat-bridge",
-            parent=PARENT_TASK, child=READY_CHILD, conf=conf, pr_info=pr_info, head_branch="task/101-auth", candidate_sha=sha,
+            parent=PARENT_TASK, child=PARSED_CHILD, conf=conf, pr_info=pr_info, head_branch="task/101-auth", candidate_sha=sha,
             base_branch="feature/chat-auth", base_sha=base_sha, scope_detail=scope_detail, security_review_record=rec,
             trace=[], deadline=time.monotonic() + 30.0, limit_s=30)
         r_clean, r_missing, r_sugg = ev(clean_rev), ev(None), ev(sugg_rev)
@@ -213,15 +193,15 @@ class SecurityReviewSlice2Test(unittest.TestCase):
         for needle in ("name: security-review", 'FACTORY_ROOT="', 'FACTORY="$FACTORY_ROOT/bin/factory"'):
             self.assertIn(needle, skill_text)
         self.assertTrue((ROOT / "docs/security-review/README.md").is_file())
+        demo_sh = ROOT / "scripts/demo-security-review.sh"
+        self.assertIn("DEMO_SECURITY_REVIEW_OK", demo_sh.read_text(encoding="utf-8"))
+        self.assertEqual(subprocess.run(["bash", "-n", str(demo_sh)], check=False).returncode, 0)
         with tempfile.TemporaryDirectory() as tmp:
             p = Path(tmp) / "sample.py"
             p.write_text("x = 1\n", encoding="utf-8")
             self.assertEqual(security_review.main(["--repo", tmp, "--verify-file", "sample.py"]), 0)
             p.write_text("BACKDOOR_SECRET = 'abc'\n", encoding="utf-8")
             self.assertEqual(security_review.main(["--repo", tmp, "--verify-file", "sample.py", "--rule", "hardcoded-secret"]), 1)
-        proc = subprocess.run(["bash", str(ROOT / "scripts/demo-security-review.sh")], capture_output=True, text=True, check=False)
-        self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("DEMO_SECURITY_REVIEW_OK", proc.stdout)
 
 
 if __name__ == "__main__":

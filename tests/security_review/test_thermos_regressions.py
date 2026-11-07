@@ -76,6 +76,16 @@ class ThermosRegressionsTest(unittest.TestCase):
                         security_review.DeliverSecuritySpec(task_ref="900", time_limit_seconds=30, agy_bin=str(builder_agy), reviewer_agy_bin=str(rev_agy)))
                 self.assertEqual((res_to.status, res_to.verified), ("timed-out", False))
                 self.assertFalse(json.loads((home / "deliveries/900/record.json").read_text(encoding="utf-8"))["verified"])
+                self.assertEqual(res_to.child["ci_verification"]["status"], "verified", "must preserve initial ci_verification when round 1 fails")
+                gh_ev_txt = Path(res_to.evidence["github_evidence_path"]).read_text(encoding="utf-8")
+                self.assertEqual(res_to.evidence["github_evidence_sha256"], security_review.runner.digest_text(gh_ev_txt))
+
+                with unittest.mock.patch.object(security_review.delivery, "resolve_github_token", side_effect=UsageError("missing token after deliver")):
+                    res_cfg = security_review.deliver_with_security_review(
+                        RuntimePaths(repo=repo, home=home),
+                        security_review.DeliverSecuritySpec(task_ref="900", time_limit_seconds=30, agy_bin=str(builder_agy), reviewer_agy_bin=str(rev_agy)))
+                self.assertFalse(res_cfg.verified)
+                self.assertFalse(json.loads((home / "deliveries/900/record.json").read_text(encoding="utf-8"))["verified"])
 
     def test_02_independent_verification_tempfile_in_landlock_sandbox(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -122,6 +132,8 @@ class ThermosRegressionsTest(unittest.TestCase):
             noop_agy = _make_fake_agy(root, "agy-noop", _make_builder_script("noop"))
             hollow_agy = _make_fake_agy(root, "agy-hollow", _make_builder_script("hollow-revert"))
             denied_agy = _make_fake_agy(root, "agy-denied", _make_builder_script("permission-denied"))
+            mal_agy = _make_fake_agy(root, "agy-mal", _make_builder_script("malformed-output"))
+            fix_agy = _make_fake_agy(root, "agy-fix", _make_builder_script("fix"))
             with (_DisposableAsanaServer(PARENT_TASK, [{"data": [READY_CHILD], "next_page": None}]) as asana,
                   _SyncingGitHubServer(bare_repo=bare) as gh,
                   unittest.mock.patch.dict(os.environ, {"TURBO_ASANA_API_URL": asana.base_url, "ASANA_ACCESS_TOKEN": "tok-a",
@@ -129,10 +141,25 @@ class ThermosRegressionsTest(unittest.TestCase):
                 run_d = lambda agy: security_review.deliver_with_security_review(
                     RuntimePaths(repo=repo, home=home),
                     security_review.DeliverSecuritySpec(task_ref="900", time_limit_seconds=30, agy_bin=str(agy), reviewer_agy_bin=str(rev_agy)))
-                r_noop, r_hollow, r_denied = run_d(noop_agy), run_d(hollow_agy), run_d(denied_agy)
+                r_noop, r_hollow, r_denied, r_mal = run_d(noop_agy), run_d(hollow_agy), run_d(denied_agy), run_d(mal_agy)
+                orig_exec = worker_module.execute_stream
+                def _timeout_on_repair(wt, argv, env, t_out, **kw):
+                    if any("SECURITY REPAIR" in str(a) for a in argv):
+                        return 124, "", "timed out", 1000, True
+                    return orig_exec(wt, argv, env, t_out, **kw)
+                orig_git_timed = security_review.delivery.git_timed
+                def _git_timed_fail_after_timeout(wt, dl, lim, desc, *args):
+                    if desc == "repair diff":
+                        raise deliver_checks.AttemptTimeoutError("deadline expired before post-repair git_timed")
+                    return orig_git_timed(wt, dl, lim, desc, *args)
+                with (unittest.mock.patch.object(worker_module, "execute_stream", side_effect=_timeout_on_repair),
+                      unittest.mock.patch.object(security_review.delivery, "git_timed", side_effect=_git_timed_fail_after_timeout)):
+                    r_to = run_d(fix_agy)
             self.assertEqual((r_noop.status, r_noop.verified), ("missing-implementation", False))
             self.assertEqual((r_hollow.status, r_hollow.verified), ("missing-implementation", False))
             self.assertEqual((r_denied.status, r_denied.verified), ("permission-denied", False))
+            self.assertEqual((r_mal.status, r_mal.verified), ("malformed-output", False))
+            self.assertEqual((r_to.status, len(r_to.child["security_repair"]["repair_attempts"])), ("timed-out", 1))
 
     def test_05_ci_polling_round1_reuse_section_replacement_and_post_patch_drift(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -153,21 +180,27 @@ class ThermosRegressionsTest(unittest.TestCase):
                     candidate_sha=cand_sha, base_branch="feature/chat-auth", base_sha=base_sha, scope_detail=scope_detail,
                     security_review_record=clean_rev, trace=[], deadline=time.monotonic() + 30.0, limit_s=30, **kw)
                 g1 = ev_gate(pr_info)
-                orig_drift, calls = security_review.ci_gate._check_pr_revision_drift, []
+                self.assertEqual(g1["verification_scope"], security_review.VERIFICATION_SCOPE_SECURITY_NOTE)
+                orig_drift, calls = security_review.delivery.ci_gate._check_pr_revision_drift, []
                 def _drift_on_second(*args, **kwargs):
                     calls.append(1)
                     return (({"head_sha": "deadbeef", "base_sha": base_sha, "state": "open", "body": gh.pulls[pr_info["number"]]["body"]}, ["PR head drifted"])
                             if len(calls) >= 2 else orig_drift(*args, **kwargs))
-                with unittest.mock.patch.object(security_review.ci_gate, "_check_pr_revision_drift", side_effect=_drift_on_second):
+                with unittest.mock.patch.object(security_review.delivery.ci_gate, "_check_pr_revision_drift", side_effect=_drift_on_second):
                     g_drift = ev_gate(g1["pr"])
                 self.assertEqual((g_drift["status"], g_drift["verified"]), ("stale-security-review", False))
+                self.assertFalse(g_drift["pr"].get("ci_verified", False))
+                self.assertFalse(g_drift["pr"].get("pr_confirmed", False))
                 self.assertIn("verified=`False`", gh.pulls[pr_info["number"]]["body"])
+                self.assertIn("sec-reviewer-1", gh.pulls[pr_info["number"]]["body"])
                 self.assertEqual(gh.pulls[pr_info["number"]]["body"].count("## Security Review Evidence"), 1)
-                with unittest.mock.patch.object(security_review.ci_gate, "evaluate_child_pr_ci_gate", wraps=security_review.ci_gate.evaluate_child_pr_ci_gate) as spy_ci:
+                with unittest.mock.patch.object(security_review.delivery.ci_gate, "evaluate_child_pr_ci_gate", wraps=security_review.delivery.ci_gate.evaluate_child_pr_ci_gate) as spy_ci:
                     ev_gate(pr_info, ci_result=g1)
                     self.assertEqual(spy_ci.call_count, 0, "round 1 matching ci_result must be reused without re-polling")
                     ev_gate(pr_info, ci_result={**g1, "candidate_sha": "other-sha"})
                     self.assertEqual(spy_ci.call_count, 1, "mismatched ci_result candidate_sha must re-poll")
+                    ev_gate(pr_info, ci_result={**g1, "base_sha": ""})
+                    self.assertEqual(spy_ci.call_count, 2, "missing ci_result base_sha must re-poll")
                     g_pend = ev_gate(pr_info, ci_result={**g1, "status": "ci-pending", "verified": False, "blockers": ["CI pending"]})
                     self.assertEqual((g_pend["status"], g_pend["verified"]), ("ci-pending", False))
 
@@ -302,18 +335,26 @@ class ThermosRegressionsTest(unittest.TestCase):
             self.assertEqual(security_review.main(["--repo", str(repo), "--home", str(repo), "--task", "900"]), 2)
 
             builder_agy = _make_fake_agy(root, "agy-builder-meas", _make_builder_script("fix-with-usage"))
+            rates = worker_module.RateCard(input_usd_per_1m=2.0, output_usd_per_1m=10.0)
             with (_DisposableAsanaServer(PARENT_TASK, [{"data": [READY_CHILD], "next_page": None}]) as asana,
                   _SyncingGitHubServer(bare_repo=bare) as gh,
                   unittest.mock.patch.dict(os.environ, {"TURBO_ASANA_API_URL": asana.base_url, "ASANA_ACCESS_TOKEN": "tok-a",
                                                         "TURBO_GITHUB_API_URL": gh.base_url, "TURBO_GITHUB_TOKEN": "tok-g"})):
                 res = security_review.deliver_with_security_review(
                     RuntimePaths(repo=repo, home=home),
-                    security_review.DeliverSecuritySpec(task_ref="900", time_limit_seconds=30, agy_bin=str(builder_agy), reviewer_agy_bin=str(rev_agy)))
+                    security_review.DeliverSecuritySpec(task_ref="900", time_limit_seconds=30, agy_bin=str(builder_agy), reviewer_agy_bin=str(rev_agy), rates=rates))
             self.assertTrue(res.verified)
             self.assertNotIn("BACKDOOR_SECRET", Path(res.evidence["candidate_diff_path"]).read_text(encoding="utf-8"))
             gh_ev = json.loads(Path(res.evidence["github_evidence_path"]).read_text(encoding="utf-8"))
             self.assertEqual(gh_ev["ci_verification"]["candidate_sha"], res.child["candidate_sha"])
             self.assertEqual(res.measurements["usage"]["input_tokens"], 300, "must retain and aggregate repair builder token usage")
+            self.assertEqual(res.measurements["usage"]["thinking_tokens"], 30)
+            self.assertEqual(res.measurements["usage"]["cache_read_tokens"], 20)
+            self.assertEqual((res.measurements["cost"]["state"], res.measurements["cost"]["usd"]), ("estimated", 0.0019))
+            rep_cost = security_review.delivery._merge_measurements(
+                {"usage": {"state": "reported"}, "cost": {"state": "reported", "usd": 0.05}},
+                [{"usage": {"state": "reported"}, "cost": {"state": "reported", "usd": 0.03}}], 100)
+            self.assertEqual((rep_cost["cost"]["state"], rep_cost["cost"]["usd"]), ("reported", 0.08))
 
 
 if __name__ == "__main__":
