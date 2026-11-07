@@ -17,9 +17,9 @@ from tests.security_review.test_reviewer import CLEAN_AUTH_PY, EXPIRED_TEST_APPE
 PARSED_CHILD = intake_eval._evaluate("900", PARENT_TASK, [READY_CHILD])[1][0]
 DEFAULT_ASSESSMENT = {k: {"status": "satisfied", "summary": f"{k} satisfied on candidate."} for k in independent_review.ASSESSMENT_KEYS}
 
-def _make_staged_reviewer_script(*, session_id: str = "ind-rev-1", phase2_session_id: str | None = None, hypotheses: list[str] | None = None, outcome: str = "review-passed", findings: list[dict] | None = None, assessment: dict | None = None, mutate_in_phase: int | None = None, mutate_kind: str = "unstaged") -> str:
+def _make_staged_reviewer_script(*, session_id: str = "ind-rev-1", phase2_session_id: str | None = None, hypotheses: list[str] | None = None, outcome: str = "review-passed", findings: list[dict] | None = None, reconciliations: list[dict] | None = None, assessment: dict | None = None, mutate_in_phase: int | None = None, mutate_kind: str = "unstaged") -> str:
     hyps = hypotheses if hypotheses is not None else ["Token validation might not strip whitespace or reject expired tokens", "Tests might only cover happy path without expired token assertion"]
-    f_list, assess = findings or [], assessment or DEFAULT_ASSESSMENT
+    f_list, r_list, assess = findings or [], reconciliations or [], assessment or DEFAULT_ASSESSMENT
     return (
         "import json, pathlib, subprocess, sys\n"
         "prompt = sys.argv[sys.argv.index('--print') + 1] if '--print' in sys.argv else ''\n"
@@ -39,12 +39,12 @@ def _make_staged_reviewer_script(*, session_id: str = "ind-rev-1", phase2_sessio
         "    assert '--conversation' in sys.argv, 'missing --conversation continuation flag in phase 2'\n"
         "    resumed_sid = sys.argv[sys.argv.index('--conversation') + 1]\n"
         "    assert resumed_sid == pathlib.Path.home().joinpath('.phase1_sid').read_text(encoding='utf-8').strip()\n"
-        "    for req in ('PHASE: 2 (substantive-assessment', 'Persisted Phase-1 Hypotheses:', 'Builder Summary (untrusted claim):'): assert req in prompt\n"
+        "    for req in ('PHASE: 2 (substantive-assessment', 'Persisted Phase-1 Hypotheses:', 'Prior Blocking Findings Requiring Verified Reconciliation:', 'Builder Summary (untrusted claim):'): assert req in prompt\n"
         f"    if {mutate_in_phase!r} == 2:\n"
         f"        if {mutate_kind!r} == 'untracked': pathlib.Path('reviewer_note.txt').write_text('x', encoding='utf-8')\n"
         "        else: pathlib.Path('src/chat_bridge/auth.py').write_text('# mut2\\n', encoding='utf-8')\n"
         "    out_sid = p2_override if p2_override is not None else resumed_sid\n"
-        f"    resp = json.dumps({{'outcome': {outcome!r}, 'assessment': {assess!r}, 'findings': {f_list!r}}})\n"
+        f"    resp = json.dumps({{'outcome': {outcome!r}, 'assessment': {assess!r}, 'findings': {f_list!r}, 'reconciliations': {r_list!r}}})\n"
         "    print(json.dumps({'event': 'result', 'result': {'conversation_id': out_sid, 'status': 'SUCCESS', 'response': resp}}))\n"
     )
 
@@ -400,6 +400,108 @@ class IndependentReviewTest(unittest.TestCase):
                 self.assertTrue(rec["role_issues"] and (child_dir / f"independent-review-round-{idx}" / "record.json").is_file())
             self.assertTrue((child_dir / "independent-review.json").is_file())
 
+    def test_ac6_multi_round_blocker_reconciliation_lifecycle(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo, home, base_sha, _, _, child_dir, _, _, run_rev = self._setup_workspace(root)
+            vcmd_fix = "python3 -c \"import pathlib, sys; sys.exit(0 if 'if not token:' in pathlib.Path('src/chat_bridge/auth.py').read_text() else 1)\""
+            vcmd_nla = "python3 -c \"import pathlib, sys; sys.exit(0 if not pathlib.Path('src/chat_bridge/legacy_helper.py').exists() else 1)\""
+            (repo / "src/chat_bridge/legacy_helper.py").write_text("LEGACY = True\n", encoding="utf-8")
+            git(repo, "add", "."); git(repo, "commit", "-q", "-m", "round 1 with blank-token bug and legacy helper")
+            cand1 = git(repo, "rev-parse", "HEAD")
+            child_ac6 = {**PARSED_CHILD, "scope": {**PARSED_CHILD["scope"], "in_scope": "src/chat_bridge/auth.py, src/chat_bridge/legacy_helper.py, tests/test_auth.py"}}
+            fid_fix = independent_review.compute_review_finding_id("bug", "src/chat_bridge/auth.py", "empty-token-accepted")
+            fid_nla = independent_review.compute_review_finding_id("scope-drift", "src/chat_bridge/legacy_helper.py", "unneeded-legacy-helper")
+            r1_findings = [
+                {"finding_id": "TEMP-ID-1", "category": "bug", "blocking": True, "target": "src/chat_bridge/auth.py", "rule": "empty-token-accepted", "title": "Empty token accepted", "evidence": "round-1: validate_token('bearer ') returns empty sub", "actionable_correction": "Reject empty token with ValueError.", "verification_command": vcmd_fix},
+                {"finding_id": "TEMP-ID-2", "category": "scope-drift", "blocking": True, "target": "src/chat_bridge/legacy_helper.py", "rule": "unneeded-legacy-helper", "title": "Legacy helper module added", "evidence": "round-1: legacy_helper.py is unnecessary", "actionable_correction": "Remove legacy_helper.py.", "verification_command": vcmd_nla},
+                {"category": "non-blocking-suggestion", "blocking": False, "target": "src/chat_bridge/auth.py", "rule": "doc-nit", "title": "Docstring nit", "evidence": "line 1", "actionable_correction": "Optional docstring."},
+            ]
+            agy_r1 = _make_fake_agy(root, "agy-ac6-r1", _make_staged_reviewer_script(session_id="rev-ac6-r1", outcome="changes-requested", assessment={**DEFAULT_ASSESSMENT, "edge_cases": {"status": "unsatisfied", "summary": "Empty token not rejected."}}, findings=r1_findings))
+            r1 = run_rev(round_num=1, candidate_sha=cand1, child=child_ac6, qa_record=_valid_qa_record(cand1, base_sha), security_record=_valid_security_record(cand1, base_sha, home), agy_bin=str(agy_r1))
+            self.assertEqual((r1["outcome"], r1["review_verified"], r1["delivery_approved"], set(r1["open_finding_ids"])), ("changes-requested", False, False, {fid_fix, fid_nla}))
+            self.assertTrue((child_dir / "prior-blockers.json").is_file() and r1["observed_verification"]["finding_verifications"][fid_fix]["reproduced"])
+
+            (repo / "src/chat_bridge/auth.py").write_text(CLEAN_AUTH_PY + "# ineffective comment\n", encoding="utf-8")
+            git(repo, "add", "."); git(repo, "commit", "-q", "-m", "round 2 ineffective fix")
+            cand2 = git(repo, "rev-parse", "HEAD")
+            r2_reconcils = [{"finding_id": fid_fix, "resolution": "fixed", "evidence": "round-2: builder edited auth.py"}, {"finding_id": fid_nla, "resolution": "no-longer-applicable", "evidence": "round-2: helper unused"}]
+            agy_r2 = _make_fake_agy(root, "agy-ac6-r2", _make_staged_reviewer_script(session_id="rev-ac6-r2", outcome="review-passed", reconciliations=r2_reconcils))
+            r2 = run_rev(round_num=2, candidate_sha=cand2, child=child_ac6, qa_record=_valid_qa_record(cand2, base_sha), security_record=_valid_security_record(cand2, base_sha, home), agy_bin=str(agy_r2))
+            self.assertEqual((r2["outcome"], r2["review_verified"], r2["delivery_approved"], set(r2["open_finding_ids"])), ("changes-requested", False, False, {fid_fix, fid_nla}))
+            by_id_r2 = {f["finding_id"]: f for f in r2["blocking_findings"]}
+            for fid, orig_ev in ((fid_fix, "round-1: validate_token('bearer ') returns empty sub"), (fid_nla, "round-1: legacy_helper.py is unnecessary")):
+                f2 = by_id_r2[fid]
+                self.assertEqual((f2["status"], f2["resolution"], f2["resolution_blocker"], f2["introduced_in_round"], f2["introduced_in_revision"], f2["last_seen_round"], f2["last_seen_revision"], f2["resolved_in_round"], f2["evidence"], len(f2["history"]), len(f2["evidence_history"])), ("open", None, "check-failed", 1, cand1, 2, cand2, None, orig_ev, 2, 2))
+
+            (repo / "src/chat_bridge/auth.py").write_text(CLEAN_AUTH_PY.replace("return {'sub': token}", "if not token:\n        raise ValueError('empty token')\n    return {'sub': token}"), encoding="utf-8")
+            (repo / "src/chat_bridge/legacy_helper.py").unlink()
+            git(repo, "add", "-A"); git(repo, "commit", "-q", "-m", "round 3 verified correction")
+            cand3 = git(repo, "rev-parse", "HEAD")
+            r3_reconcils = [{"finding_id": fid_fix, "resolution": "fixed", "evidence": "round-3: empty token raises ValueError"}, {"finding_id": fid_nla, "resolution": "no-longer-applicable", "evidence": "round-3: legacy_helper.py removed from candidate"}]
+            agy_r3 = _make_fake_agy(root, "agy-ac6-r3", _make_staged_reviewer_script(session_id="rev-ac6-r3", outcome="review-passed", reconciliations=r3_reconcils))
+            r3 = run_rev(round_num=3, candidate_sha=cand3, child=child_ac6, qa_record=_valid_qa_record(cand3, base_sha), security_record=_valid_security_record(cand3, base_sha, home), agy_bin=str(agy_r3))
+            self.assertEqual((r3["outcome"], r3["review_verified"], r3["delivery_approved"], r3["blocking_findings"], r3["open_finding_ids"]), ("review-passed", True, False, [], []))
+            by_id_r3 = {f["finding_id"]: f for f in r3["findings"] if f["blocking"]}
+            self.assertEqual((by_id_r3[fid_fix]["status"], by_id_r3[fid_fix]["resolution"], by_id_r3[fid_fix]["resolved_in_round"], by_id_r3[fid_fix]["resolved_in_revision"], by_id_r3[fid_fix]["introduced_in_round"], by_id_r3[fid_fix]["introduced_in_revision"], by_id_r3[fid_fix]["evidence"], len(by_id_r3[fid_fix]["history"]), len(by_id_r3[fid_fix]["evidence_history"])), ("resolved", "fixed", 3, cand3, 1, cand1, "round-1: validate_token('bearer ') returns empty sub", 3, 3))
+            self.assertEqual((by_id_r3[fid_nla]["status"], by_id_r3[fid_nla]["resolution"], by_id_r3[fid_nla]["resolved_in_round"], by_id_r3[fid_nla]["resolved_in_revision"], len(by_id_r3[fid_nla]["history"])), ("resolved", "no-longer-applicable", 3, cand3, 3))
+            self.assertEqual(([h["status"] for h in by_id_r3[fid_fix]["history"]], [h["resolution_blocker"] for h in by_id_r3[fid_fix]["history"]]), (["open", "open", "resolved"], ["active-finding", "check-failed", None]))
+            for fid in (fid_fix, fid_nla):
+                ver = by_id_r3[fid]["reproducer_verification"]
+                self.assertTrue(ver["ok"] and ver["head_sha"] == cand3 and Path(ver["output_path"]).is_file())
+
+    def test_ac7_omitted_blockers_and_invalid_resolutions_remain_unresolved(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo, home, base_sha, cand1, _, _, _, _, run_rev = self._setup_workspace(root)
+            vcmd_pass = "python3 -m unittest tests.test_auth -v"
+            b1 = {"category": "bug", "blocking": True, "target": "src/chat_bridge/auth.py", "rule": "b1-rule", "title": "Blocker 1", "evidence": "r1-b1-ev", "actionable_correction": "Fix b1.", "verification_command": vcmd_pass}
+            b2 = {"category": "missing-behavior", "blocking": True, "target": "src/chat_bridge/auth.py", "rule": "b2-rule", "title": "Blocker 2", "evidence": "r1-b2-ev", "actionable_correction": "Fix b2."}
+            fid1, fid2 = independent_review.compute_review_finding_id("bug", "src/chat_bridge/auth.py", "b1-rule"), independent_review.compute_review_finding_id("missing-behavior", "src/chat_bridge/auth.py", "b2-rule")
+            agy1 = _make_fake_agy(root, "agy-ac7-1", _make_staged_reviewer_script(session_id="rev-ac7-1", outcome="changes-requested", assessment={**DEFAULT_ASSESSMENT, "requirement_compliance": {"status": "unsatisfied", "summary": "Two blockers."}}, findings=[b1, b2]))
+            r1 = run_rev(round_num=1, agy_bin=str(agy1))
+            self.assertEqual(set(r1["open_finding_ids"]), {fid1, fid2})
+
+            (repo / "src/chat_bridge/auth.py").write_text(CLEAN_AUTH_PY + "# r2 update\n", encoding="utf-8"); git(repo, "add", "."); git(repo, "commit", "-q", "-m", "round 2 commit")
+            cand2 = git(repo, "rev-parse", "HEAD")
+            agy2_omit = _make_fake_agy(root, "agy-ac7-2", _make_staged_reviewer_script(session_id="rev-ac7-2", outcome="review-passed", reconciliations=[{"finding_id": fid1, "resolution": "fixed", "evidence": "b1 verified"}]))
+            r2 = run_rev(round_num=2, candidate_sha=cand2, qa_record=_valid_qa_record(cand2, base_sha), security_record=_valid_security_record(cand2, base_sha, home), agy_bin=str(agy2_omit))
+            self.assertEqual((r2["outcome"], r2["review_verified"], r2["delivery_approved"], r2["open_finding_ids"]), ("changes-requested", False, False, [fid2]))
+            res_map2 = {r["finding_id"]: r for r in r2["previous_findings_resolution"]}
+            self.assertEqual((res_map2[fid1]["status"], res_map2[fid2]["status"], res_map2[fid2]["resolution_blocker"]), ("resolved", "open", "omitted-from-review"))
+
+            (repo / "src/chat_bridge/auth.py").write_text(CLEAN_AUTH_PY + "# r3 update\n", encoding="utf-8"); git(repo, "add", "."); git(repo, "commit", "-q", "-m", "round 3 commit")
+            cand3 = git(repo, "rev-parse", "HEAD")
+            agy3 = _make_fake_agy(root, "agy-ac7-3", _make_staged_reviewer_script(session_id="rev-ac7-3", outcome="review-passed", reconciliations=[{"finding_id": fid2, "resolution": "fixed", "evidence": "b2 now verified", "verification_command": vcmd_pass}]))
+            r3 = run_rev(round_num=3, candidate_sha=cand3, qa_record=_valid_qa_record(cand3, base_sha), security_record=_valid_security_record(cand3, base_sha, home), agy_bin=str(agy3))
+            self.assertEqual((r3["outcome"], r3["review_verified"], r3["delivery_approved"], r3["open_finding_ids"]), ("review-passed", True, False, []))
+            by_id3 = {f["finding_id"]: f for f in r3["findings"] if f["blocking"]}
+            self.assertEqual((by_id3[fid1]["resolved_in_round"], by_id3[fid1]["resolved_in_revision"], by_id3[fid2]["resolved_in_round"], by_id3[fid2]["resolved_in_revision"]), (2, cand2, 3, cand3))
+
+            obs_ok, valid_chk = r3["observed_verification"], r3["observed_verification"]["finding_verifications"][fid2]
+            prior_open = [{**by_id3[fid2], "status": "open", "resolved_in_round": None, "resolved_in_revision": None, "last_seen_round": 2, "last_seen_revision": cand2, "verification_command": ""}]
+            for label, rec_override, kw_extra, exp_blocker in (
+                ("omitted", {}, {}, "omitted-from-review"),
+                ("thread-closed", {fid2: {"finding_id": fid2, "resolution": "thread-closed", "evidence": "thread closed in PR"}}, {}, "thread-closure-only"),
+                ("comment-resolved", {fid2: {"finding_id": fid2, "resolution": "comment-resolved", "evidence": "resolved comment"}}, {}, "thread-closure-only"),
+                ("dismissed", {fid2: {"finding_id": fid2, "resolution": "dismissed", "evidence": "dismissed"}}, {}, "thread-closure-only"),
+                ("unsupported-fixed", {fid2: {"finding_id": fid2, "resolution": "fixed", "evidence": "looks good in prose only"}}, {"obs_ver": {**obs_ok, "finding_verifications": {}}}, "unsupported-assertion"),
+                ("unsupported-nla", {fid2: {"finding_id": fid2, "resolution": "no-longer-applicable", "evidence": "not needed anymore"}}, {"obs_ver": {**obs_ok, "finding_verifications": {}}}, "unsupported-assertion"),
+                ("unbound-check", {fid2: {"finding_id": fid2, "resolution": "fixed", "evidence": "wrong target check", "reproducer_verification": {**valid_chk, "finding_id": "REV-OTHER", "assesses": "OTHER-TARGET", "name": "finding/REV-OTHER"}}}, {"obs_ver": {**obs_ok, "finding_verifications": {}}}, "unsupported-assertion"),
+                ("downgrade-sugg", {}, {"agent_findings": [{"finding_id": "REV-SUGG", "category": "non-blocking-suggestion", "blocking": False, "target": "src/chat_bridge/auth.py", "rule": "b2-rule", "title": "Downgraded", "evidence": "nit", "actionable_correction": "opt"}]}, "unsupported-assertion"),
+                ("missing-ev-text", {fid2: {"finding_id": fid2, "resolution": "fixed", "evidence": ""}}, {}, "missing-evidence"),
+                ("unexecuted-chk", {fid2: {"finding_id": fid2, "resolution": "fixed", "evidence": "unexecuted", "reproducer_verification": {**valid_chk, "executed": False, "ok": False}}}, {}, "missing-verification"),
+                ("missing-log", {fid2: {"finding_id": fid2, "resolution": "fixed", "evidence": "missing log", "reproducer_verification": {**valid_chk, "output_path": str(home / "nonexistent.log")}}}, {}, "missing-verification"),
+                ("tampered-digest", {fid2: {"finding_id": fid2, "resolution": "fixed", "evidence": "bad digest", "reproducer_verification": {**valid_chk, "output_sha256": "0" * 64}}}, {}, "missing-verification"),
+                ("stale-ev-sha", {fid2: {"finding_id": fid2, "resolution": "fixed", "evidence": "old sha", "evidence_sha": cand1}}, {}, "stale-evidence"),
+                ("stale-same-rev", {fid2: {"finding_id": fid2, "resolution": "fixed", "evidence": "same rev"}}, {"candidate_sha": cand2}, "stale-evidence"),
+                ("stale-chk-sha", {fid2: {"finding_id": fid2, "resolution": "fixed", "evidence": "old chk", "reproducer_verification": {**valid_chk, "head_sha": cand1}}}, {}, "stale-evidence"),
+                ("stale-qa", {fid2: {"finding_id": fid2, "resolution": "fixed", "evidence": "stale qa"}}, {"qa_eval": {"status": "stale-qa-evidence", "verified": False}}, "stale-evidence"),
+            ):
+                kw = {"round_num": 3, "candidate_sha": cand3, "base_sha": base_sha, "agent_findings": [], "det_findings": [], "prior_findings": prior_open, "reconciliations": rec_override, "obs_ver": obs_ok, "qa_eval": {"status": "qa-verified", "verified": True}, "sec_eval": {"status": "approved", "verified": True}, "home": home, **kw_extra}
+                _, blk_f, _, res_f = independent_review.reconcile_review_findings(**kw)
+                self.assertEqual((len(blk_f), blk_f[0]["finding_id"], blk_f[0]["status"], res_f[0]["resolution_blocker"]), (1, fid2, "open", exp_blocker), f"failed invalid-resolution check for {label}")
+
 def run_disposable_demo(tmp: Path) -> dict:
     repo, home, _ = _make_disposable_product_workspace(tmp)
     base_sha = git(repo, "rev-parse", "refs/heads/main")
@@ -421,6 +523,19 @@ def run_disposable_demo(tmp: Path) -> dict:
     r_false_claim = _call(3, child={**PARSED_CHILD, "criteria": [{**PARSED_CHILD["criteria"][0], "verification": "python3 -c \"import sys; sys.exit(1)\""}]}, builder_summary="All checks passed with zero errors!")
     r_missing_chk = _call(4, child={**PARSED_CHILD, "criteria": [{**PARSED_CHILD["criteria"][0], "verification": ""}]})
     r_stale_up, r_mutated = _call(5, qa_record={**qa_rec, "candidate_sha": "0" * 40}), _call(6, agy_bin=str(mut_agy))
+    rec_dir = home / "deliveries" / "demo-55" / "children" / "101"
+    vcmd_demo = "python3 -c \"import pathlib, sys; sys.exit(0 if '# reconciled-fix' in pathlib.Path('src/chat_bridge/auth.py').read_text() else 1)\""
+    fid_demo = independent_review.compute_review_finding_id("bug", "src/chat_bridge/auth.py", "demo-reconcil-bug")
+    agy_d1 = _make_fake_agy(tmp, "agy-d1", _make_staged_reviewer_script(session_id="rev-d1", outcome="changes-requested", assessment={**DEFAULT_ASSESSMENT, "edge_cases": {"status": "unsatisfied", "summary": "bug"}}, findings=[{"category": "bug", "blocking": True, "target": "src/chat_bridge/auth.py", "rule": "demo-reconcil-bug", "title": "Demo bug", "evidence": "r1-demo-ev", "actionable_correction": "Add # reconciled-fix", "verification_command": vcmd_demo}]))
+    d1 = _call(1, child_dir=rec_dir, agy_bin=str(agy_d1))
+    (repo / "src/chat_bridge/auth.py").write_text(CLEAN_AUTH_PY + "# ineffective\n", encoding="utf-8"); git(repo, "add", "."); git(repo, "commit", "-q", "-m", "demo r2 ineffective")
+    cand_d2 = git(repo, "rev-parse", "HEAD")
+    agy_d2 = _make_fake_agy(tmp, "agy-d2", _make_staged_reviewer_script(session_id="rev-d2", outcome="review-passed", reconciliations=[{"finding_id": fid_demo, "resolution": "fixed", "evidence": "r2-ineffective-claim"}]))
+    d2 = _call(2, child_dir=rec_dir, candidate_sha=cand_d2, qa_record=_valid_qa_record(cand_d2, base_sha), security_record=_valid_security_record(cand_d2, base_sha, home), agy_bin=str(agy_d2))
+    (repo / "src/chat_bridge/auth.py").write_text(CLEAN_AUTH_PY + "# reconciled-fix\n", encoding="utf-8"); git(repo, "add", "."); git(repo, "commit", "-q", "-m", "demo r3 verified fix")
+    cand_d3 = git(repo, "rev-parse", "HEAD")
+    agy_d3 = _make_fake_agy(tmp, "agy-d3", _make_staged_reviewer_script(session_id="rev-d3", outcome="review-passed", reconciliations=[{"finding_id": fid_demo, "resolution": "fixed", "evidence": "r3-verified-claim"}]))
+    d3 = _call(3, child_dir=rec_dir, candidate_sha=cand_d3, qa_record=_valid_qa_record(cand_d3, base_sha), security_record=_valid_security_record(cand_d3, base_sha, home), agy_bin=str(agy_d3))
     summary = {
         "valid_review": {"outcome": r_valid["outcome"], "review_verified": r_valid["review_verified"], "delivery_approved": r_valid["delivery_approved"], "verification_scope": r_valid["verification_scope"], "ordering_enforced": r_valid["protocol_ordering"]["enforced"], "hypotheses_count": len(r_valid["failure_hypotheses"]), "record_path": str(child_dir / "independent-review-round-1" / "record.json")},
         "self_approval_rejected": {"outcome": r_self["outcome"], "review_verified": r_self["review_verified"]},
@@ -428,6 +543,7 @@ def run_disposable_demo(tmp: Path) -> dict:
         "missing_check_rejected": {"outcome": r_missing_chk["outcome"], "review_verified": r_missing_chk["review_verified"]},
         "stale_upstream_rejected": {"outcome": r_stale_up["outcome"], "review_verified": r_stale_up["review_verified"]},
         "reviewer_mutation_rejected": {"outcome": r_mutated["outcome"], "review_verified": r_mutated["review_verified"], "candidate_modified_by_reviewer": r_mutated["worktree_integrity"]["candidate_modified_by_reviewer"], "mutation_evidence_retained": Path(r_mutated["worktree_integrity"]["mutation_evidence_path"]).is_file()},
+        "reconciliation_lifecycle": {"round_1_outcome": d1["outcome"], "round_2_ineffective_rejected": d2["outcome"], "round_2_blocker": d2["blocking_findings"][0]["resolution_blocker"], "round_3_reconciled_outcome": d3["outcome"], "round_3_review_verified": d3["review_verified"], "delivery_approved": d3["delivery_approved"], "history_rounds": len(d3["findings"][0]["history"])},
     }
     assert summary["valid_review"]["outcome"] == "review-passed" and summary["valid_review"]["review_verified"] is True and summary["valid_review"]["delivery_approved"] is False
     assert summary["self_approval_rejected"] == {"outcome": "invalid-review", "review_verified": False}
@@ -435,6 +551,7 @@ def run_disposable_demo(tmp: Path) -> dict:
     assert summary["missing_check_rejected"] == {"outcome": "changes-requested", "review_verified": False}
     assert summary["stale_upstream_rejected"] == {"outcome": "changes-requested", "review_verified": False}
     assert summary["reviewer_mutation_rejected"] == {"outcome": "invalid-review", "review_verified": False, "candidate_modified_by_reviewer": True, "mutation_evidence_retained": True}
+    assert summary["reconciliation_lifecycle"] == {"round_1_outcome": "changes-requested", "round_2_ineffective_rejected": "changes-requested", "round_2_blocker": "check-failed", "round_3_reconciled_outcome": "review-passed", "round_3_review_verified": True, "delivery_approved": False, "history_rounds": 3}
     return summary
 
 if __name__ == "__main__":

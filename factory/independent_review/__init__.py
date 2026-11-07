@@ -31,40 +31,27 @@ def _gap_finding(target: str, rule: str, title: str, evidence: str, correction: 
 def _normalize_prior_findings(child_dir: Path, home: Path, round_num: int, prior_findings: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
     disk_items: list[dict[str, Any]] = []
     if round_num > 1 and (prior_findings is None or len(prior_findings) > 0):
-        for r in range(1, round_num):
-            r_path = child_dir / f"independent-review-round-{r}" / "record.json"
-            if r_path.is_file():
+        paths = [*(child_dir / f"independent-review-round-{r}" / "record.json" for r in range(1, round_num)), child_dir / "prior-blockers.json"]
+        for p in paths:
+            if p.is_file():
                 try:
-                    r_rec = read_json(r_path, home) or {}
-                    for item in (r_rec.get("findings") or r_rec.get("blocking_findings") or ()):
-                        if isinstance(item, dict): disk_items.append(dict(item))
+                    rec = read_json(p, home) or {}
+                    disk_items.extend(dict(item) for item in (rec.get("findings") or rec.get("blocking_findings") or ()) if isinstance(item, dict))
                 except errors_module.FactoryError:
                     pass
-        if (child_dir / "prior-blockers.json").is_file():
-            try:
-                saved = read_json(child_dir / "prior-blockers.json", home) or {}
-                for item in saved.get("findings") or ():
-                    if isinstance(item, dict): disk_items.append(dict(item))
-            except errors_module.FactoryError:
-                pass
-    raw_items: list[dict[str, Any]] = [*disk_items, *(dict(f) for f in (prior_findings or []) if isinstance(f, dict))]
     by_id: dict[str, dict[str, Any]] = {}
-    for raw in raw_items:
+    for raw in (*disk_items, *(dict(f) for f in (prior_findings or []) if isinstance(f, dict))):
         cat = str(raw.get("category") or "bug").strip()
         target = str(raw.get("target") or raw.get("file_path") or raw.get("criterion_id") or "repository").strip()
         rule = str(raw.get("rule") or raw.get("title") or "concern").strip()
         fid = compute_review_finding_id(cat, target, rule) if (cat in FINDING_CATEGORIES and raw.get("target") and raw.get("rule")) else (str(raw.get("finding_id") or "").strip() or compute_review_finding_id(cat, target, rule))
-        if not raw.get("blocking", cat != "non-blocking-suggestion"):
-            continue
+        if not raw.get("blocking", cat != "non-blocking-suggestion"): continue
         prev = by_id.get(fid, {})
-        hist_map: dict[int, dict[str, Any]] = {}
-        for h in (*(prev.get("history") or ()), *(raw.get("history") or ())):
-            if isinstance(h, dict) and isinstance(h.get("round"), int): hist_map[int(h["round"])] = dict(h)
+        hist_map = {int(h["round"]): dict(h) for h in (*(prev.get("history") or ()), *(raw.get("history") or ())) if isinstance(h, dict) and isinstance(h.get("round"), int)}
         hist = [hist_map[k] for k in sorted(hist_map)]
         ev_hist: list[dict[str, Any]] = []
         for e in (*(prev.get("evidence_history") or ()), *(raw.get("evidence_history") or ())):
-            if isinstance(e, dict) and not any(x.get("round") == e.get("round") and x.get("evidence") == e.get("evidence") for x in ev_hist):
-                ev_hist.append(dict(e))
+            if isinstance(e, dict) and not any(x.get("round") == e.get("round") and x.get("evidence") == e.get("evidence") for x in ev_hist): ev_hist.append(dict(e))
         intro_round = int(prev.get("introduced_in_round") or raw.get("introduced_in_round") or raw.get("created_round") or 1)
         intro_rev = str(prev.get("introduced_in_revision") or raw.get("introduced_in_revision") or raw.get("created_candidate_sha") or raw.get("last_seen_revision") or "")
         orig_ev = str(prev.get("evidence") or raw.get("evidence") or "")
@@ -74,15 +61,12 @@ def _normalize_prior_findings(child_dir: Path, home: Path, round_num: int, prior
         if not hist:
             hist.append({"round": intro_round, "candidate_sha": intro_rev, "status": str(raw.get("status") or "open"), "resolution_blocker": raw.get("resolution_blocker"), "evidence": orig_ev, "verification_command": str(raw.get("verification_command") or ""), "reproducer_verification": raw.get("reproducer_verification"), "resolution_evidence": raw.get("resolution_evidence")})
         by_id[fid] = {
-            **prev, **raw, "finding_id": fid, "category": cat if cat in FINDING_CATEGORIES else "bug", "blocking": True,
-            "target": target, "rule": rule, "title": str(prev.get("title") or raw.get("title") or rule),
-            "evidence": orig_ev, "latest_evidence": latest_ev,
+            **prev, **raw, "finding_id": fid, "category": cat if cat in FINDING_CATEGORIES else "bug", "blocking": True, "target": target, "rule": rule,
+            "title": str(prev.get("title") or raw.get("title") or rule), "evidence": orig_ev, "latest_evidence": latest_ev,
             "actionable_correction": str(raw.get("actionable_correction") or prev.get("actionable_correction") or ""),
             "verification_command": str(raw.get("verification_command") or prev.get("verification_command") or "").strip(),
-            "source": str(prev.get("source") or raw.get("source") or "reviewer-agent"),
-            "status": str(raw.get("status") or prev.get("status") or "open"),
-            "introduced_in_round": intro_round, "created_round": intro_round,
-            "introduced_in_revision": intro_rev, "created_candidate_sha": intro_rev,
+            "source": str(prev.get("source") or raw.get("source") or "reviewer-agent"), "status": str(raw.get("status") or prev.get("status") or "open"),
+            "introduced_in_round": intro_round, "created_round": intro_round, "introduced_in_revision": intro_rev, "created_candidate_sha": intro_rev,
             "last_seen_round": int(raw.get("last_seen_round") or raw.get("latest_round") or prev.get("last_seen_round") or intro_round),
             "last_seen_revision": str(raw.get("last_seen_revision") or raw.get("latest_candidate_sha") or prev.get("last_seen_revision") or intro_rev),
             "resolved_in_round": raw.get("resolved_in_round") if raw.get("resolved_in_round") is not None else (raw.get("resolved_round") if raw.get("resolved_round") is not None else prev.get("resolved_in_round")),
@@ -376,26 +360,22 @@ def reconcile_review_findings(
     scope_ok: bool = True, changed_paths: tuple[str, ...] = (), deleted_paths: tuple[str, ...] = (),
     role_sep_ok: bool = True, home: Path | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
-    prior_map: dict[str, dict[str, Any]] = {}
-    prior_alias: dict[str, str] = {}
+    prior_map, prior_alias = {}, {}
     for pf in prior_findings or ():
         if not isinstance(pf, dict): continue
-        cat, target, rule = str(pf.get("category") or "bug"), str(pf.get("target") or "repository"), str(pf.get("rule") or "concern")
-        raw_fid = str(pf.get("finding_id") or "").strip()
+        cat, target, rule, raw_fid = str(pf.get("category") or "bug"), str(pf.get("target") or "repository"), str(pf.get("rule") or "concern"), str(pf.get("finding_id") or "").strip()
         fid = compute_review_finding_id(cat, target, rule) if (cat in FINDING_CATEGORIES and pf.get("target") and pf.get("rule")) else raw_fid
         if fid and pf.get("blocking", cat != "non-blocking-suggestion"):
             prior_map[fid] = {**pf, "finding_id": fid, "blocking": True}
             if raw_fid: prior_alias[raw_fid] = fid
             prior_alias[f"{SLUG_RE.sub('-', target.lower()).strip('-')}::{SLUG_RE.sub('-', rule.lower()).strip('-')}"] = fid
 
-    cur_by_id: dict[str, dict[str, Any]] = {}
-    downgrade_ids: set[str] = set()
+    cur_by_id, downgrade_ids = {}, set()
     for item in (*agent_findings, *det_findings):
         fid = str(item["finding_id"])
         tr_key = f"{SLUG_RE.sub('-', str(item.get('target') or '').lower()).strip('-')}::{SLUG_RE.sub('-', str(item.get('rule') or '').lower()).strip('-')}"
         if not item.get("blocking") and (fid in prior_map or prior_alias.get(fid) in prior_map or prior_alias.get(tr_key) in prior_map):
-            downgrade_ids.add(prior_alias.get(fid) or prior_alias.get(tr_key) or fid)
-            continue
+            downgrade_ids.add(prior_alias.get(fid) or prior_alias.get(tr_key) or fid); continue
         if fid not in cur_by_id or item.get("source") != "reviewer-agent" or (item.get("blocking") and not cur_by_id[fid].get("blocking")):
             cur_by_id[fid] = dict(item)
 
@@ -423,8 +403,7 @@ def reconcile_review_findings(
         stable_fid = compute_review_finding_id(cat, target, rule) if (cat in FINDING_CATEGORIES and target and rule) else fid
         intro_round = int(old_f.get("introduced_in_round") or old_f.get("created_round") or 1) if old_f else round_num
         intro_rev = str(old_f.get("introduced_in_revision") or old_f.get("created_candidate_sha") or old_f.get("last_seen_revision") or candidate_sha) if old_f else candidate_sha
-        prev_status = str(old_f.get("status") or "open") if old_f else "new"
-        prev_seen_rev = str(old_f.get("last_seen_revision") or old_f.get("latest_candidate_sha") or intro_rev) if old_f else ""
+        prev_status, prev_seen_rev = (str(old_f.get("status") or "open"), str(old_f.get("last_seen_revision") or old_f.get("latest_candidate_sha") or intro_rev)) if old_f else ("new", "")
         hist = [dict(h) for h in (old_f.get("history") or ()) if isinstance(h, dict)] if old_f else []
         ev_hist = [dict(e) for e in (old_f.get("evidence_history") or ()) if isinstance(e, dict)] if old_f else []
         if old_f and not ev_hist and old_f.get("evidence"):
@@ -433,138 +412,93 @@ def reconcile_review_findings(
             hist.append({"round": intro_round, "candidate_sha": intro_rev, "status": prev_status, "resolution_blocker": old_f.get("resolution_blocker"), "evidence": str(old_f.get("evidence") or ""), "verification_command": str(old_f.get("verification_command") or ""), "reproducer_verification": old_f.get("reproducer_verification"), "resolution_evidence": old_f.get("resolution_evidence")})
         if cur_f is not None and cur_f.get("evidence"):
             cur_ev_entry = {"round": round_num, "candidate_sha": candidate_sha, "evidence": str(cur_f["evidence"]), "actionable_correction": str(cur_f.get("actionable_correction") or ""), "source": str(cur_f.get("source") or "reviewer-agent")}
-            if not ev_hist or ev_hist[-1].get("round") != round_num or ev_hist[-1].get("evidence") != cur_ev_entry["evidence"]:
-                ev_hist.append(cur_ev_entry)
+            if not ev_hist or ev_hist[-1].get("round") != round_num or ev_hist[-1].get("evidence") != cur_ev_entry["evidence"]: ev_hist.append(cur_ev_entry)
 
         rec_claim = reconcil_map.get(stable_fid) or reconcil_map.get(fid)
         vcmd = str((rec_claim or {}).get("verification_command") or (cur_f or {}).get("verification_command") or (old_f or {}).get("verification_command") or "").strip()
         f_ver = f_vers.get(stable_fid) or f_vers.get(fid)
         claim_ver = rec_claim.get("reproducer_verification") if isinstance(rec_claim, dict) and isinstance(rec_claim.get("reproducer_verification"), dict) else None
-        if claim_ver is not None and (f_ver is None or _verify_stored_check(claim_ver, candidate_sha, home, finding_id=stable_fid, target=target) is not None):
-            f_ver = claim_ver
+        if claim_ver is not None and (f_ver is None or _verify_stored_check(claim_ver, candidate_sha, home, finding_id=stable_fid, target=target) is not None): f_ver = claim_ver
 
         claim_res = str((rec_claim or {}).get("resolution") or "").strip().lower()
-        if old_f is None:
-            status, blocker, res_kind, res_ev = "open", "active-finding", None, None
+        if old_f is None: status, blocker, res_kind, res_ev = "open", "active-finding", None, None
         elif cur_f is not None and cur_f.get("blocking") and (cur_f.get("source") != "reviewer-agent" or claim_res in ("", "open", "unresolved")):
             status, blocker, res_kind, res_ev = "open", ("check-failed" if (cur_f.get("source") != "reviewer-agent" or (f_ver is not None and not f_ver.get("ok"))) else "re-reported-by-reviewer"), None, None
-        elif not role_sep_ok:
-            status, blocker, res_kind, res_ev = "open", "invalid-review", None, None
+        elif not role_sep_ok: status, blocker, res_kind, res_ev = "open", "invalid-review", None, None
         elif prev_status == "resolved" and rec_claim is None and stable_fid not in downgrade_ids and (f_ver is None or _verify_stored_check(f_ver, candidate_sha, home, finding_id=stable_fid, target=target) is None) and obs_ok and qa_ok and sec_ok and scope_ok:
             status, blocker, res_kind, res_ev = "resolved", None, str(old_f.get("resolution") or "fixed"), str(old_f.get("resolution_evidence") or "")
         else:
-            source = str(old_f.get("source") or "reviewer-agent")
-            claim_ev = str((rec_claim or {}).get("evidence") or "").strip()
-            claim_sha = str((rec_claim or {}).get("evidence_sha") or "").strip()
+            source, claim_ev, claim_sha = str(old_f.get("source") or "reviewer-agent"), str((rec_claim or {}).get("evidence") or "").strip(), str((rec_claim or {}).get("evidence_sha") or "").strip()
             same_open_rev = prev_status == "open" and prev_seen_rev == candidate_sha
             det_reconciled, det_ev, det_chk, det_blocker = False, "", None, None
             if source == "observed-upstream-gate":
-                if target == "automated-qa":
-                    det_reconciled, det_ev, det_blocker = (qa_ok and not same_open_rev), f"Observed automated-qa gate verified on {candidate_sha} (base {base_sha}).", ("stale-evidence" if ((qa_eval or {}).get("status") == "stale-qa-evidence" or same_open_rev) else "upstream-unverified")
-                elif target == "security-review":
-                    det_reconciled, det_ev, det_blocker = (sec_ok and not same_open_rev), f"Observed security-review gate verified on {candidate_sha} (base {base_sha}).", ("stale-evidence" if ((sec_eval or {}).get("status") == "stale-security-review" or same_open_rev) else "upstream-unverified")
+                if target == "automated-qa": det_reconciled, det_ev, det_blocker = (qa_ok and not same_open_rev), f"Observed automated-qa gate verified on {candidate_sha} (base {base_sha}).", ("stale-evidence" if ((qa_eval or {}).get("status") == "stale-qa-evidence" or same_open_rev) else "upstream-unverified")
+                elif target == "security-review": det_reconciled, det_ev, det_blocker = (sec_ok and not same_open_rev), f"Observed security-review gate verified on {candidate_sha} (base {base_sha}).", ("stale-evidence" if ((sec_eval or {}).get("status") == "stale-security-review" or same_open_rev) else "upstream-unverified")
             elif source == "observed-scope-check":
                 det_reconciled, det_ev, det_blocker = (scope_ok and obs_ok and not same_open_rev), f"Observed scope check satisfied on {candidate_sha} (base {base_sha}).", ("stale-evidence" if same_open_rev else ("scope-drift-persists" if not scope_ok else "missing-verification"))
             elif source == "observed-verification":
                 match_chk = next((c for c in obs_checks if c.get("assesses") == target or c.get("name") == target), None)
                 if rule == "deleted-test-coverage":
-                    det_reconciled = target not in deleted_paths and obs_ok and not same_open_rev
-                    det_ev = f"Deleted test coverage restored or satisfied with passing observed verification on {candidate_sha}."
+                    det_reconciled, det_ev = (target not in deleted_paths and obs_ok and not same_open_rev), f"Deleted test coverage restored or satisfied with passing observed verification on {candidate_sha}."
                     det_blocker = "stale-evidence" if same_open_rev else ("check-failed" if not det_reconciled else None)
                 elif match_chk is not None and _verify_stored_check(match_chk, candidate_sha, home, finding_id=stable_fid, target=target) is None and obs_ok and not same_open_rev:
-                    det_reconciled, det_chk = True, match_chk
-                    det_ev = f"Observed verification check {match_chk['name']!r} ({match_chk['command']!r}) exited 0 on {candidate_sha} ({match_chk['output_path']})."
+                    det_reconciled, det_chk, det_ev = True, match_chk, f"Observed verification check {match_chk['name']!r} ({match_chk['command']!r}) exited 0 on {candidate_sha} ({match_chk['output_path']})."
                 else:
                     det_blocker = "stale-evidence" if (same_open_rev or (match_chk and match_chk.get("head_sha") != candidate_sha)) else ("missing-verification" if not (match_chk and match_chk.get("executed")) else "check-failed")
 
             if det_reconciled and claim_res not in ("thread-closed", "comment-resolved", "dismissed"):
                 status, blocker, res_kind, res_ev = "resolved", None, (claim_res if claim_res in ("fixed", "no-longer-applicable") else "fixed"), det_ev
                 if det_chk is not None and f_ver is None: f_ver = det_chk
-            elif source != "reviewer-agent" and det_blocker is not None and rec_claim is None:
-                status, blocker, res_kind, res_ev = "open", det_blocker, None, None
-            elif stable_fid in downgrade_ids and rec_claim is None:
-                status, blocker, res_kind, res_ev = "open", "unsupported-assertion", None, None
-            elif rec_claim is None:
-                status, blocker, res_kind, res_ev = "open", "omitted-from-review", None, None
-            elif claim_res in ("thread-closed", "comment-resolved", "dismissed"):
-                status, blocker, res_kind, res_ev = "open", "thread-closure-only", None, None
-            elif claim_res not in ("fixed", "no-longer-applicable"):
-                status, blocker, res_kind, res_ev = "open", "unresolved-claim", None, None
-            elif claim_sha and claim_sha != candidate_sha:
+            elif source != "reviewer-agent" and det_blocker is not None and rec_claim is None: status, blocker, res_kind, res_ev = "open", det_blocker, None, None
+            elif stable_fid in downgrade_ids and rec_claim is None: status, blocker, res_kind, res_ev = "open", "unsupported-assertion", None, None
+            elif rec_claim is None: status, blocker, res_kind, res_ev = "open", "omitted-from-review", None, None
+            elif claim_res in ("thread-closed", "comment-resolved", "dismissed"): status, blocker, res_kind, res_ev = "open", "thread-closure-only", None, None
+            elif claim_res not in ("fixed", "no-longer-applicable"): status, blocker, res_kind, res_ev = "open", "unresolved-claim", None, None
+            elif (claim_sha and claim_sha != candidate_sha) or (obs.get("head_sha") and obs.get("head_sha") != candidate_sha) or same_open_rev:
                 status, blocker, res_kind, res_ev = "open", "stale-evidence", None, None
-            elif obs.get("head_sha") and obs.get("head_sha") != candidate_sha:
-                status, blocker, res_kind, res_ev = "open", "stale-evidence", None, None
-            elif same_open_rev:
-                status, blocker, res_kind, res_ev = "open", "stale-evidence", None, None
-            elif not claim_ev:
-                status, blocker, res_kind, res_ev = "open", "missing-evidence", None, None
+            elif not claim_ev: status, blocker, res_kind, res_ev = "open", "missing-evidence", None, None
             else:
                 ver_err = _verify_stored_check(f_ver, candidate_sha, home, finding_id=stable_fid, target=target) if f_ver is not None else None
                 if f_ver is not None and ver_err is not None:
-                    b_code = "stale-evidence" if "stale" in ver_err else ("unsupported-assertion" if "unbound" in ver_err else ("check-failed" if bool(f_ver.get("executed")) else "missing-verification"))
+                    b_code = "stale-evidence" if "stale" in ver_err else ("unsupported-assertion" if "unbound" in ver_err else ("missing-verification" if (not bool(f_ver.get("executed")) or "missing" in ver_err or "digest" in ver_err or "unreadable" in ver_err) else "check-failed"))
                     status, blocker, res_kind, res_ev = "open", b_code, None, None
                 elif not obs_ok or not qa_ok or not sec_ok or not scope_ok:
                     b_code = "stale-evidence" if ((qa_eval or {}).get("status") == "stale-qa-evidence" or (sec_eval or {}).get("status") == "stale-security-review") else ("check-failed" if obs.get("executed") and not obs.get("ok") else "missing-verification")
                     status, blocker, res_kind, res_ev = "open", b_code, None, None
                 elif f_ver is not None and ver_err is None:
-                    status, blocker, res_kind = "resolved", None, claim_res
-                    res_ev = f"{claim_ev} [verified by {f_ver.get('command')!r} on {candidate_sha}: {f_ver.get('output_path')}]"
+                    status, blocker, res_kind, res_ev = "resolved", None, claim_res, f"{claim_ev} [verified by {f_ver.get('command')!r} on {candidate_sha}: {f_ver.get('output_path')}]"
                 else:
                     bound_chk = next((c for c in obs_checks if _verify_stored_check(c, candidate_sha, home, finding_id=stable_fid, target=target) is None), None)
                     if bound_chk is None and claim_res == "no-longer-applicable" and target in deleted_paths and obs_checks and all(_verify_stored_check(c, candidate_sha, home) is None for c in obs_checks):
                         bound_chk = obs_checks[0]
                     if bound_chk is not None:
-                        f_ver = bound_chk
-                        status, blocker, res_kind = "resolved", None, claim_res
-                        res_ev = f"{claim_ev} [verified by observed check {bound_chk['name']!r} on {candidate_sha}: {bound_chk['output_path']}]"
-                    else:
-                        status, blocker, res_kind, res_ev = "open", "unsupported-assertion", None, None
+                        f_ver, status, blocker, res_kind, res_ev = bound_chk, "resolved", None, claim_res, f"{claim_ev} [verified by observed check {bound_chk['name']!r} on {candidate_sha}: {bound_chk['output_path']}]"
+                    else: status, blocker, res_kind, res_ev = "open", "unsupported-assertion", None, None
 
         if rec_claim is not None and rec_claim.get("evidence"):
             rec_ev_entry = {"round": round_num, "candidate_sha": candidate_sha, "evidence": str(rec_claim["evidence"]), "claimed_resolution": claim_res or None, "status": status, "resolution_blocker": blocker, "source": "reconciliation-claim"}
-            if not ev_hist or ev_hist[-1].get("round") != round_num or ev_hist[-1].get("evidence") != rec_ev_entry["evidence"]:
-                ev_hist.append(rec_ev_entry)
+            if not ev_hist or ev_hist[-1].get("round") != round_num or ev_hist[-1].get("evidence") != rec_ev_entry["evidence"]: ev_hist.append(rec_ev_entry)
 
         was_resolved = old_f is not None and prev_status == "resolved" and (old_f.get("resolved_in_round") is not None or old_f.get("resolved_round") is not None)
         res_round = (int(old_f.get("resolved_in_round") or old_f.get("resolved_round") or round_num) if was_resolved else round_num) if status == "resolved" else None
         res_rev = (str(old_f.get("resolved_in_revision") or old_f.get("resolved_candidate_sha") or candidate_sha) if was_resolved else candidate_sha) if status == "resolved" else None
-        hist_entry = {
-            "round": round_num, "candidate_sha": candidate_sha, "status": status, "resolution": res_kind,
-            "resolution_blocker": blocker, "claimed_resolution": (rec_claim or {}).get("resolution") if isinstance(rec_claim, dict) else None,
-            "evidence": str((cur_f or {}).get("evidence") or (rec_claim or {}).get("evidence") or (old_f or {}).get("evidence") or ""),
-            "verification_command": vcmd, "reproducer_verification": f_ver, "resolution_evidence": res_ev,
-        }
-        hist.append(hist_entry)
-        merged = {
-            **(old_f or {}), **(cur_f or {}), "finding_id": stable_fid, "category": cat, "blocking": True,
-            "target": target, "rule": rule, "title": str((old_f or cur_f or {}).get("title") or rule),
-            "evidence": str((old_f or cur_f or {}).get("evidence") or ""),
+        hist.append({"round": round_num, "candidate_sha": candidate_sha, "status": status, "resolution": res_kind, "resolution_blocker": blocker, "claimed_resolution": (rec_claim or {}).get("resolution") if isinstance(rec_claim, dict) else None, "evidence": str((cur_f or {}).get("evidence") or (rec_claim or {}).get("evidence") or (old_f or {}).get("evidence") or ""), "verification_command": vcmd, "reproducer_verification": f_ver, "resolution_evidence": res_ev})
+        all_findings.append({
+            **(old_f or {}), **(cur_f or {}), "finding_id": stable_fid, "category": cat, "blocking": True, "target": target, "rule": rule,
+            "title": str((old_f or cur_f or {}).get("title") or rule), "evidence": str((old_f or cur_f or {}).get("evidence") or ""),
             "latest_evidence": str((cur_f or {}).get("evidence") or (rec_claim or {}).get("evidence") or (old_f or {}).get("latest_evidence") or (old_f or {}).get("evidence") or ""),
             "actionable_correction": str((cur_f or {}).get("actionable_correction") or (old_f or {}).get("actionable_correction") or ""),
             "verification_command": vcmd, "source": str((old_f or cur_f or {}).get("source") or "reviewer-agent"),
             "status": status, "resolution": res_kind, "resolution_blocker": blocker,
-            "introduced_in_round": intro_round, "created_round": intro_round,
-            "introduced_in_revision": intro_rev, "created_candidate_sha": intro_rev,
-            "last_seen_round": round_num, "latest_round": round_num,
-            "last_seen_revision": candidate_sha, "latest_candidate_sha": candidate_sha,
-            "resolved_in_round": res_round, "resolved_round": res_round,
-            "resolved_in_revision": res_rev, "resolved_candidate_sha": res_rev,
-            "resolution_evidence": res_ev, "reproducer_verification": f_ver,
-            "history": hist, "evidence_history": ev_hist,
-        }
-        all_findings.append(merged)
+            "introduced_in_round": intro_round, "created_round": intro_round, "introduced_in_revision": intro_rev, "created_candidate_sha": intro_rev,
+            "last_seen_round": round_num, "latest_round": round_num, "last_seen_revision": candidate_sha, "latest_candidate_sha": candidate_sha,
+            "resolved_in_round": res_round, "resolved_round": res_round, "resolved_in_revision": res_rev, "resolved_candidate_sha": res_rev,
+            "resolution_evidence": res_ev, "reproducer_verification": f_ver, "history": hist, "evidence_history": ev_hist,
+        })
         if old_f is not None:
-            resolutions.append({
-                "finding_id": stable_fid, "previous_status": prev_status, "status": status,
-                "resolution": res_kind, "resolution_blocker": blocker,
-                "claimed_resolution": (rec_claim or {}).get("resolution") if isinstance(rec_claim, dict) else None,
-                "introduced_in_round": intro_round, "introduced_in_revision": intro_rev,
-                "verified_on_revision": candidate_sha if status == "resolved" else None,
-                "candidate_sha": candidate_sha, "reproducer_verification": f_ver, "resolution_evidence": res_ev,
-            })
+            resolutions.append({"finding_id": stable_fid, "previous_status": prev_status, "status": status, "resolution": res_kind, "resolution_blocker": blocker, "claimed_resolution": (rec_claim or {}).get("resolution") if isinstance(rec_claim, dict) else None, "introduced_in_round": intro_round, "introduced_in_revision": intro_rev, "verified_on_revision": candidate_sha if status == "resolved" else None, "candidate_sha": candidate_sha, "reproducer_verification": f_ver, "resolution_evidence": res_ev})
     blocking_findings = [f for f in all_findings if f.get("blocking") and f.get("status") != "resolved"]
-    suggestions = [f for f in all_findings if not f.get("blocking")]
-    return all_findings, blocking_findings, suggestions, resolutions
+    return all_findings, blocking_findings, [f for f in all_findings if not f.get("blocking")], resolutions
 
 def _snapshot_worktree(worktree: Path) -> dict[str, tuple[Any, ...]]:
     snap: dict[str, tuple[Any, ...]] = {}
