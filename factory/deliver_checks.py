@@ -2,17 +2,18 @@
 
 from __future__ import annotations
 
-import json, math, os, re, shlex, subprocess, time
+import io
+import json, os, re, shlex, subprocess, time
 from pathlib import Path, PurePosixPath
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlparse
 from urllib.request import Request, build_opener
+import zipfile
 
-from factory import config as config_module, gitio, runner, worker as worker_module
+from factory import config as config_module, gitio
 from factory.errors import UsageError
 from factory.intake import NoRedirectHandler, same_api_origin
-from factory.paths import safe_dir, write_evidence
 
 DEFAULT_GITHUB_API_URL = "https://api.github.com"
 REPO_SLUG_RE = re.compile(r"^(?:https://github\.com/|git@github\.com:)?([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+?)(?:\.git)?/?$")
@@ -249,28 +250,6 @@ def inspect_diff_categories(worktree: Path, base_sha: str, head_sha: str, deadli
         "has_implementation_changes": has_impl_changes, "has_test_changes": has_test_changes,
     }
 
-def prepare_verification_env(worker_env: dict[str, str], child_dir: Path, home: Path) -> dict[str, str]:
-    verify_home = safe_dir(child_dir / "verify-home", create=True, root=home)
-    tmp_dir = str(safe_dir(verify_home / ".tmp", create=True, root=home))
-    clean = {
-        key: val for key, val in worker_env.items()
-        if "TOKEN" not in key.upper()
-        and not (key.upper().startswith("TURBO_") and key.upper().endswith("_URL"))
-        and not key.upper().endswith("_PROXY")
-        and key.upper() not in ("TURBO_LIVE_AGY", "PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP", "PYTHONUSERBASE")
-    }
-    clean.update({
-        "HOME": str(verify_home), "TMPDIR": tmp_dir, "TMP": tmp_dir, "TEMP": tmp_dir,
-        "XDG_CONFIG_HOME": str(verify_home / ".config"), "XDG_CACHE_HOME": str(verify_home / ".cache"),
-        "GIT_CONFIG_GLOBAL": str(verify_home / "nonexistent-gitconfig"),
-        "GIT_CONFIG_SYSTEM": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1", "GIT_TERMINAL_PROMPT": "0",
-        "GIT_ASKPASS": "/bin/false", "SSH_ASKPASS": "/bin/false", "SSH_AUTH_SOCK": "",
-        "GIT_SSH_COMMAND": "false", "GIT_ALLOW_PROTOCOL": "none",
-        "HTTP_PROXY": "http://127.0.0.1:1", "HTTPS_PROXY": "http://127.0.0.1:1",
-        "ALL_PROXY": "http://127.0.0.1:1", "NO_PROXY": "", "PIP_NO_INDEX": "1",
-        "NPM_CONFIG_OFFLINE": "true",
-    })
-    return clean
 
 def _verification_argv(raw: str) -> tuple[str, ...] | None:
     try:
@@ -279,57 +258,6 @@ def _verification_argv(raw: str) -> tuple[str, ...] | None:
         return None
     return tokens if tokens and PurePosixPath(tokens[0]).name in EXECUTABLE_VERIFIERS else None
 
-def _exec_check(
-    check_id: str, kind: str, stem: str, argv: tuple[str, ...], worktree: Path,
-    child_dir: Path, home: Path, verify_env: dict[str, str], deadline: float, limit_s: int,
-) -> dict[str, Any]:
-    rem = remaining_seconds(deadline, f"verification {check_id}", limit_s)
-    try:
-        code, out_s, err_s, _, timed_out = worker_module.execute_stream(
-            worktree, argv, verify_env, max(1, int(math.ceil(rem))),
-            isolated_home=Path(verify_env["HOME"]), allow_network=False,
-        )
-    except OSError as exc:
-        out = f"[factory] verification executable failed to start ({argv[0]!r}): {exc}\n"
-        ev_path = write_evidence(child_dir, stem, out, home)
-        return {
-            "id": check_id, "kind": kind, "argv": list(argv), "executed": False, "exit": 127,
-            "ok": False, "error": str(exc), "output_path": str(ev_path), "output_sha256": runner.digest_text(out),
-        }
-    out = (out_s + err_s).strip() + "\n"
-    ev_path = write_evidence(child_dir, stem, out, home)
-    if timed_out or time.monotonic() >= deadline:
-        raise AttemptTimeoutError(f"attempt timed out during verification {check_id} after {limit_s}s")
-    return {
-        "id": check_id, "kind": kind, "argv": list(argv), "executed": True, "exit": code,
-        "ok": code == 0, "output_path": str(ev_path), "output_sha256": runner.digest_text(out),
-    }
-
-def run_child_verifications(
-    worktree: Path, child: dict[str, Any], conf: config_module.Config, child_dir: Path,
-    home: Path, worker_env: dict[str, str], deadline: float, limit_s: int,
-) -> tuple[bool, list[dict[str, Any]], list[str]]:
-    verify_env = prepare_verification_env(worker_env, child_dir, home)
-    checks, failures, seen_cmds = [], [], set()
-    for crit in child.get("criteria") or []:
-        cid, ver_str = str(crit.get("id") or "AC"), str(crit.get("verification") or "").strip()
-        argv = _verification_argv(ver_str)
-        if argv is None:
-            checks.append({"id": cid, "kind": "criterion-evaluation", "command": ver_str, "executed": False, "ok": False})
-            failures.append(f"criterion {cid} verification is not an executable check command: {ver_str!r}")
-            continue
-        seen_cmds.add(argv)
-        rec = _exec_check(cid, "criterion-verification", f"check-{cid.lower()}", argv, worktree, child_dir, home, verify_env, deadline, limit_s)
-        if not rec["ok"]:
-            failures.append(f"criterion {cid} verification failed (exit {rec['exit']}): {ver_str}")
-        checks.append(rec)
-    gate2 = conf.gates.get("2")
-    if gate2 is not None and gate2.kind == "command" and gate2.argv and gate2.argv not in seen_cmds:
-        rec = _exec_check("gate-2", "project-tests", "check-project-tests", gate2.argv, worktree, child_dir, home, verify_env, deadline, limit_s)
-        if not rec["ok"]:
-            failures.append(f"project test check failed (exit {rec['exit']}): {' '.join(gate2.argv)}")
-        checks.append(rec)
-    return len(failures) == 0, checks, failures
 
 def github_request(
     method: str, url: str, token: str, base_url: str, trace: list[dict[str, Any]],
@@ -426,5 +354,317 @@ def open_and_confirm_pr(
         "number": pr_number, "url": str(verified.get("html_url") or created.get("html_url") or verify_url),
         "title": str(verified.get("title") or title), "body": str(verified.get("body") or body),
         "state": state, "merged": merged, "repository": obs_base_repo,
-        "base_ref": obs_base_ref, "head_ref": obs_head_ref, "head_sha": obs_head_sha, "verified": True,
+        "base_ref": obs_base_ref, "head_ref": obs_head_ref, "head_sha": obs_head_sha,
+        "pr_confirmed": True, "ci_verified": False, "verified": False,
     }
+
+
+MAX_ARTIFACT_ZIP_BYTES = 10 * 1024 * 1024
+MAX_EVIDENCE_JSON_BYTES = 2 * 1024 * 1024
+_READ_CHUNK_BYTES = 65536
+RUN_URL_RE = re.compile(r"/actions/runs/([0-9]+)(?:/job/([0-9]+))?")
+KEY_VAL_RE = re.compile(r"^\s*([a-z_]+)\s*=\s*(\S+)\s*$", re.MULTILINE)
+
+
+def _sanitize_url_for_log(raw_url: str) -> str:
+    parsed = urlparse(str(raw_url or "").strip())
+    if not parsed.scheme or not parsed.hostname:
+        return "[redacted-url]"
+    port_suffix = f":{parsed.port}" if parsed.port else ""
+    return f"{parsed.scheme}://{parsed.hostname}{port_suffix}{parsed.path}"
+
+
+def _is_allowed_redirect_url(redirect_url: str, base_url: str) -> bool:
+    parsed = urlparse(redirect_url)
+    if not parsed.hostname or parsed.username or parsed.password:
+        return False
+    if parsed.scheme == "https":
+        return True
+    base_parsed = urlparse(base_url)
+    return (
+        parsed.scheme == "http"
+        and parsed.hostname in ("127.0.0.1", "localhost", "::1")
+        and base_parsed.hostname in ("127.0.0.1", "localhost", "::1")
+    )
+
+
+def _read_bounded_bytes(resp: Any, max_bytes: int, deadline: float, limit_s: int, phase: str) -> bytes:
+    headers = getattr(resp, "headers", None)
+    if headers is not None and (raw_len := headers.get("Content-Length")) is not None:
+        try:
+            if int(raw_len) > max_bytes:
+                raise GitHubError(f"{phase} exceeds maximum size of {max_bytes} bytes")
+        except ValueError:
+            pass
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        remaining_seconds(deadline, phase, limit_s)
+        chunk = resp.read(_READ_CHUNK_BYTES)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > max_bytes:
+            raise GitHubError(f"{phase} exceeds maximum size of {max_bytes} bytes")
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def _download_zip_bytes(
+    url: str, token: str, base_url: str, trace: list[dict[str, Any]], deadline: float, limit_s: int,
+) -> bytes:
+    rem = remaining_seconds(deadline, "CI artifact download", limit_s)
+    safe_url = _sanitize_url_for_log(url)
+    if not same_api_origin(url, base_url):
+        trace.append({"method": "GET", "url": safe_url, "status": "blocked-origin"})
+        raise GitHubError(f"refused to send GitHub credentials to untrusted artifact URL: {safe_url}")
+    req = Request(url, headers={"Accept": "application/vnd.github+json", "Authorization": f"Bearer {token}"}, method="GET")
+    redirect_loc = ""
+    try:
+        with build_opener(NoRedirectHandler).open(req, timeout=min(15.0, rem)) as resp:
+            trace.append({"method": "GET", "url": safe_url, "status": getattr(resp, "status", 200)})
+            return _read_bounded_bytes(resp, MAX_ARTIFACT_ZIP_BYTES, deadline, limit_s, "CI artifact download")
+    except HTTPError as exc:
+        if exc.code in (301, 302, 303, 307, 308):
+            redirect_loc = (exc.headers.get("Location") or "").strip() if exc.headers else ""
+            exc.close()
+            trace.append({"method": "GET", "url": safe_url, "status": exc.code})
+        else:
+            trace.append({"method": "GET", "url": safe_url, "status": exc.code})
+            exc.close()
+            raise GitHubError(f"GitHub artifact download HTTP {exc.code} on {safe_url}: {exc.reason}") from exc
+    except (URLError, OSError, TimeoutError) as exc:
+        if time.monotonic() >= deadline or isinstance(exc, TimeoutError) or isinstance(getattr(exc, "reason", None), TimeoutError):
+            raise AttemptTimeoutError(f"attempt timed out during CI artifact download after {limit_s}s") from exc
+        raise GitHubError(f"CI artifact download failed on {safe_url}: {exc}") from exc
+
+    safe_redirect = _sanitize_url_for_log(redirect_loc)
+    if not _is_allowed_redirect_url(redirect_loc, base_url):
+        trace.append({"method": "GET", "url": safe_redirect, "status": "invalid-redirect"})
+        raise GitHubError(f"refused insecure artifact redirect Location: {safe_redirect}")
+    rem_blob = remaining_seconds(deadline, "CI artifact blob download", limit_s)
+    blob_req = Request(redirect_loc, headers={"Accept": "*/*"}, method="GET")
+    try:
+        with build_opener(NoRedirectHandler).open(blob_req, timeout=min(15.0, rem_blob)) as b_resp:
+            trace.append({"method": "GET", "url": safe_redirect, "status": getattr(b_resp, "status", 200)})
+            return _read_bounded_bytes(b_resp, MAX_ARTIFACT_ZIP_BYTES, deadline, limit_s, "CI artifact blob download")
+    except HTTPError as exc:
+        trace.append({"method": "GET", "url": safe_redirect, "status": exc.code})
+        exc.close()
+        raise GitHubError(f"CI artifact blob download HTTP {exc.code} on {safe_redirect}: {exc.reason}") from exc
+    except (URLError, OSError, TimeoutError) as exc:
+        if time.monotonic() >= deadline or isinstance(exc, TimeoutError) or isinstance(getattr(exc, "reason", None), TimeoutError):
+            raise AttemptTimeoutError(f"attempt timed out during CI artifact blob download after {limit_s}s") from exc
+        raise GitHubError(f"CI artifact blob download failed on {safe_redirect}: {exc}") from exc
+
+
+def _fetch_all_check_runs(
+    base_url: str, token: str, repo_slug: str, candidate_sha: str,
+    trace: list[dict[str, Any]], deadline: float, limit_s: int,
+) -> list[dict[str, Any]]:
+    all_runs: list[dict[str, Any]] = []
+    seen_ids: set[int] = set()
+    page = 1
+    while True:
+        url = f"{base_url}/repos/{repo_slug}/commits/{candidate_sha}/check-runs?per_page=100&page={page}"
+        payload = github_request("GET", url, token, base_url, trace, deadline, limit_s)
+        batch, total_count = payload.get("check_runs"), payload.get("total_count")
+        if not isinstance(batch, list) or isinstance(total_count, bool) or not isinstance(total_count, int):
+            raise GitHubError("malformed GitHub check-runs response (requires integer total_count and check_runs list)")
+        if not batch:
+            if len(all_runs) < total_count:
+                raise GitHubError(f"truncated GitHub check-runs pagination: got {len(all_runs)} of {total_count}")
+            break
+        new_in_page = 0
+        for item in batch:
+            if not isinstance(item, dict) or isinstance(item.get("id"), bool) or not isinstance(item.get("id"), int):
+                raise GitHubError("malformed check_run entry in GitHub response")
+            cid = int(item["id"])
+            if cid not in seen_ids:
+                seen_ids.add(cid)
+                all_runs.append(item)
+                new_in_page += 1
+        if len(all_runs) >= total_count:
+            break
+        if new_in_page == 0 or page >= 50:
+            raise GitHubError("cyclic or excessive pagination in GitHub check-runs response")
+        page += 1
+    return all_runs
+
+
+def _fetch_workflow_run(
+    base_url: str, token: str, repo_slug: str, run_id: int, cache: dict[int, dict[str, Any]],
+    trace: list[dict[str, Any]], deadline: float, limit_s: int,
+) -> dict[str, Any]:
+    if run_id not in cache:
+        url = f"{base_url}/repos/{repo_slug}/actions/runs/{run_id}"
+        cache[run_id] = github_request("GET", url, token, base_url, trace, deadline, limit_s)
+    return cache[run_id]
+
+
+def _extract_wf_run_id(cr: dict[str, Any]) -> int | None:
+    for url_field in ("details_url", "html_url"):
+        match = RUN_URL_RE.search(str(cr.get(url_field) or ""))
+        if match is not None:
+            return int(match.group(1))
+    return None
+
+
+def _extract_check_run_attempt(cr: dict[str, Any], wf_info: dict[str, Any] | None = None) -> int | None:
+    raw_attempt = cr.get("run_attempt")
+    if not isinstance(raw_attempt, bool) and isinstance(raw_attempt, int) and raw_attempt >= 1:
+        return raw_attempt
+    out_obj = cr.get("output") if isinstance(cr.get("output"), dict) else {}
+    summary_kv = dict(KEY_VAL_RE.findall(str(out_obj.get("summary") or "")))
+    if "run_attempt" in summary_kv:
+        try:
+            parsed_att = int(summary_kv["run_attempt"])
+            if parsed_att >= 1:
+                return parsed_att
+        except ValueError:
+            return None
+    if isinstance(wf_info, dict):
+        wf_att = wf_info.get("run_attempt")
+        if not isinstance(wf_att, bool) and isinstance(wf_att, int) and wf_att >= 1:
+            return wf_att
+    return None
+
+
+def _select_authoritative_check_run(
+    rname: str, runs: list[dict[str, Any]], base_url: str, token: str, repo_slug: str,
+    wf_cache: dict[int, dict[str, Any]], trace: list[dict[str, Any]], deadline: float, limit_s: int,
+) -> tuple[dict[str, Any] | None, list[dict[str, Any]], set[int], str | None]:
+    if not runs:
+        return None, [], set(), None
+    non_completed = [r for r in runs if str(r.get("status") or "") != "completed"]
+    if non_completed:
+        return non_completed[-1], runs[:-1], set(), None
+    if len(runs) == 1:
+        return runs[0], [], set(), None
+    annotated: list[tuple[int, int, str, str, int, dict[str, Any]]] = []
+    for r in runs:
+        wf_id = _extract_wf_run_id(r)
+        wf_info = (
+            _fetch_workflow_run(base_url, token, repo_slug, wf_id, wf_cache, trace, deadline, limit_s)
+            if wf_id is not None else None
+        )
+        attempt = _extract_check_run_attempt(r, wf_info)
+        started_at = str(r.get("started_at") or "").strip()
+        completed_at = str(r.get("completed_at") or "").strip()
+        ts_primary = completed_at or started_at
+        if wf_id is None or attempt is None or not ts_primary:
+            err = f"ambiguous rerun ordering for required check {rname!r}: missing workflow_run_id, run_attempt, or timestamps"
+            return runs[-1], runs[:-1], set(), err
+        annotated.append((wf_id, attempt, ts_primary, started_at, int(r.get("id") or 0), r))
+    annotated.sort(key=lambda item: (item[0], item[1], item[2], item[3], item[4]))
+    for idx in range(len(annotated) - 1):
+        prev_wf, prev_att, prev_ts, prev_start, _, _ = annotated[idx]
+        next_wf, next_att, next_ts, next_start, _, _ = annotated[idx + 1]
+        if (prev_wf, prev_att) == (next_wf, next_att) and (prev_ts, prev_start) == (next_ts, next_start):
+            err = f"ambiguous rerun ordering for required check {rname!r}: duplicate ({prev_wf}, attempt {prev_att}) with identical timestamps"
+            return annotated[-1][5], [x[5] for x in annotated[:-1]], set(), err
+        if (next_wf, next_att) > (prev_wf, prev_att) and next_ts < prev_ts:
+            err = f"contradictory rerun ordering for required check {rname!r}: newer ({next_wf}, attempt {next_att}) has earlier timestamp {next_ts!r}"
+            return annotated[-1][5], [x[5] for x in annotated[:-1]], set(), err
+    selected = annotated[-1][5]
+    superseded_runs = [x[5] for x in annotated[:-1]]
+    superseded_wf_ids = {x[0] for x in annotated[:-1] if x[0] != annotated[-1][0]}
+    return selected, superseded_runs, superseded_wf_ids, None
+
+
+def _read_manifest_from_zip(raw_zip: bytes, art_id: object) -> dict[str, Any]:
+    with zipfile.ZipFile(io.BytesIO(raw_zip), "r") as zf:
+        if "turbo-ci-evidence.json" not in zf.namelist():
+            raise GitHubError(f"artifact {art_id} zip is missing turbo-ci-evidence.json")
+        info = zf.getinfo("turbo-ci-evidence.json")
+        if info.file_size > MAX_EVIDENCE_JSON_BYTES:
+            raise GitHubError(f"artifact {art_id} turbo-ci-evidence.json exceeds maximum size of {MAX_EVIDENCE_JSON_BYTES} bytes")
+        with zf.open("turbo-ci-evidence.json", "r") as member:
+            raw_json = member.read(MAX_EVIDENCE_JSON_BYTES + 1)
+            if len(raw_json) > MAX_EVIDENCE_JSON_BYTES:
+                raise GitHubError(f"artifact {art_id} turbo-ci-evidence.json exceeds maximum size of {MAX_EVIDENCE_JSON_BYTES} bytes")
+    manifest = json.loads(raw_json.decode("utf-8", "replace"))
+    if not isinstance(manifest, dict):
+        raise GitHubError(f"artifact {art_id} turbo-ci-evidence.json must be a JSON object")
+    return manifest
+
+
+def _fetch_run_evidence_artifacts(
+    base_url: str, token: str, repo_slug: str, run_attempts_by_id: dict[int, int],
+    trace: list[dict[str, Any]], deadline: float, limit_s: int,
+) -> tuple[dict[str, dict[str, Any]], list[str]]:
+    merged_checks: dict[str, dict[str, Any]] = {}
+    issues: list[str] = []
+    for run_id in sorted(run_attempts_by_id):
+        expected_attempt = run_attempts_by_id[run_id]
+        arts_all: list[dict[str, Any]] = []
+        page = 1
+        while True:
+            url = f"{base_url}/repos/{repo_slug}/actions/runs/{run_id}/artifacts?per_page=100&page={page}"
+            payload = github_request("GET", url, token, base_url, trace, deadline, limit_s)
+            batch, total = payload.get("artifacts"), payload.get("total_count")
+            if not isinstance(batch, list) or isinstance(total, bool) or not isinstance(total, int):
+                issues.append(f"malformed artifacts response for workflow run {run_id}")
+                break
+            arts_all.extend(a for a in batch if isinstance(a, dict))
+            if not batch or len(arts_all) >= total or page >= 20:
+                break
+            page += 1
+        ev_arts = [a for a in arts_all if str(a.get("name") or "").startswith("turbo-ci-evidence")]
+        if not ev_arts:
+            issues.append(f"missing turbo-ci-evidence artifact on workflow run {run_id}")
+            continue
+        for art in ev_arts:
+            art_id = art.get("id")
+            if bool(art.get("expired")):
+                issues.append(f"CI evidence artifact {art_id} on workflow run {run_id} is expired")
+                continue
+            dl_url = str(art.get("archive_download_url") or "").strip()
+            if not dl_url:
+                issues.append(f"CI evidence artifact {art_id} is missing archive_download_url")
+                continue
+            art_html = f"https://github.com/{repo_slug}/actions/runs/{run_id}/artifacts/{art_id}"
+            try:
+                raw_zip = _download_zip_bytes(dl_url, token, base_url, trace, deadline, limit_s)
+                manifest = _read_manifest_from_zip(raw_zip, art_id)
+            except (GitHubError, zipfile.BadZipFile, json.JSONDecodeError, KeyError) as exc:
+                issues.append(f"failed to read CI evidence artifact {art_id}: {exc}")
+                continue
+            man_run_id = manifest.get("workflow_run_id")
+            if man_run_id is not None and (isinstance(man_run_id, bool) or man_run_id != run_id):
+                issues.append(f"artifact {art_id} workflow_run_id {man_run_id!r} does not match workflow run {run_id}")
+                continue
+            man_attempt = manifest.get("run_attempt")
+            if man_attempt is not None and (isinstance(man_attempt, bool) or man_attempt != expected_attempt):
+                issues.append(f"artifact {art_id} run_attempt {man_attempt!r} does not match workflow run {run_id} attempt {expected_attempt}")
+                continue
+            checks_map = manifest.get("checks")
+            if not isinstance(checks_map, dict) or not checks_map:
+                issues.append(f"artifact {art_id} has empty or invalid checks map")
+                continue
+            for cname, cdata in checks_map.items():
+                if not isinstance(cdata, dict):
+                    issues.append(f"artifact {art_id} entry for {cname!r} is not an object")
+                    continue
+                if str(cdata.get("check_name") or "").strip() != cname:
+                    issues.append(f"artifact {art_id} check key {cname!r} does not match entry check_name {cdata.get('check_name')!r}")
+                    continue
+                rec_run_id = cdata.get("workflow_run_id", man_run_id)
+                if rec_run_id is not None and (isinstance(rec_run_id, bool) or rec_run_id != run_id):
+                    issues.append(f"artifact {art_id} check {cname!r} workflow_run_id {rec_run_id!r} != {run_id}")
+                    continue
+                rec_attempt = cdata.get("run_attempt", man_attempt)
+                if rec_attempt is not None and (isinstance(rec_attempt, bool) or rec_attempt != expected_attempt):
+                    issues.append(f"artifact {art_id} check {cname!r} run_attempt {rec_attempt!r} != expected attempt {expected_attempt}")
+                    continue
+                if expected_attempt > 1 and rec_attempt != expected_attempt:
+                    issues.append(f"artifact {art_id} check {cname!r} is missing explicit run_attempt={expected_attempt} for rerun")
+                    continue
+                if cname in merged_checks:
+                    issues.append(f"duplicate or ambiguous CI evidence artifact entry for required check {cname!r}")
+                    continue
+                merged_checks[cname] = {
+                    **cdata, "artifact_id": art_id, "artifact_url": art_html, "run_id": run_id,
+                    "run_attempt": rec_attempt if isinstance(rec_attempt, int) else expected_attempt,
+                }
+    return merged_checks, issues

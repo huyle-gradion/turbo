@@ -260,8 +260,8 @@ def _dispatch(paths: RuntimePaths, args: argparse.Namespace) -> int:
             if args.json:
                 print(json.dumps(result.to_dict(), indent=2, sort_keys=True))
             else:
-                print(f"deliver {result.task_gid}: {result.status} (pr_opened={result.pr_opened})")
-            return 0 if result.pr_opened else 1
+                print(f"deliver {result.task_gid}: {result.status} (pr_opened={result.pr_opened}, verified={result.verified})")
+            return 0 if result.verified else 1
         case unreachable:
             raise AssertionError(unreachable)
 
