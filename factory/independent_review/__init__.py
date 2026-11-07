@@ -68,19 +68,26 @@ def build_phase1_prompt(child: dict[str, Any], base_sha: str, candidate_sha: str
 
 
 def build_phase2_prompt(
-    child: dict[str, Any], base_sha: str, candidate_sha: str, hypotheses: list[str],
-    builder_summary: str, qa_eval: dict[str, Any], sec_eval: dict[str, Any],
+    child: dict[str, Any], base_sha: str, candidate_sha: str, diff_text: str, standards: list[dict[str, Any]],
+    hypotheses: list[str], builder_summary: str, qa_eval: dict[str, Any], sec_eval: dict[str, Any],
 ) -> str:
     hyp_lines = "\n".join(f"- {h}" for h in hypotheses)
+    crit_lines = "\n".join(f"- {c.get('id')}: {c.get('description')} (verification: `{c.get('verification')}`)"
+                           for c in (child.get("criteria") or []) if isinstance(c, dict)) or "- None"
+    std_lines = "\n".join(f"- {s['id']} ({s['name']}): {s['description']}" for s in standards)
+    dims = ", ".join(ASSESSMENT_KEYS)
     schema = ('{"outcome":"review-passed|changes-requested","assessment":{key:{"status":"satisfied|unsatisfied","summary":"..."}},'
               '"findings":[{"finding_id":"REV-...","category":"missing-behavior|bug|verification-gap|scope-drift|non-blocking-suggestion",'
               '"blocking":true,"target":"<file_or_criterion>","rule":"<concern>","title":"...","evidence":"...","actionable_correction":"..."}]}')
     return (f"Role: independent-reviewer (fresh session separate from builder). Do not edit files or commit.\n"
             f"PHASE: 2 (substantive-assessment after independent hypotheses were persisted)\nSub-task: {child.get('gid')} ({child.get('name')})\n"
-            f"Candidate revision: {candidate_sha} (base: {base_sha})\nPersisted Phase-1 Hypotheses:\n{hyp_lines}\n"
+            f"Candidate revision: {candidate_sha} (base: {base_sha})\nRequired Assessment Dimensions: {dims}\n"
+            f"Requirements & Acceptance Criteria:\n{crit_lines}\nApplicable Project Standards:\n{std_lines}\n"
+            f"Persisted Phase-1 Hypotheses:\n{hyp_lines}\n"
             f"Same-Candidate Automated QA Gate Summary: status={qa_eval['status']} verified={qa_eval['verified']}\n"
             f"Same-Candidate Security Review Gate Summary: status={sec_eval['status']} verified={sec_eval['verified']}\n"
-            f"Builder Summary (untrusted claim):\n{builder_summary or '(none provided)'}\nRequired JSON response schema:\n{schema}\n")
+            f"Builder Summary (untrusted claim):\n{builder_summary or '(none provided)'}\nExact Base-to-Candidate Diff:\n{diff_text}\n"
+            f"Required JSON response schema:\n{schema}\n")
 
 
 def _parse_json_obj(text: str, phase: str) -> tuple[dict[str, Any] | None, list[str]]:
@@ -110,10 +117,16 @@ def evaluate_upstream_evidence(
     gaps: list[dict[str, Any]] = []
     if not isinstance(qa_record, dict) or not qa_record:
         qa_eval = {"status": "qa-missing", "verified": False, "blockers": [f"missing automated QA evidence for candidate {candidate_sha}"]}
-    elif str(qa_record.get("candidate_sha") or "") != candidate_sha or str(qa_record.get("base_sha") or "") != base_sha:
+    elif (str(qa_record.get("candidate_sha") or "") != candidate_sha or str(qa_record.get("base_sha") or "") != base_sha
+          or str(qa_record.get("tested_sha") or candidate_sha) != candidate_sha):
         qa_eval = {"status": "stale-qa-evidence", "verified": False,
                    "blockers": [f"stale automated QA evidence: qa=({qa_record.get('candidate_sha')}, base={qa_record.get('base_sha')}) != candidate=({candidate_sha}, base={base_sha})"]}
-    elif not bool(qa_record.get("qa_verified")) or str(qa_record.get("status") or "") != "qa-verified" or bool(qa_record.get("open_finding_ids")):
+    elif (qa_record.get("role") not in (None, "automated-qa") or not bool(qa_record.get("qa_verified"))
+          or str(qa_record.get("status") or "") != "qa-verified" or bool(qa_record.get("open_finding_ids"))
+          or (qa_record.get("ci_revalidation") or {}).get("verified", True) is not True
+          or (qa_record.get("role_separation") or {}).get("candidate_modified_by_qa", False) is not False
+          or qa_record.get("regression_passed", True) is not True
+          or any(not isinstance(f, dict) or f.get("status") != "resolved" for f in (qa_record.get("findings") or ()))):
         qa_eval = {"status": str(qa_record.get("status") or "qa-failed"), "verified": False,
                    "blockers": [f"automated QA not verified on {candidate_sha} (status={qa_record.get('status')!r}, open_findings={qa_record.get('open_finding_ids')})"]}
     else:
@@ -211,6 +224,8 @@ def _run_observed_verification(
         specs.append(("regression/affected-tests", "regression", "regression-suite", (sys.executable, "-m", "unittest", *aff, "-v"), f"unittest {' '.join(aff)}"))
     if (gate2 := conf.gates.get("2")) is not None and gate2.kind == "command" and gate2.argv:
         specs.append(("regression/gate-2", "regression", "gate-2", tuple(gate2.argv), " ".join(gate2.argv)))
+    elif plan.get("mode") == "full-suite":
+        specs.append(("regression/full-suite", "regression", "regression-suite", (sys.executable, "-m", "unittest", "discover", "-s", "tests", "-v"), "python3 -m unittest discover -s tests -v"))
 
     checks, gaps = [], []
     if not criteria_list:
@@ -344,8 +359,9 @@ def review_candidate_independently(
         p1_prompt_red = redact_value(p1_prompt, secrets)
         p1_prompt_path = write_evidence(round_dir, "phase1-prompt", p1_prompt_red, home)
         summary_norm = (builder_summary or "").strip()
-        p1_omitted_summary = "Builder Summary" not in p1_prompt and "Builder summary:" not in p1_prompt and (
-            len(summary_norm) < 8 or summary_norm not in p1_prompt.split("Exact Base-to-Candidate Diff:", 1)[0]
+        p1_header = p1_prompt.split("Exact Base-to-Candidate Diff:", 1)[0]
+        p1_omitted_summary = "builder summary" not in p1_prompt.lower() and (
+            not summary_norm or (len(summary_norm) >= 8 and summary_norm not in p1_header) or len(summary_norm) < 8
         )
         p1_has_exact_diff = bool(diff_res.output.strip()) and diff_text.strip() in p1_prompt_red
         if not p1_omitted_summary:
@@ -386,7 +402,7 @@ def review_candidate_independently(
                 role_issues.append(f"sandbox unavailable during phase 1: {exc}")
 
         if hypotheses_path is not None and not role_issues:
-            p2_prompt = build_phase2_prompt(child, base_sha, resolved_sha, hypotheses, builder_summary, qa_eval, sec_eval)
+            p2_prompt = build_phase2_prompt(child, base_sha, resolved_sha, diff_text, standards, hypotheses, builder_summary, qa_eval, sec_eval)
             p2_prompt_path = str(write_evidence(round_dir, "phase2-prompt", redact_value(p2_prompt, secrets), home))
             try:
                 p2_res = _run_phase_exec(worktree, round_dir, home, isolated_home, worker_env, str(agy_bin), p2_prompt, "phase2", resolved_sha, secrets, deadline, limit_s)
@@ -418,7 +434,7 @@ def review_candidate_independently(
             obs_ver = {"executed": False, "ok": False, "head_sha": resolved_sha, "selection_plan": {}, "checks": [], "verification_gaps": [], "provenance": "skipped-due-to-role-or-mutation-failure"}
 
         det_findings = [
-            _gap_finding("scope", SLUG_RE.sub("-", sv.lower()).strip("-")[:32] or "out-of-scope", f"Scope or protected-path drift: {sv}", sv,
+            _gap_finding("scope", SLUG_RE.sub("-", sv.lower()).strip("-") or "out-of-scope", f"Scope or protected-path drift: {sv}", sv,
                          "Revert out-of-scope or protected-path modifications so the diff stays within declared sub-task scope.", "observed-scope-check", cat="scope-drift")
             for sv in ([] if scope_ok else scope_violations)
         ] + upstream_gaps + list(obs_ver.get("verification_gaps") or [])
