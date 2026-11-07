@@ -28,19 +28,25 @@ def compute_review_finding_id(category: str, target: str, rule_or_concern: str) 
 def _gap_finding(target: str, rule: str, title: str, evidence: str, correction: str, source: str, cat: str = "verification-gap", vcmd: str = "") -> dict[str, Any]:
     return {"finding_id": compute_review_finding_id(cat, target, rule), "category": cat, "blocking": True, "target": target, "rule": rule, "title": title, "evidence": evidence, "actionable_correction": correction, "verification_command": vcmd, "source": source}
 
-def _normalize_prior_findings(child_dir: Path, home: Path, round_num: int, prior_findings: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+def _normalize_prior_findings(child_dir: Path, home: Path, round_num: int, prior_findings: list[dict[str, Any]] | None, *, recovered_out: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
     disk_items: list[dict[str, Any]] = []
-    if round_num > 1 and (prior_findings is None or len(prior_findings) > 0):
-        paths = [*(child_dir / f"independent-review-round-{r}" / "record.json" for r in range(1, round_num)), child_dir / "prior-blockers.json"]
-        for p in paths:
-            if p.is_file():
-                try:
-                    rec = read_json(p, home) or {}
-                    disk_items.extend(dict(item) for item in (rec.get("findings") or rec.get("blocking_findings") or ()) if isinstance(item, dict))
-                except errors_module.FactoryError:
-                    pass
+    corrupt_err: str | None = None
+    paths = [*(child_dir / f"independent-review-round-{r}" / "record.json" for r in range(1, max(round_num, 1))), *((child_dir / "prior-blockers.json",) if round_num > 1 or (child_dir / "prior-blockers.json").exists() or (child_dir / "prior-blockers.json").is_symlink() else ())]
+    for p in paths:
+        if p.exists() or p.is_symlink():
+            try:
+                rec = read_json(p, home)
+                items = rec.get("findings") if isinstance(rec, dict) and "findings" in rec else (rec.get("blocking_findings") if isinstance(rec, dict) else None)
+                if not isinstance(rec, dict) or not isinstance(items, list) or any(not isinstance(item, dict) for item in items):
+                    corrupt_err = corrupt_err or f"corrupt prior review history structure in {p}"
+                else:
+                    disk_items.extend(dict(item) for item in items)
+            except (errors_module.FactoryError, OSError) as exc:
+                corrupt_err = corrupt_err or f"unreadable or corrupt prior review history in {p}: {exc}"
+    if prior_findings is not None and (not isinstance(prior_findings, list) or any(not isinstance(f, dict) for f in prior_findings)):
+        corrupt_err = corrupt_err or "prior_findings must be a list of finding objects"
     by_id: dict[str, dict[str, Any]] = {}
-    for raw in (*disk_items, *(dict(f) for f in (prior_findings or []) if isinstance(f, dict))):
+    for raw in (*disk_items, *(dict(f) for f in (prior_findings if isinstance(prior_findings, list) else ()) if isinstance(f, dict))):
         cat = str(raw.get("category") or "bug").strip()
         target = str(raw.get("target") or raw.get("file_path") or raw.get("criterion_id") or "repository").strip()
         rule = str(raw.get("rule") or raw.get("title") or "concern").strip()
@@ -74,6 +80,8 @@ def _normalize_prior_findings(child_dir: Path, home: Path, round_num: int, prior
             "resolution_blocker": raw.get("resolution_blocker"), "resolution_evidence": raw.get("resolution_evidence") or prev.get("resolution_evidence"),
             "reproducer_verification": raw.get("reproducer_verification") or prev.get("reproducer_verification"), "history": hist, "evidence_history": ev_hist,
         }
+    if recovered_out is not None: recovered_out.extend(by_id.values())
+    if corrupt_err is not None: raise errors_module.FactoryError(corrupt_err)
     return list(by_id.values())
 
 def load_project_standards(repo: Path, base_sha: str, child: dict[str, Any], conf: config_module.Config, deadline: float, limit_s: int) -> list[dict[str, Any]]:
@@ -569,7 +577,8 @@ def _run_phase_exec(worktree: Path, round_dir: Path, home: Path, isolated_home: 
     return {"executed": True, "ok": ok, "exit_code": code, "parse_err": perr, "stdout_path": stdout_p, "stderr_path": stderr_p, "session_id": sid, "response": str(res.get("response") or "") if isinstance(res, dict) else "", "mut": mut}
 
 def review_candidate_independently(*, repo: Path, home: Path, child_dir: Path, child: dict[str, Any], conf: config_module.Config, base_sha: str, candidate_sha: str, builder_session_id: str | None, builder_summary: str = "", qa_record: dict[str, Any] | None = None, security_record: dict[str, Any] | None = None, prior_findings: list[dict[str, Any]] | None = None, round_num: int = 1, agy_bin: str | None = None, deadline: float, limit_s: int) -> dict[str, Any]:
-    prior_list = _normalize_prior_findings(child_dir, home, round_num, prior_findings)
+    prior_list: list[dict[str, Any]] = []
+    history_corrupt = False
     round_dir = safe_dir(child_dir / f"independent-review-round-{round_num}", create=True, root=home)
     worktree = round_dir / "worktree"
     isolated_home = worker_module.prepare_isolated_home(round_dir, Path.home(), root=home); safe_dir(isolated_home / ".tmp", create=True, root=home)
@@ -578,6 +587,11 @@ def review_candidate_independently(*, repo: Path, home: Path, child_dir: Path, c
     secrets, resolved_sha = collect_redaction_secrets(), str(candidate_sha or "").strip()
     try:
         try:
+            try:
+                prior_list = _normalize_prior_findings(child_dir, home, round_num, prior_findings, recovered_out=prior_list)
+            except errors_module.FactoryError:
+                history_corrupt = True
+                raise
             resolved_sha = worker_module.prepare_isolated_git_checkout(repo, worktree, candidate_sha, deadline=deadline)
             fetch_res = git_timed(worktree, deadline, limit_s, "fetch base_sha", "fetch", "-q", "--no-tags", str(repo), base_sha)
             rev_res = git_timed(worktree, deadline, limit_s, "verify base_sha", "rev-parse", "--verify", f"{base_sha}^{{commit}}")
@@ -712,8 +726,9 @@ def review_candidate_independently(*, repo: Path, home: Path, child_dir: Path, c
                 "outcome": outcome, "review_verified": review_verified, "recorded_at": now(),
             }, secrets)
         except (worker_module.SandboxUnavailableError, errors_module.FactoryError, deliver_checks.AttemptTimeoutError, TimeoutError, OSError) as exc:
+            corrupt_gaps = [_gap_finding("prior-history", "corrupt-prior-history", "Corrupt or unreadable prior blocker history", str(exc), "Restore valid prior review records before re-running independent review.", "observed-setup")] if history_corrupt else []
             all_findings, blocking_findings, suggestions, resolutions = reconcile_review_findings(
-                round_num=round_num, candidate_sha=resolved_sha, base_sha=base_sha, agent_findings=[], det_findings=[],
+                round_num=round_num, candidate_sha=resolved_sha, base_sha=base_sha, agent_findings=[], det_findings=corrupt_gaps,
                 prior_findings=prior_list, reconciliations={}, obs_ver=None, qa_eval=None, sec_eval=None, scope_ok=False, role_sep_ok=False, home=home,
             )
             record = redact_value({
@@ -732,7 +747,8 @@ def review_candidate_independently(*, repo: Path, home: Path, child_dir: Path, c
                 "outcome": "invalid-review", "review_verified": False, "recorded_at": now(),
             }, secrets)
         atomic_json(round_dir / "record.json", record, home); atomic_json(child_dir / "independent-review.json", record, home)
-        atomic_json(child_dir / "prior-blockers.json", {"schema": 1, "updated_in_round": round_num, "reviewed_revision": record["reviewed_revision"], "findings": [f for f in record["findings"] if f.get("blocking")]}, home)
+        if not history_corrupt:
+            atomic_json(child_dir / "prior-blockers.json", {"schema": 1, "updated_in_round": round_num, "reviewed_revision": record["reviewed_revision"], "findings": [f for f in record["findings"] if f.get("blocking")]}, home)
         return record
     finally:
         shutil.rmtree(worktree, ignore_errors=True)

@@ -159,7 +159,7 @@ class IndependentReviewTest(unittest.TestCase):
     def test_ac3_actionable_findings_categories_incomplete_rejection_and_identity_stability(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            _, _, _, _, _, _, _, _, run_rev = self._setup_workspace(root)
+            _, _, _, _, _, child_dir, _, _, run_rev = self._setup_workspace(root)
             five_cat_findings = [
                 {"category": "missing-behavior", "blocking": True, "target": "src/chat_bridge/auth.py", "rule": "missing-whitespace-strip", "title": "Token whitespace not stripped", "evidence": "src/chat_bridge/auth.py:3", "actionable_correction": "Call token.strip() before prefix check."},
                 {"category": "bug", "blocking": True, "target": "src/chat_bridge/auth.py", "rule": "empty-token-accepted", "title": "Empty token returns valid sub", "evidence": "validate_token('') -> {'sub': ''}", "actionable_correction": "Raise ValueError on empty token."},
@@ -172,7 +172,7 @@ class IndependentReviewTest(unittest.TestCase):
             self.assertEqual((r_five["outcome"], r_five["review_verified"], len(r_five["blocking_findings"]), len(r_five["non_blocking_suggestions"])), ("changes-requested", False, 4, 1))
             self.assertEqual({f["category"] for f in r_five["findings"]}, independent_review.FINDING_CATEGORIES)
             sugg_only_agy = _make_fake_agy(root, "agy-sugg-only", _make_staged_reviewer_script(session_id="rev-ac3-2", outcome="review-passed", findings=[five_cat_findings[4]]))
-            r_sugg = run_rev(round_num=2, prior_findings=[], agy_bin=str(sugg_only_agy))
+            r_sugg = run_rev(round_num=1, child_dir=child_dir / "sugg-only", agy_bin=str(sugg_only_agy))
             self.assertEqual((r_sugg["outcome"], r_sugg["review_verified"], r_sugg["delivery_approved"], len(r_sugg["blocking_findings"]), len(r_sugg["non_blocking_suggestions"])), ("review-passed", True, False, 0, 1))
             f_pos1 = [{"finding_id": "LINE-10-POS-0", "category": "bug", "blocking": True, "target": "src/chat_bridge/auth.py", "rule": "empty-token-accepted", "line": 10, "title": "Empty token bug", "evidence": "line 10: return {'sub': token}", "actionable_correction": "Reject empty token."}, five_cat_findings[0]]
             f_pos2 = [five_cat_findings[0], {"finding_id": "LINE-42-POS-1", "category": "bug", "blocking": True, "target": "src/chat_bridge/auth.py", "rule": "empty-token-accepted", "line": 42, "title": "Empty token bug shifted", "evidence": "line 42: return {'sub': token}", "actionable_correction": "Reject empty token."}]
@@ -501,6 +501,30 @@ class IndependentReviewTest(unittest.TestCase):
                 kw = {"round_num": 3, "candidate_sha": cand3, "base_sha": base_sha, "agent_findings": [], "det_findings": [], "prior_findings": prior_open, "reconciliations": rec_override, "obs_ver": obs_ok, "qa_eval": {"status": "qa-verified", "verified": True}, "sec_eval": {"status": "approved", "verified": True}, "home": home, **kw_extra}
                 _, blk_f, _, res_f = independent_review.reconcile_review_findings(**kw)
                 self.assertEqual((len(blk_f), blk_f[0]["finding_id"], blk_f[0]["status"], res_f[0]["resolution_blocker"]), (1, fid2, "open", exp_blocker), f"failed invalid-resolution check for {label}")
+
+    def test_reconcil_m1_persisted_blockers_and_corrupt_history(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo, home, base_sha, cand1, _, child_dir, _, _, run_rev = self._setup_workspace(root)
+            fid = independent_review.compute_review_finding_id("bug", "src/chat_bridge/auth.py", "m1-persisted-rule")
+            b1 = {"category": "bug", "blocking": True, "target": "src/chat_bridge/auth.py", "rule": "m1-persisted-rule", "title": "M1 bug", "evidence": "r1-m1-ev", "actionable_correction": "Fix m1."}
+            agy1 = _make_fake_agy(root, "agy-m1-1", _make_staged_reviewer_script(session_id="rev-m1-1", outcome="changes-requested", assessment={**DEFAULT_ASSESSMENT, "edge_cases": {"status": "unsatisfied", "summary": "m1"}}, findings=[b1]))
+            r1 = run_rev(round_num=1, agy_bin=str(agy1))
+            self.assertEqual(r1["open_finding_ids"], [fid])
+            (repo / "src/chat_bridge/auth.py").write_text(CLEAN_AUTH_PY + "# m1 r2\n", encoding="utf-8"); git(repo, "add", "."); git(repo, "commit", "-q", "-m", "m1 r2")
+            cand2 = git(repo, "rev-parse", "HEAD")
+            agy2 = _make_fake_agy(root, "agy-m1-2", _make_staged_reviewer_script(session_id="rev-m1-2", outcome="review-passed"))
+            r2 = run_rev(round_num=2, candidate_sha=cand2, prior_findings=[], qa_record=_valid_qa_record(cand2, base_sha), security_record=_valid_security_record(cand2, base_sha, home), agy_bin=str(agy2))
+            self.assertEqual((r2["outcome"], r2["review_verified"], r2["delivery_approved"], r2["open_finding_ids"]), ("changes-requested", False, False, [fid]))
+            f2 = r2["blocking_findings"][0]
+            self.assertEqual((f2["finding_id"], f2["status"], f2["resolution_blocker"], f2["introduced_in_round"], f2["introduced_in_revision"], f2["evidence"], len(f2["history"])), (fid, "open", "omitted-from-review", 1, cand1, "r1-m1-ev", 2))
+            for corrupt_payload in ("{corrupt-json", json.dumps({"findings": "not-a-list"})):
+                (child_dir / "prior-blockers.json").write_text(corrupt_payload, encoding="utf-8")
+                with self.assertRaises(independent_review.errors_module.FactoryError):
+                    independent_review._normalize_prior_findings(child_dir, home, 3, [])
+                r3 = run_rev(round_num=3, candidate_sha=cand2, prior_findings=[], qa_record=_valid_qa_record(cand2, base_sha), security_record=_valid_security_record(cand2, base_sha, home), agy_bin=str(agy2))
+                self.assertEqual((r3["outcome"], r3["review_verified"], r3["delivery_approved"]), ("invalid-review", False, False))
+                self.assertTrue(r3["role_issues"] and fid in r3["open_finding_ids"] and any(f["finding_id"] == fid and f["status"] == "open" for f in r3["blocking_findings"]))
 
 def run_disposable_demo(tmp: Path) -> dict:
     repo, home, _ = _make_disposable_product_workspace(tmp)
