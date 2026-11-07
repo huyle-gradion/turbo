@@ -248,7 +248,7 @@ def _open_inotify_watch(worktree: Path) -> int | None:
     try:
         libc = ctypes.CDLL("libc.so.6", use_errno=True)
         if (fd := libc.inotify_init1(0o4000 | 0o2000000)) < 0: return None
-        mask = 0x002 | 0x004 | 0x008 | 0x040 | 0x080 | 0x100 | 0x200 | 0x400 | 0x800
+        mask = 0x002 | 0x008 | 0x040 | 0x080 | 0x100 | 0x200 | 0x400 | 0x800
         for root, dirs, _ in os.walk(worktree, topdown=True, followlinks=False):
             libc.inotify_add_watch(fd, os.fsencode(root), mask)
             for d in dirs: libc.inotify_add_watch(fd, os.fsencode(os.path.join(root, d)), mask)
