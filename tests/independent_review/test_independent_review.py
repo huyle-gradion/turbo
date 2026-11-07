@@ -51,6 +51,8 @@ def _make_staged_reviewer_script(*, session_id: str = "ind-rev-1", phase2_sessio
 _LAST_QA_HOME: Path | None = None
 
 def _valid_qa_record(candidate_sha: str, base_sha: str, tested_sha: str | None = None, home: Path | None = None) -> dict:
+    global _LAST_QA_HOME
+    if home is not None: _LAST_QA_HOME = home
     t_sha = tested_sha or candidate_sha
     r_kind = "fast-forward-head" if t_sha == candidate_sha else "integration-merge"
     qa_dir = ((home or _LAST_QA_HOME or Path(tempfile.gettempdir())) / "qa-fixture")
@@ -95,7 +97,7 @@ class IndependentReviewTest(unittest.TestCase):
         (repo / "tests/test_auth.py").write_text((repo / "tests/test_auth.py").read_text(encoding="utf-8") + EXPIRED_TEST_APPEND, encoding="utf-8")
         git(repo, "add", "."); git(repo, "commit", "-q", "-m", "feat: validate expired token")
         cand_sha = git(repo, "rev-parse", "HEAD")
-        qa_rec, sec_rec = _valid_qa_record(cand_sha, base_sha), _valid_security_record(cand_sha, base_sha, home)
+        qa_rec, sec_rec = _valid_qa_record(cand_sha, base_sha, home=home), _valid_security_record(cand_sha, base_sha, home)
         good_agy = _make_fake_agy(root, "agy-good", _make_staged_reviewer_script(session_id="fresh-reviewer-99"))
         def run_rev(**overrides):
             kwargs = {"repo": repo, "home": home, "child_dir": child_dir, "child": PARSED_CHILD, "conf": conf, "base_sha": base_sha, "candidate_sha": cand_sha, "builder_session_id": "builder-session-1", "builder_summary": "All checks passed and requirements met.", "qa_record": qa_rec, "security_record": sec_rec, "agy_bin": str(good_agy), "deadline": time.monotonic() + 30.0, "limit_s": 30}
@@ -701,7 +703,7 @@ def run_disposable_demo(tmp: Path) -> dict:
     (repo / "tests/test_auth.py").write_text((repo / "tests/test_auth.py").read_text(encoding="utf-8") + EXPIRED_TEST_APPEND, encoding="utf-8")
     git(repo, "add", "."); git(repo, "commit", "-q", "-m", "feat: validate expired token")
     cand_sha = git(repo, "rev-parse", "HEAD")
-    qa_rec, sec_rec = _valid_qa_record(cand_sha, base_sha), _valid_security_record(cand_sha, base_sha, home)
+    qa_rec, sec_rec = _valid_qa_record(cand_sha, base_sha, home=home), _valid_security_record(cand_sha, base_sha, home)
     good_agy = _make_fake_agy(tmp, "agy-demo-good", _make_staged_reviewer_script(session_id="fresh-reviewer-demo"))
     reused_agy = _make_fake_agy(tmp, "agy-demo-reused", _make_staged_reviewer_script(session_id="builder-demo-1"))
     mut_agy = _make_fake_agy(tmp, "agy-demo-mut", _make_staged_reviewer_script(session_id="fresh-reviewer-mut", mutate_in_phase=2, mutate_kind="unstaged"))

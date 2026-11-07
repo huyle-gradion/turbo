@@ -406,8 +406,9 @@ def verify_candidate_approval(candidate_sha: str, base_sha: str, approval_record
             ci_record, qa_record = (ci_record if ci_record is not None else inp.get("ci_record")), (qa_record if qa_record is not None else inp.get("qa_record"))
             security_record, review_record = (security_record if security_record is not None else inp.get("security_record")), (review_record if review_record is not None else inp.get("review_record"))
             prior_f, b_sid = inp.get("prior_findings"), inp.get("builder_session_id")
-    if conf is None and repo is not None and home is not None and (repo / ".factory" / "config.toml").is_file():
-        conf = config_module.load(config_module.RuntimePaths(repo=repo, home=home))
+    if conf is None and repo is not None and home is not None:
+        try: conf = config_module.load(config_module.RuntimePaths(repo=repo, home=home))
+        except errors_module.FactoryError: pass
     reval = evaluate_approval_gate(candidate_sha=candidate_sha, base_sha=base_sha, ci_record=ci_record, qa_record=qa_record, security_record=security_record, review_record=review_record, repo=repo, home=home, child_dir=child_dir, child=child, conf=conf, builder_session_id=b_sid, prior_findings=prior_f, load_from_child_dir=True, _persist=False, deadline=deadline, limit_s=limit_s)
     if not reval["delivery_approved"] or reval.get("tested_sha") != t_sha or reval.get("revision_kind") != r_kind:
         return _rej(str(reval.get("status") if not reval["delivery_approved"] else "stale-candidate-revision"), list(reval.get("blockers") or ["underlying prerequisite revalidation failed"]))
