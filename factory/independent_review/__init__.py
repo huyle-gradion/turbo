@@ -241,7 +241,7 @@ def _snapshot_worktree(worktree: Path) -> dict[str, tuple[Any, ...]]:
         for name in (*dirs, *files):
             p = rp / name; st = p.lstat()
             payload = f"symlink:{os.readlink(p)}" if stat.S_ISLNK(st.st_mode) else (hashlib.sha256(p.read_bytes()).hexdigest() if stat.S_ISREG(st.st_mode) else "dir")
-            snap[str(p.relative_to(worktree))] = (st.st_mode, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns, payload)
+            snap[str(p.relative_to(worktree))] = (st.st_mode, st.st_ino, st.st_size, st.st_mtime_ns, payload)
     return snap
 
 def _open_inotify_watch(worktree: Path) -> int | None:
