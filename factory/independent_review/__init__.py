@@ -454,7 +454,7 @@ def reconcile_review_findings(
 
         claim_res = str((rec_claim or {}).get("resolution") or "").strip().lower()
         if old_f is None: status, blocker, res_kind, res_ev = "open", "active-finding", None, None
-        elif cur_f is not None and cur_f.get("blocking") and (cur_f.get("source") != "reviewer-agent" or claim_res in ("", "open", "unresolved")):
+        elif cur_f is not None and cur_f.get("blocking"):
             status, blocker, res_kind, res_ev = "open", ("check-failed" if (cur_f.get("source") != "reviewer-agent" or (f_ver is not None and not f_ver.get("ok"))) else "re-reported-by-reviewer"), None, None
         elif not role_sep_ok: status, blocker, res_kind, res_ev = "open", "invalid-review", None, None
         elif prev_status == "resolved" and rec_claim is None and stable_fid not in downgrade_ids and (f_ver is None or _verify_stored_check(f_ver, candidate_sha, home, finding_id=stable_fid, target=None if str((old_f or {}).get("source") or "reviewer-agent") == "reviewer-agent" else target) is None) and obs_ok and qa_ok and sec_ok and scope_ok:

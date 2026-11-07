@@ -630,6 +630,28 @@ class IndependentReviewTest(unittest.TestCase):
             r3 = run_rev(round_num=3, base_sha=base_m4, candidate_sha=cand3, child=child_m4, qa_record=_valid_qa_record(cand3, base_m4), security_record=_valid_security_record(cand3, base_m4, home), agy_bin=str(agy3))
             self.assertEqual((r3["outcome"], r3["review_verified"], r3["open_finding_ids"]), ("review-passed", True, []))
 
+    def test_reconcil_m5_active_blocker_overrides_contradictory_fixed_claim(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo, home, base_sha, _, _, _, _, _, run_rev = self._setup_workspace(root)
+            vcmd = "python3 -m unittest tests.test_auth -v"
+            fid = independent_review.compute_review_finding_id("bug", "src/chat_bridge/auth.py", "m5-active-rule")
+            b1 = {"category": "bug", "blocking": True, "target": "src/chat_bridge/auth.py", "rule": "m5-active-rule", "title": "M5 active bug", "evidence": "r1-m5-ev", "actionable_correction": "Fix m5.", "verification_command": vcmd}
+            agy1 = _make_fake_agy(root, "agy-m5-1", _make_staged_reviewer_script(session_id="rev-m5-1", outcome="changes-requested", assessment={**DEFAULT_ASSESSMENT, "edge_cases": {"status": "unsatisfied", "summary": "m5"}}, findings=[b1]))
+            r1 = run_rev(round_num=1, agy_bin=str(agy1))
+            self.assertEqual(r1["open_finding_ids"], [fid])
+            (repo / "src/chat_bridge/auth.py").write_text(CLEAN_AUTH_PY + "# m5-r2\n", encoding="utf-8"); git(repo, "add", "."); git(repo, "commit", "-q", "-m", "m5 r2")
+            cand2 = git(repo, "rev-parse", "HEAD")
+            agy2 = _make_fake_agy(root, "agy-m5-2", _make_staged_reviewer_script(session_id="rev-m5-2", outcome="changes-requested", findings=[{**b1, "evidence": "r2-still-broken"}], reconciliations=[{"finding_id": fid, "resolution": "fixed", "evidence": "contradictory fixed claim"}]))
+            r2 = run_rev(round_num=2, candidate_sha=cand2, qa_record=_valid_qa_record(cand2, base_sha), security_record=_valid_security_record(cand2, base_sha, home), agy_bin=str(agy2))
+            self.assertEqual((r2["outcome"], r2["review_verified"], r2["open_finding_ids"]), ("changes-requested", False, [fid]))
+            self.assertEqual((r2["blocking_findings"][0]["status"], r2["blocking_findings"][0]["resolution_blocker"]), ("open", "re-reported-by-reviewer"))
+            (repo / "src/chat_bridge/auth.py").write_text(CLEAN_AUTH_PY + "# m5-r3\n", encoding="utf-8"); git(repo, "add", "."); git(repo, "commit", "-q", "-m", "m5 r3")
+            cand3 = git(repo, "rev-parse", "HEAD")
+            agy3 = _make_fake_agy(root, "agy-m5-3", _make_staged_reviewer_script(session_id="rev-m5-3", outcome="review-passed", reconciliations=[{"finding_id": fid, "resolution": "fixed", "evidence": "now resolved without active finding"}]))
+            r3 = run_rev(round_num=3, candidate_sha=cand3, qa_record=_valid_qa_record(cand3, base_sha), security_record=_valid_security_record(cand3, base_sha, home), agy_bin=str(agy3))
+            self.assertEqual((r3["outcome"], r3["review_verified"], r3["open_finding_ids"]), ("review-passed", True, []))
+
 def run_disposable_demo(tmp: Path) -> dict:
     repo, home, _ = _make_disposable_product_workspace(tmp)
     base_sha = git(repo, "rev-parse", "refs/heads/main")
