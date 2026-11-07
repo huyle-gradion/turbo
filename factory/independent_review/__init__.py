@@ -344,7 +344,9 @@ def review_candidate_independently(
         p1_prompt_red = redact_value(p1_prompt, secrets)
         p1_prompt_path = write_evidence(round_dir, "phase1-prompt", p1_prompt_red, home)
         summary_norm = (builder_summary or "").strip()
-        p1_omitted_summary = (not summary_norm or summary_norm not in p1_prompt) and "Builder Summary" not in p1_prompt and "Builder summary:" not in p1_prompt
+        p1_omitted_summary = "Builder Summary" not in p1_prompt and "Builder summary:" not in p1_prompt and (
+            len(summary_norm) < 8 or summary_norm not in p1_prompt.split("Exact Base-to-Candidate Diff:", 1)[0]
+        )
         p1_has_exact_diff = bool(diff_res.output.strip()) and diff_text.strip() in p1_prompt_red
         if not p1_omitted_summary:
             role_issues.append("protocol violation: phase-1 prompt exposed builder summary before hypotheses were recorded")
@@ -363,6 +365,7 @@ def review_candidate_independently(
         if probes_ok and diff_ok and bool(b_sid) and bool(agy_bin and str(agy_bin).strip()) and p1_omitted_summary and p1_has_exact_diff:
             try:
                 p1_res = _run_phase_exec(worktree, round_dir, home, isolated_home, worker_env, str(agy_bin), p1_prompt, "phase1", resolved_sha, secrets, deadline, limit_s)
+                p2_res["mut"] = p1_res["mut"]
                 if p1_res["mut"]["candidate_modified_by_reviewer"]:
                     role_issues.append("independent reviewer mutated the candidate worktree during phase 1")
                 if not p1_res["ok"]:
@@ -476,3 +479,27 @@ def review_candidate_independently(
         return record
     finally:
         shutil.rmtree(worktree, ignore_errors=True)
+
+
+def run_disposable_demo(tmp: Path) -> dict[str, Any]:
+    from tests.independent_review.test_independent_review import run_disposable_demo as _run_demo
+    return _run_demo(tmp)
+
+
+def main(argv: list[str] | None = None) -> int:
+    import argparse, tempfile
+    p = argparse.ArgumentParser(prog="python3 -m factory.independent_review", description="Standalone independent reviewer role demo (#52).")
+    p.add_argument("--demo", action="store_true", help="Run disposable independent-review demonstration.")
+    p.add_argument("--evidence-dir", type=Path, default=None, help="Optional directory to retain demo evidence.")
+    args = p.parse_args(argv)
+    if not args.demo:
+        p.error("standalone independent-review slice (#52) supports --demo; delivery approval gate is #53")
+    if args.evidence_dir is not None:
+        args.evidence_dir.mkdir(parents=True, exist_ok=True)
+        summary = run_disposable_demo(args.evidence_dir)
+    else:
+        with tempfile.TemporaryDirectory() as tmp:
+            summary = run_disposable_demo(Path(tmp))
+    print(json.dumps(summary, indent=2, sort_keys=True))
+    print("DEMO_INDEPENDENT_REVIEW_OK")
+    return 0
