@@ -652,6 +652,35 @@ class IndependentReviewTest(unittest.TestCase):
             r3 = run_rev(round_num=3, candidate_sha=cand3, qa_record=_valid_qa_record(cand3, base_sha), security_record=_valid_security_record(cand3, base_sha, home), agy_bin=str(agy3))
             self.assertEqual((r3["outcome"], r3["review_verified"], r3["open_finding_ids"]), ("review-passed", True, []))
 
+    def test_reconcil_m6_verification_plan_blockers_reconcile(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo, home, base_sha, cand1, conf, _, _, _, run_rev = self._setup_workspace(root)
+            fid_mc = independent_review.compute_review_finding_id("verification-gap", "criteria", "missing-criteria")
+            fid_ne = independent_review.compute_review_finding_id("verification-gap", "verification-plan", "no-executable-checks")
+            empty_conf = dataclasses.replace(conf, gates={})
+            r1 = run_rev(round_num=1, child={**PARSED_CHILD, "criteria": []}, conf=empty_conf, prior_findings=[independent_review._gap_finding("verification-plan", "no-executable-checks", "No executable verification checks configured", f"0 checks on {cand1}", "Configure checks.", "observed-verification")])
+            self.assertTrue({fid_mc, fid_ne}.issubset(set(r1["open_finding_ids"])))
+            (repo / "src/chat_bridge/auth.py").write_text(CLEAN_AUTH_PY + "# m6-r2\n", encoding="utf-8"); git(repo, "add", "."); git(repo, "commit", "-q", "-m", "m6 r2")
+            cand2 = git(repo, "rev-parse", "HEAD")
+            bad_child = {**PARSED_CHILD, "criteria": [{**PARSED_CHILD["criteria"][0], "verification": ""}]}
+            r2 = run_rev(round_num=2, candidate_sha=cand2, child=bad_child, conf=empty_conf, qa_record=_valid_qa_record(cand2, base_sha), security_record=_valid_security_record(cand2, base_sha, home))
+            self.assertTrue({fid_mc, fid_ne}.issubset(set(r2["open_finding_ids"])))
+            (repo / "src/chat_bridge/auth.py").write_text(CLEAN_AUTH_PY + "# m6-r3\n", encoding="utf-8"); git(repo, "add", "."); git(repo, "commit", "-q", "-m", "m6 r3")
+            cand3 = git(repo, "rev-parse", "HEAD")
+            r3 = run_rev(round_num=3, candidate_sha=cand3, child=PARSED_CHILD, conf=conf, qa_record=_valid_qa_record(cand3, base_sha), security_record=_valid_security_record(cand3, base_sha, home))
+            self.assertEqual((r3["outcome"], r3["review_verified"], r3["open_finding_ids"]), ("review-passed", True, []))
+            by_id3 = {f["finding_id"]: f for f in r3["findings"] if f["finding_id"] in {fid_mc, fid_ne}}
+            for fid in (fid_mc, fid_ne):
+                self.assertEqual((by_id3[fid]["status"], by_id3[fid]["resolved_in_round"], by_id3[fid]["resolved_in_revision"], len(by_id3[fid]["history"])), ("resolved", 3, cand3, 3))
+            obs3 = r3["observed_verification"]
+            reg_only = [c for c in obs3["checks"] if c["kind"] != "criterion"]
+            crit_only = [c for c in obs3["checks"] if c["kind"] == "criterion"]
+            prior_m6 = [{**by_id3[fid_mc], "status": "open", "resolved_in_round": None, "resolved_in_revision": None, "last_seen_round": 2, "last_seen_revision": cand2}, {**by_id3[fid_ne], "status": "open", "resolved_in_round": None, "resolved_in_revision": None, "last_seen_round": 2, "last_seen_revision": cand2}]
+            for bad_obs in ({**obs3, "checks": reg_only}, {**obs3, "checks": crit_only}, {**obs3, "executed": False, "checks": []}, {**obs3, "head_sha": cand1}):
+                _, blk_m6, _, _ = independent_review.reconcile_review_findings(round_num=3, candidate_sha=cand3, base_sha=base_sha, agent_findings=[], det_findings=[], prior_findings=prior_m6, reconciliations={}, obs_ver=bad_obs, qa_eval={"status": "qa-verified", "verified": True}, sec_eval={"status": "approved", "verified": True}, home=home)
+                self.assertEqual({f["finding_id"] for f in blk_m6}, {fid_mc, fid_ne})
+
 def run_disposable_demo(tmp: Path) -> dict:
     repo, home, _ = _make_disposable_product_workspace(tmp)
     base_sha = git(repo, "rev-parse", "refs/heads/main")

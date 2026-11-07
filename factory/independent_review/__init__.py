@@ -473,6 +473,17 @@ def reconcile_review_findings(
                 if rule == "deleted-test-coverage":
                     det_reconciled, det_ev = (target not in deleted_paths and obs_ok and not same_open_rev), f"Deleted test coverage restored or satisfied with passing observed verification on {candidate_sha}."
                     det_blocker = "stale-evidence" if same_open_rev else ("check-failed" if not det_reconciled else None)
+                elif rule in ("missing-criteria", "no-executable-checks"):
+                    crit_chks = [c for c in obs_checks if c.get("kind") == "criterion"]
+                    reg_chks = [c for c in obs_checks if c.get("kind") in ("regression", "guard")]
+                    chks_err = next((err for c in obs_checks if (err := _verify_stored_check(c, candidate_sha, home)) is not None), None)
+                    plan_cids = {str(pc.get("id") or "").strip() for pc in ((obs.get("selection_plan") or {}).get("criterion_checks") or ()) if isinstance(pc, dict) and str(pc.get("id") or "").strip()}
+                    exec_cids = {str(c.get("assesses") or "").strip() for c in crit_chks}
+                    if crit_chks and reg_chks and plan_cids.issubset(exec_cids) and chks_err is None and obs_ok and not same_open_rev:
+                        det_reconciled, det_chk, det_ev = True, crit_chks[0], f"Observed verification plan satisfied with {len(crit_chks)} criterion and {len(reg_chks)} regression/guard check(s) passing on {candidate_sha} ({crit_chks[0]['output_path']})."
+                    else:
+                        is_stale = same_open_rev or (obs.get("head_sha") and obs.get("head_sha") != candidate_sha) or (chks_err is not None and "stale" in chks_err)
+                        det_blocker = "stale-evidence" if is_stale else ("check-failed" if any(c.get("executed") and not c.get("ok") for c in obs_checks) else "missing-verification")
                 elif match_chk is not None and _verify_stored_check(match_chk, candidate_sha, home, finding_id=stable_fid, target=target) is None and obs_ok and not same_open_rev:
                     det_reconciled, det_chk, det_ev = True, match_chk, f"Observed verification check {match_chk['name']!r} ({match_chk['command']!r}) exited 0 on {candidate_sha} ({match_chk['output_path']})."
                 else:
@@ -481,7 +492,7 @@ def reconcile_review_findings(
             if det_reconciled and claim_res not in ("thread-closed", "comment-resolved", "dismissed"):
                 status, blocker, res_kind, res_ev = "resolved", None, (claim_res if claim_res in ("fixed", "no-longer-applicable") else "fixed"), det_ev
                 if det_chk is not None and f_ver is None: f_ver = det_chk
-            elif source != "reviewer-agent" and det_blocker is not None and rec_claim is None: status, blocker, res_kind, res_ev = "open", det_blocker, None, None
+            elif source != "reviewer-agent" and det_blocker is not None: status, blocker, res_kind, res_ev = "open", det_blocker, None, None
             elif stable_fid in downgrade_ids and rec_claim is None: status, blocker, res_kind, res_ev = "open", "unsupported-assertion", None, None
             elif rec_claim is None: status, blocker, res_kind, res_ev = "open", "omitted-from-review", None, None
             elif claim_res in ("thread-closed", "comment-resolved", "dismissed"): status, blocker, res_kind, res_ev = "open", "thread-closure-only", None, None
