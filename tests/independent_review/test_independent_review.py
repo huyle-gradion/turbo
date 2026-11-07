@@ -278,6 +278,93 @@ class IndependentReviewTest(unittest.TestCase):
             bad_p2_rec = run_rev(round_num=7, agy_bin=str(bad_p2_agy))
             self.assertEqual((bad_p2_rec["outcome"], bad_p2_rec["review_verified"]), ("invalid-review", False))
 
+    def test_ac3_actionable_findings_categories_incomplete_rejection_and_identity_stability(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo, home, base_sha, cand_sha, conf, child_dir = self._setup_workspace(root)
+            qa_rec = _valid_qa_record(cand_sha, base_sha)
+            sec_rec = _valid_security_record(cand_sha, base_sha, home)
+
+            five_cat_findings = [
+                {"category": "missing-behavior", "blocking": True, "target": "src/chat_bridge/auth.py", "rule": "missing-whitespace-strip",
+                 "title": "Token whitespace not stripped", "evidence": "src/chat_bridge/auth.py:3", "actionable_correction": "Call token.strip() before prefix check."},
+                {"category": "bug", "blocking": True, "target": "src/chat_bridge/auth.py", "rule": "empty-token-accepted",
+                 "title": "Empty token returns valid sub", "evidence": "validate_token('') -> {'sub': ''}", "actionable_correction": "Raise ValueError on empty token."},
+                {"category": "verification-gap", "blocking": True, "target": "tests/test_auth.py", "rule": "missing-blank-token-test",
+                 "title": "No test for blank token", "evidence": "tests/test_auth.py lacks blank token test", "actionable_correction": "Add test_blank_token in tests/test_auth.py."},
+                {"category": "scope-drift", "blocking": True, "target": "src/chat_bridge/auth.py", "rule": "extra-helper-export",
+                 "title": "Unrequested helper in auth module", "evidence": "diff adds unrequested symbol", "actionable_correction": "Remove unrequested symbol."},
+                {"category": "non-blocking-suggestion", "blocking": False, "target": "src/chat_bridge/auth.py", "rule": "docstring-nit",
+                 "title": "Add docstring to validate_token", "evidence": "line 2", "actionable_correction": "Optional docstring."},
+            ]
+            five_agy = _make_fake_agy(
+                root, "agy-five",
+                _make_staged_reviewer_script(session_id="rev-ac3-1", outcome="changes-requested", findings=five_cat_findings),
+            )
+            r_five = independent_review.review_candidate_independently(
+                repo=repo, home=home, child_dir=child_dir, child=PARSED_CHILD, conf=conf,
+                base_sha=base_sha, candidate_sha=cand_sha, builder_session_id="b-1", builder_summary="done",
+                qa_record=qa_rec, security_record=sec_rec, round_num=1, agy_bin=str(five_agy),
+                deadline=time.monotonic() + 30.0, limit_s=30,
+            )
+            self.assertEqual((r_five["outcome"], r_five["review_verified"]), ("changes-requested", False))
+            self.assertEqual(len(r_five["blocking_findings"]), 4)
+            self.assertEqual(len(r_five["non_blocking_suggestions"]), 1)
+            self.assertEqual({f["category"] for f in r_five["findings"]}, independent_review.FINDING_CATEGORIES)
+
+            # Suggestion-only review passes without manufacturing blockers, while keeping delivery_approved=False
+            sugg_only_agy = _make_fake_agy(
+                root, "agy-sugg-only",
+                _make_staged_reviewer_script(session_id="rev-ac3-2", outcome="review-passed", findings=[five_cat_findings[4]]),
+            )
+            r_sugg = independent_review.review_candidate_independently(
+                repo=repo, home=home, child_dir=child_dir, child=PARSED_CHILD, conf=conf,
+                base_sha=base_sha, candidate_sha=cand_sha, builder_session_id="b-1", builder_summary="done",
+                qa_record=qa_rec, security_record=sec_rec, round_num=2, agy_bin=str(sugg_only_agy),
+                deadline=time.monotonic() + 30.0, limit_s=30,
+            )
+            self.assertEqual((r_sugg["outcome"], r_sugg["review_verified"], r_sugg["delivery_approved"]), ("review-passed", True, False))
+            self.assertEqual((len(r_sugg["blocking_findings"]), len(r_sugg["non_blocking_suggestions"])), (0, 1))
+
+            # Identity stability across array positions, line numbers, and caller-supplied unstable IDs
+            f_pos1 = [
+                {"finding_id": "LINE-10-POS-0", "category": "bug", "blocking": True, "target": "src/chat_bridge/auth.py", "rule": "empty-token-accepted",
+                 "line": 10, "title": "Empty token bug", "evidence": "line 10: return {'sub': token}", "actionable_correction": "Reject empty token."},
+                five_cat_findings[0],
+            ]
+            f_pos2 = [
+                five_cat_findings[0],
+                {"finding_id": "LINE-42-POS-1", "category": "bug", "blocking": True, "target": "src/chat_bridge/auth.py", "rule": "empty-token-accepted",
+                 "line": 42, "title": "Empty token bug shifted", "evidence": "line 42: return {'sub': token}", "actionable_correction": "Reject empty token."},
+            ]
+            _, _, parsed_pos1, iss1 = independent_review._parse_phase2_response(json.dumps({
+                "outcome": "changes-requested", "assessment": {k: {"status": "satisfied", "summary": "ok"} for k in independent_review.ASSESSMENT_KEYS},
+                "findings": f_pos1,
+            }))
+            _, _, parsed_pos2, iss2 = independent_review._parse_phase2_response(json.dumps({
+                "outcome": "changes-requested", "assessment": {k: {"status": "satisfied", "summary": "ok"} for k in independent_review.ASSESSMENT_KEYS},
+                "findings": f_pos2,
+            }))
+            self.assertEqual((iss1, iss2), ([], []))
+            id1 = [f["finding_id"] for f in parsed_pos1 if f["rule"] == "empty-token-accepted"][0]
+            id2 = [f["finding_id"] for f in parsed_pos2 if f["rule"] == "empty-token-accepted"][0]
+            self.assertEqual(id1, "REV-BUG-src-chat-bridge-auth-py-empty-token-accepted")
+            self.assertEqual(id1, id2)
+
+            # Reject incomplete blocker records (missing evidence, missing correction, missing target/rule, or duplicate colliding blocker IDs)
+            for bad_finding in (
+                {"category": "bug", "blocking": True, "target": "src/chat_bridge/auth.py", "rule": "r1", "evidence": "", "actionable_correction": "fix"},
+                {"category": "bug", "blocking": True, "target": "src/chat_bridge/auth.py", "rule": "r1", "evidence": "ev", "actionable_correction": ""},
+                {"category": "bug", "blocking": True, "target": "", "rule": "r1", "evidence": "ev", "actionable_correction": "fix"},
+                {"category": "unknown-cat", "blocking": True, "target": "src/chat_bridge/auth.py", "rule": "r1", "evidence": "ev", "actionable_correction": "fix"},
+            ):
+                _, _, _, bad_issues = independent_review._parse_phase2_response(json.dumps({
+                    "outcome": "changes-requested",
+                    "assessment": {k: {"status": "satisfied", "summary": "ok"} for k in independent_review.ASSESSMENT_KEYS},
+                    "findings": [bad_finding],
+                }))
+                self.assertTrue(bad_issues, f"expected rejection for {bad_finding}")
+
 
 if __name__ == "__main__":
     unittest.main()

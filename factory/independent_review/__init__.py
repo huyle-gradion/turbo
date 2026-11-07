@@ -153,6 +153,7 @@ def _parse_phase2_response(response_text: str) -> tuple[str | None, dict[str, di
         return outcome, assessment, [], [*issues, "phase-2 reviewer response is missing a valid 'findings' list of objects"]
 
     findings: list[dict[str, Any]] = []
+    seen_fids: set[str] = set()
     for idx, raw in enumerate(raw_findings):
         cat, raw_blk = str(raw.get("category") or "").strip(), raw.get("blocking")
         if cat not in FINDING_CATEGORIES:
@@ -168,8 +169,12 @@ def _parse_phase2_response(response_text: str) -> tuple[str | None, dict[str, di
             issues.append(f"blocker finding[{idx}] requires non-empty target, rule, concrete evidence, and actionable_correction"); continue
         target = target or "repository"
         rule = rule or SLUG_RE.sub("-", title.lower()).strip("-") or "suggestion"
+        fid = compute_review_finding_id(cat, target, rule)
+        if fid in seen_fids:
+            issues.append(f"finding[{idx}] has duplicate or colliding finding_id {fid!r}"); continue
+        seen_fids.add(fid)
         findings.append({
-            "finding_id": compute_review_finding_id(cat, target, rule), "category": cat, "blocking": blocking,
+            "finding_id": fid, "category": cat, "blocking": blocking,
             "target": target, "rule": rule, "title": title, "evidence": evidence or f"Suggestion on {target}",
             "actionable_correction": correction or "Optional maintainability improvement.", "source": "reviewer-agent",
         })
