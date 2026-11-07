@@ -290,10 +290,11 @@ def evaluate_independent_review_prerequisite(
     if not isinstance(wt, dict) or wt.get("worktree_clean") is not True or wt.get("candidate_modified_by_reviewer") is not False or wt.get("head_before") != candidate_sha or wt.get("head_after") != candidate_sha or wt.get("status_porcelain") != "" or wt.get("mutation_evidence_path") is not None:
         return _fail("reviewer-modified-worktree", "independent reviewer modified the candidate worktree", historical_blockers=all_hist)
     b_sid, r_sid = str(review_record.get("builder_session_id") or "").strip(), str(review_record.get("reviewer_session_id") or "").strip()
-    if not b_sid or not r_sid or r_sid == b_sid or (builder_session_id is not None and b_sid != str(builder_session_id).strip()):
+    role_iss_txt = " ".join(str(x) for x in (review_record.get("role_issues") or ()))
+    if not b_sid or r_sid == b_sid or "matches builder session" in role_iss_txt or (builder_session_id is not None and b_sid != str(builder_session_id).strip()):
         return _fail("reused-builder-identity", f"invalid or reused session identity: builder={b_sid!r}, reviewer={r_sid!r}", historical_blockers=all_hist)
     po, hyps = review_record.get("protocol_ordering"), review_record.get("failure_hypotheses")
-    if not isinstance(po, dict) or not (po.get("enforced") is True and po.get("phase_1_executed") is True and po.get("phase_1_omitted_builder_summary") is True and po.get("phase_1_included_exact_diff") is True and po.get("hypotheses_persisted_before_summary") is True and po.get("phase_2_executed") is True and po.get("phase_2_continued_session_id") == r_sid):
+    if not r_sid or not isinstance(po, dict) or not (po.get("enforced") is True and po.get("phase_1_executed") is True and po.get("phase_1_omitted_builder_summary") is True and po.get("phase_1_included_exact_diff") is True and po.get("hypotheses_persisted_before_summary") is True and po.get("phase_2_executed") is True and po.get("phase_2_continued_session_id") == r_sid):
         return _fail("invalid-review-protocol", "independent review two-phase protocol ordering was not enforced", historical_blockers=all_hist)
     if not isinstance(hyps, list) or not hyps or any(not isinstance(h, str) or not h.strip() for h in hyps):
         return _fail("invalid-review-protocol", "independent review is missing non-empty pre-summary failure hypotheses", historical_blockers=all_hist)
@@ -371,13 +372,8 @@ def evaluate_independent_review_prerequisite(
     rec_findings, rec_blocking, rec_open_ids, rec_resolutions = review_record.get("findings"), review_record.get("blocking_findings"), review_record.get("open_finding_ids"), review_record.get("previous_findings_resolution")
     if not isinstance(rec_findings, list) or not isinstance(rec_blocking, list) or not isinstance(rec_open_ids, list) or not isinstance(rec_resolutions, list) or any(not isinstance(x, dict) for x in (*rec_findings, *rec_resolutions)):
         return _fail("invalid-review", "independent review findings or resolutions structure is invalid", historical_blockers=all_hist)
-    if rec_blocking or rec_open_ids:
-        return _fail("changes-requested", f"open blocking findings on {candidate_sha}: {', '.join(str(x) for x in rec_open_ids)}", historical_blockers=all_hist)
     findings_by_id = {str(f.get("finding_id")): f for f in rec_findings if f.get("finding_id")}
     res_by_id = {str(r.get("finding_id")): r for r in rec_resolutions if r.get("finding_id")}
-    for f in rec_findings:
-        if f.get("blocking") and (f.get("status") != "resolved" or f.get("resolution") not in ("fixed", "no-longer-applicable") or f.get("resolution_blocker") is not None or f.get("last_seen_revision") != candidate_sha):
-            return _fail("unresolved-historical-blockers", f"blocking finding {f.get('finding_id')} is not verified resolved on {candidate_sha}", historical_blockers=all_hist)
     for pf in all_hist:
         fid = str(pf["finding_id"])
         cur_f, res_e = findings_by_id.get(fid), res_by_id.get(fid)
@@ -392,6 +388,11 @@ def evaluate_independent_review_prerequisite(
         if source == "reviewer-agent" or exp_vcmd or f_ver is not None:
             if (ver_err := ir_pkg._verify_stored_check(f_ver, candidate_sha, home, finding_id=fid, target=None if source == "reviewer-agent" else str(cur_f.get("target") or ""), expected_command=exp_vcmd or None)) is not None:
                 return _fail("unresolved-historical-blockers", f"historical blocker {fid} failed trusted execution verification on {candidate_sha}: {ver_err}", historical_blockers=all_hist)
+    for f in rec_findings:
+        if f.get("blocking") and (f.get("status") != "resolved" or f.get("resolution") not in ("fixed", "no-longer-applicable") or f.get("resolution_blocker") is not None or f.get("last_seen_revision") != candidate_sha):
+            return _fail("changes-requested", f"blocking finding {f.get('finding_id')} is not verified resolved on {candidate_sha}", historical_blockers=all_hist)
+    if rec_blocking or rec_open_ids:
+        return _fail("changes-requested", f"open blocking findings on {candidate_sha}: {', '.join(str(x) for x in rec_open_ids)}", historical_blockers=all_hist)
     _, recheck_blk, _, _ = ir_pkg.reconcile_review_findings(
         round_num=rec_round, candidate_sha=candidate_sha, base_sha=base_sha, agent_findings=p2_findings, det_findings=[],
         prior_findings=prior_entering, reconciliations=p2_reconcils, obs_ver=obs, qa_eval=up["automated_qa"], sec_eval=up["security_review"],

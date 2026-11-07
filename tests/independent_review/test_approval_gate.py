@@ -301,6 +301,102 @@ class ApprovalGateGroup1Test(unittest.TestCase):
             self.assertEqual((gate_b["delivery_approved"], gate_b["approved_revision"], gate_b["superseded_approved_revision"]), (True, cand_b, cand_a))
             self.assertFalse(independent_review.verify_candidate_approval(cand_b, base_sha, gate_a, repo=repo, home=home)["delivery_approved"])
 
+    def test_ac4_integrated_rejection_rules(self) -> None:
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo, home, base_sha, cand_sha, conf, child_dir, good_agy = self._setup_workspace(root)
+            ci_ok = _valid_ci_record(cand_sha, base_sha, home, conf=conf)
+            qa_ok = _valid_qa_record(cand_sha, base_sha)
+            sec_ok = _valid_security_record(cand_sha, base_sha, home)
+
+            def run_gate(sub_name: str, **over):
+                c_dir = child_dir / sub_name
+                kw = {
+                    "candidate_sha": cand_sha, "base_sha": base_sha, "ci_record": ci_ok, "qa_record": qa_ok,
+                    "security_record": sec_ok, "repo": repo, "home": home, "child_dir": c_dir, "child": PARSED_CHILD,
+                    "conf": conf, "builder_session_id": "builder-ac4", "builder_summary": "All checks passed.",
+                    "round_num": 1, "agy_bin": str(good_agy),
+                }
+                kw.update(over)
+                res = independent_review.evaluate_approval_gate(**kw)
+                self.assertTrue(res["prerequisites"]["ci"]["verified"] and res["prerequisites"]["automated_qa"]["verified"] and res["prerequisites"]["security_review"]["verified"])
+                return res
+
+            # Baseline: clean review + valid CI/QA/Security approves
+            ok_gate = run_gate("baseline-ok")
+            self.assertEqual((ok_gate["delivery_approved"], ok_gate["approved_revision"], ok_gate["status"]), (True, cand_sha, "approved"))
+            valid_rev = independent_review.read_json(child_dir / "baseline-ok" / "independent-review.json", home)
+
+            # 1. Reviewer edits (Phase 1 & Phase 2 mutations, edit-then-restore, and tampered review record)
+            edit_restore_agy = _make_fake_agy(
+                root, "agy-ac4-er",
+                "import os, pathlib\nf = pathlib.Path('src/chat_bridge/auth.py')\norig, st = f.read_bytes(), f.stat()\n"
+                "f.write_bytes(orig + b'\\n# transient\\n'); f.write_bytes(orig); os.utime(f, ns=(st.st_atime_ns, st.st_mtime_ns))\n"
+                + _make_staged_reviewer_script(session_id="rev-ac4-er"),
+            )
+            for idx, (phase, kind) in enumerate(((1, "unstaged"), (1, "staged"), (1, "untracked"), (1, "commit"), (2, "unstaged"), (2, "untracked")), start=1):
+                mut_agy = _make_fake_agy(root, f"agy-ac4-mut-{idx}", _make_staged_reviewer_script(session_id=f"rev-ac4-m{idx}", mutate_in_phase=phase, mutate_kind=kind))
+                res_m = run_gate(f"mut-{idx}", agy_bin=str(mut_agy))
+                self.assertEqual((res_m["delivery_approved"], res_m["approved_revision"], res_m["status"]), (False, None, "reviewer-modified-worktree"))
+            res_er = run_gate("mut-er", agy_bin=str(edit_restore_agy))
+            self.assertEqual((res_er["delivery_approved"], res_er["approved_revision"], res_er["status"]), (False, None, "reviewer-modified-worktree"))
+            mut_rec = independent_review.read_json(child_dir / "mut-1" / "independent-review.json", home)
+            res_mut_tampered = run_gate("mut-tampered", review_record={**mut_rec, "outcome": "review-passed", "review_verified": True, "role_separation_verified": True, "role_issues": []})
+            self.assertEqual((res_mut_tampered["delivery_approved"], res_mut_tampered["status"]), (False, "reviewer-modified-worktree"))
+
+            # 2. Reused builder identity (Phase 1 match, Phase 2 match, missing builder_session_id, tampered record)
+            p1_reused_agy = _make_fake_agy(root, "agy-ac4-id1", _make_staged_reviewer_script(session_id="builder-ac4"))
+            p2_reused_agy = _make_fake_agy(root, "agy-ac4-id2", _make_staged_reviewer_script(session_id="fresh-ac4", phase2_session_id="builder-ac4"))
+            for label, kw_id in (
+                ("p1-reused", {"agy_bin": str(p1_reused_agy)}),
+                ("p2-reused", {"agy_bin": str(p2_reused_agy)}),
+                ("missing-builder-id", {"builder_session_id": ""}),
+                ("tampered-same-id", {"review_record": {**valid_rev, "reviewer_session_id": "builder-ac4"}}),
+            ):
+                res_id = run_gate(f"id-{label}", **kw_id)
+                self.assertEqual((res_id["delivery_approved"], res_id["approved_revision"], res_id["status"]), (False, None, "reused-builder-identity"), label)
+
+            # 3. Invalid review protocol (summary leak in Phase 1, missing diff, empty hypotheses, session drift, fenced JSON, unsatisfied dimension)
+            with mock.patch.object(independent_review, "build_phase1_prompt", return_value="ROLE: independent-reviewer\nPHASE: 1\nBuilder summary: leaked!\nExact Base-to-Candidate Diff:\n" + Path(valid_rev["inspected_scope"]["diff_path"]).read_text(encoding="utf-8")):
+                res_leak = run_gate("proto-leak")
+            with mock.patch.object(independent_review, "build_phase1_prompt", return_value="ROLE: independent-reviewer\nPHASE: 1\nExact Base-to-Candidate Diff:\nno-diff\n"):
+                res_nodiff = run_gate("proto-nodiff")
+            empty_hyp_agy = _make_fake_agy(root, "agy-ac4-eh", _make_staged_reviewer_script(session_id="rev-eh", hypotheses=[]))
+            drift_agy = _make_fake_agy(root, "agy-ac4-drift", _make_staged_reviewer_script(session_id="rev-d1", phase2_session_id="rev-d2"))
+            fenced_agy = _make_fake_agy(
+                root, "agy-ac4-fenced",
+                _make_staged_reviewer_script(session_id="rev-fenced").replace(
+                    "print(json.dumps({'event': 'result', 'result': {'conversation_id': out_sid, 'status': 'SUCCESS', 'response': resp}}))",
+                    "print(json.dumps({'event': 'result', 'result': {'conversation_id': out_sid, 'status': 'SUCCESS', 'response': '```json\\n' + resp + '\\n```'}}))",
+                ),
+            )
+            unsat_agy = _make_fake_agy(root, "agy-ac4-unsat", _make_staged_reviewer_script(session_id="rev-unsat", outcome="review-passed", assessment={**DEFAULT_ASSESSMENT, "edge_cases": {"status": "unsatisfied", "summary": "missing"}}))
+            for label, res_p in (
+                ("leak", res_leak), ("nodiff", res_nodiff),
+                ("empty-hyp", run_gate("proto-eh", agy_bin=str(empty_hyp_agy))),
+                ("drift", run_gate("proto-drift", agy_bin=str(drift_agy))),
+                ("fenced", run_gate("proto-fenced", agy_bin=str(fenced_agy))),
+                ("unsat", run_gate("proto-unsat", agy_bin=str(unsat_agy))),
+            ):
+                self.assertEqual((res_p["delivery_approved"], res_p["approved_revision"], res_p["status"]), (False, None, "invalid-review-protocol"), label)
+
+            # 4. Unsupported success claims (builder claim contradicted by failing check, prose-only reconciliation claims, forged check log)
+            fail_child = {**PARSED_CHILD, "criteria": [{**PARSED_CHILD["criteria"][0], "verification": "python3 -c \"import sys; sys.exit(1)\""}]}
+            res_bclaim = run_gate("claim-builder-false", child=fail_child, builder_summary="All tests passed with 0 failures!")
+            self.assertEqual((res_bclaim["delivery_approved"], res_bclaim["approved_revision"], res_bclaim["status"]), (False, None, "unsupported-success-claim"))
+            res_bclaim_tampered = run_gate("claim-builder-tampered", review_record={**valid_rev, "builder_summary_claim": {"summary": "passed", "treated_as_execution_evidence": True, "contradicted_by_observed_execution": False}})
+            self.assertEqual((res_bclaim_tampered["delivery_approved"], res_bclaim_tampered["status"]), (False, "unsupported-success-claim"))
+
+            vcmd_fail = "python3 -c \"import pathlib, sys; sys.exit(0 if '# ac4-never-added' in pathlib.Path('src/chat_bridge/auth.py').read_text() else 1)\""
+            fid_ac4 = independent_review.compute_review_finding_id("bug", "src/chat_bridge/auth.py", "ac4-unfixed-bug")
+            prior_ac4 = [{"finding_id": fid_ac4, "category": "bug", "blocking": True, "target": "src/chat_bridge/auth.py", "rule": "ac4-unfixed-bug", "title": "Unfixed bug", "evidence": "r1-ev", "actionable_correction": "Add # ac4-never-added", "verification_command": vcmd_fail, "status": "open", "introduced_in_round": 1, "introduced_in_revision": base_sha}]
+            for idx, bad_res in enumerate(("fixed", "no-longer-applicable", "thread-closed", "comment-resolved", "dismissed"), start=1):
+                claim_agy = _make_fake_agy(root, f"agy-ac4-cl-{idx}", _make_staged_reviewer_script(session_id=f"rev-cl-{idx}", outcome="review-passed", reconciliations=[{"finding_id": fid_ac4, "resolution": bad_res, "evidence": f"claimed {bad_res} without fix"}]))
+                res_cl = run_gate(f"claim-rec-{idx}", round_num=2, prior_findings=prior_ac4, agy_bin=str(claim_agy))
+                self.assertEqual((res_cl["delivery_approved"], res_cl["approved_revision"], res_cl["status"]), (False, None, "unresolved-historical-blockers"), bad_res)
+                self.assertIn(fid_ac4, res_cl["historical_blockers"]["unresolved_ids"])
+
 
 if __name__ == "__main__":
     unittest.main()
