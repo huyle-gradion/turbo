@@ -208,6 +208,99 @@ class ApprovalGateGroup1Test(unittest.TestCase):
             corrupt_res = eval_g()
             self.assertEqual((corrupt_res["delivery_approved"], corrupt_res["status"]), (False, "corrupt-prior-history"))
 
+    def test_ac2_exact_candidate_approval_binding_and_stale_rejection(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo, home, base_sha, cand_a, conf, child_dir, good_agy = self._setup_workspace(root)
+            ci_a, qa_a, sec_a = _valid_ci_record(cand_a, base_sha, home, conf=conf), _valid_qa_record(cand_a, base_sha), _valid_security_record(cand_a, base_sha, home)
+            rev_a = independent_review.review_candidate_independently(
+                repo=repo, home=home, child_dir=child_dir, child=PARSED_CHILD, conf=conf, base_sha=base_sha, candidate_sha=cand_a,
+                builder_session_id="builder-a", builder_summary="Candidate A", qa_record=qa_a, security_record=sec_a, round_num=1, agy_bin=str(good_agy), deadline=time.monotonic() + 30.0, limit_s=30,
+            )
+            self.assertFalse(rev_a["delivery_approved"])
+            gate_a = independent_review.evaluate_approval_gate(
+                candidate_sha=cand_a, base_sha=base_sha, ci_record=ci_a, qa_record=qa_a, security_record=sec_a,
+                review_record=rev_a, repo=repo, home=home, child_dir=child_dir, child=PARSED_CHILD, conf=conf,
+            )
+            self.assertEqual((gate_a["delivery_approved"], gate_a["approved_revision"], gate_a["candidate_sha"], gate_a["tested_sha"], gate_a["revision_kind"]), (True, cand_a, cand_a, cand_a, "fast-forward-head"))
+            self.assertTrue(independent_review.verify_candidate_approval(cand_a, base_sha, gate_a, repo=repo, home=home)["delivery_approved"])
+
+            # Integration-merge tested-revision semantics on cand_a
+            git(repo, "checkout", "-q", "-b", "merge-sim-ac2", base_sha)
+            git(repo, "merge", "--no-ff", "-q", "-m", "Merge cand_a into base", cand_a)
+            merge_sha = git(repo, "rev-parse", "HEAD")
+            git(repo, "checkout", "-q", "task/101-gate")
+            ci_merge = _valid_ci_record(cand_a, base_sha, home, tested_sha=merge_sha, revision_kind="integration-merge", conf=conf)
+            qa_merge = {**_valid_qa_record(cand_a, base_sha, tested_sha=merge_sha), "revision_kind": "integration-merge"}
+            gate_merge = independent_review.evaluate_approval_gate(
+                candidate_sha=cand_a, base_sha=base_sha, ci_record=ci_merge, qa_record=qa_merge, security_record=sec_a,
+                review_record=rev_a, repo=repo, home=home, child_dir=child_dir, child=PARSED_CHILD, conf=conf,
+            )
+            self.assertEqual((gate_merge["delivery_approved"], gate_merge["approved_revision"], gate_merge["tested_sha"], gate_merge["revision_kind"]), (True, cand_a, merge_sha, "integration-merge"))
+            mismatch_merge = independent_review.evaluate_approval_gate(
+                candidate_sha=cand_a, base_sha=base_sha, ci_record=ci_merge, qa_record=qa_a, security_record=sec_a,
+                review_record=rev_a, repo=repo, home=home, child_dir=child_dir, child=PARSED_CHILD, conf=conf,
+            )
+            self.assertEqual((mismatch_merge["delivery_approved"], mismatch_merge["status"]), (False, "stale-qa-evidence"))
+
+            # Re-approve cand_a on disk before creating subsequent candidate B
+            gate_a = independent_review.evaluate_approval_gate(
+                candidate_sha=cand_a, base_sha=base_sha, ci_record=ci_a, qa_record=qa_a, security_record=sec_a,
+                review_record=rev_a, repo=repo, home=home, child_dir=child_dir, child=PARSED_CHILD, conf=conf,
+            )
+            (repo / "src/chat_bridge/auth.py").write_text(CLEAN_AUTH_PY + "# candidate B change\n", encoding="utf-8")
+            git(repo, "add", "."); git(repo, "commit", "-q", "-m", "candidate B")
+            cand_b = git(repo, "rev-parse", "HEAD")
+            self.assertNotEqual(cand_a, cand_b)
+
+            # Approval issued for cand_a is rejected when evaluated for subsequent candidate B
+            ver_b_from_a = independent_review.verify_candidate_approval(cand_b, base_sha, gate_a, repo=repo, home=home)
+            self.assertEqual((ver_b_from_a["delivery_approved"], ver_b_from_a["approved_revision"], ver_b_from_a["status"], ver_b_from_a["stale_approved_revision"]), (False, None, "stale-candidate-revision", cand_a))
+            gate_b_stale = independent_review.evaluate_approval_gate(
+                candidate_sha=cand_b, base_sha=base_sha, ci_record=ci_a, qa_record=qa_a, security_record=sec_a,
+                review_record=rev_a, prior_approval=gate_a, repo=repo, home=home, child_dir=child_dir, child=PARSED_CHILD, conf=conf,
+            )
+            self.assertEqual((gate_b_stale["delivery_approved"], gate_b_stale["approved_revision"], gate_b_stale["status"], gate_b_stale["prior_approval_rejected"], gate_b_stale["superseded_approved_revision"]), (False, None, "stale-candidate-revision", True, cand_a))
+            self.assertFalse(json.loads((child_dir / "approval-gate.json").read_text(encoding="utf-8"))["delivery_approved"])
+
+            # Fresh prerequisites for cand_b, but test partial/relabelled cand_a evidence first
+            ci_b, qa_b, sec_b = _valid_ci_record(cand_b, base_sha, home, conf=conf), _valid_qa_record(cand_b, base_sha), _valid_security_record(cand_b, base_sha, home)
+            rev_b = independent_review.review_candidate_independently(
+                repo=repo, home=home, child_dir=child_dir, child=PARSED_CHILD, conf=conf, base_sha=base_sha, candidate_sha=cand_b,
+                builder_session_id="builder-b", builder_summary="Candidate B", qa_record=qa_b, security_record=sec_b, round_num=2, agy_bin=str(good_agy), deadline=time.monotonic() + 30.0, limit_s=30,
+            )
+            for label, bad_kw in (
+                ("stale-ci-a", {"ci_record": ci_a}),
+                ("relabelled-ci-a", {"ci_record": {**ci_a, "candidate_sha": cand_b, "tested_sha": cand_b}}),
+                ("relabelled-merge-ci-a", {"ci_record": {**ci_merge, "candidate_sha": cand_b}, "qa_record": {**qa_merge, "candidate_sha": cand_b}}),
+                ("stale-qa-a", {"qa_record": qa_a}),
+                ("relabelled-qa-a", {"qa_record": {**qa_a, "candidate_sha": cand_b, "tested_sha": cand_b}}),
+                ("stale-sec-a", {"security_record": sec_a}),
+                ("relabelled-sec-a", {"security_record": {**sec_a, "reviewed_revision": cand_b}}),
+                ("stale-rev-a", {"review_record": rev_a}),
+                ("relabelled-rev-a", {"review_record": {**rev_a, "reviewed_revision": cand_b, "round": 2}}),
+            ):
+                kw_b = {"candidate_sha": cand_b, "base_sha": base_sha, "ci_record": ci_b, "qa_record": qa_b, "security_record": sec_b, "review_record": rev_b, "repo": repo, "home": home, "child_dir": child_dir, "child": PARSED_CHILD, "conf": conf, **bad_kw}
+                res_b = independent_review.evaluate_approval_gate(**kw_b)
+                self.assertEqual((res_b["delivery_approved"], res_b["approved_revision"]), (False, None), f"expected rejection for {label}")
+
+            # Non-gate producers cannot issue delivery_approved=True
+            for non_gate_rec in (rev_b, {**rev_b, "delivery_approved": True}, {**ci_b, "delivery_approved": True}, {**qa_b, "delivery_approved": True}, {**sec_b, "delivery_approved": True}):
+                v_ng = independent_review.verify_candidate_approval(cand_b, base_sha, non_gate_rec, repo=repo, home=home)
+                self.assertEqual((v_ng["delivery_approved"], v_ng["status"]), (False, "authority-violation"))
+            for field_name, base_rec in (("ci_record", ci_b), ("qa_record", qa_b), ("security_record", sec_b), ("review_record", rev_b)):
+                auth_kw = {"candidate_sha": cand_b, "base_sha": base_sha, "ci_record": ci_b, "qa_record": qa_b, "security_record": sec_b, "review_record": rev_b, "repo": repo, "home": home, "child_dir": child_dir, "child": PARSED_CHILD, "conf": conf, field_name: {**base_rec, "delivery_approved": True}}
+                auth_res = independent_review.evaluate_approval_gate(**auth_kw)
+                self.assertEqual((auth_res["delivery_approved"], auth_res["status"]), (False, "authority-violation"))
+
+            # Full fresh evidence on cand_b issues new approval bound to cand_b while gate_a remains rejected for cand_b
+            gate_b = independent_review.evaluate_approval_gate(
+                candidate_sha=cand_b, base_sha=base_sha, ci_record=ci_b, qa_record=qa_b, security_record=sec_b,
+                review_record=rev_b, prior_approval=gate_a, repo=repo, home=home, child_dir=child_dir, child=PARSED_CHILD, conf=conf,
+            )
+            self.assertEqual((gate_b["delivery_approved"], gate_b["approved_revision"], gate_b["superseded_approved_revision"]), (True, cand_b, cand_a))
+            self.assertFalse(independent_review.verify_candidate_approval(cand_b, base_sha, gate_a, repo=repo, home=home)["delivery_approved"])
+
 
 if __name__ == "__main__":
     unittest.main()
