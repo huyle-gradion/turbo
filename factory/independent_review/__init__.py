@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import json, math, os, re, shutil, sys, time
+import ctypes, hashlib, json, math, os, re, shutil, stat, sys, time
 from pathlib import Path
 from typing import Any
 
@@ -265,8 +265,7 @@ def _run_observed_verification(
     verify_home = safe_dir(verify_dir / "verify-home", create=True, root=home)
     safe_dir(verify_home / ".tmp", create=True, root=home)
     env, _ = worker_module.sanitized_env(dict(os.environ), worktree, verify_home)
-    if (worktree / "tests").is_dir():
-        env["PYTHONPATH"] = "tests:."
+    env["GIT_OPTIONAL_LOCKS"] = env["PYTHONNOUSERSITE"] = "1"
     specs: list[tuple[str, str, str, tuple[str, ...] | None, str]] = []
     for guard in plan.get("essential_guards") or []:
         gid = str(guard.get("id") or "")
@@ -331,13 +330,91 @@ def _run_observed_verification(
             "checks": checks, "verification_gaps": gaps, "provenance": "observed-independent-verification"}
 
 
-def _check_worktree_mutation(worktree: Path, expected_sha: str, round_dir: Path, home: Path, phase_label: str, secrets: tuple[str, ...]) -> dict[str, Any]:
-    head_after, status_out = gitio.head(worktree), gitio.status_porcelain(worktree)
-    mutated = head_after != expected_sha or bool(status_out.strip())
+def _snapshot_worktree(worktree: Path) -> dict[str, tuple[Any, ...]]:
+    snap: dict[str, tuple[Any, ...]] = {}
+    for root, dirs, files in os.walk(worktree, topdown=True, followlinks=False):
+        dirs.sort(); files.sort()
+        rp = Path(root)
+        for name in (*dirs, *files):
+            p = rp / name
+            rel = str(p.relative_to(worktree))
+            st = p.lstat()
+            if stat.S_ISLNK(st.st_mode):
+                payload = f"symlink:{os.readlink(p)}"
+            elif stat.S_ISREG(st.st_mode):
+                payload = hashlib.sha256(p.read_bytes()).hexdigest()
+            else:
+                payload = "dir"
+            snap[rel] = (st.st_mode, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns, payload)
+    return snap
+
+
+def _open_inotify_watch(worktree: Path) -> int | None:
+    try:
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        fd = libc.inotify_init1(0o4000 | 0o2000000)
+        if fd < 0:
+            return None
+        mask = 0x002 | 0x004 | 0x008 | 0x040 | 0x080 | 0x100 | 0x200 | 0x400 | 0x800
+        for root, dirs, _ in os.walk(worktree, topdown=True, followlinks=False):
+            libc.inotify_add_watch(fd, os.fsencode(root), mask)
+            for d in dirs:
+                libc.inotify_add_watch(fd, os.fsencode(os.path.join(root, d)), mask)
+        return int(fd)
+    except Exception:
+        return None
+
+
+def _drain_inotify_watch(fd: int | None) -> bool:
+    if fd is None:
+        return False
+    try:
+        chunks: list[bytes] = []
+        while True:
+            try:
+                buf = os.read(fd, 65536)
+                if not buf:
+                    break
+                chunks.append(buf)
+            except BlockingIOError:
+                break
+        return bool(b"".join(chunks))
+    except OSError:
+        return False
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
+def _read_head_pure(worktree: Path) -> str:
+    try:
+        raw = (worktree / ".git" / "HEAD").read_text(encoding="utf-8", errors="replace").strip()
+        if raw.startswith("ref: "):
+            ref_p = worktree / ".git" / raw[5:].strip()
+            if ref_p.is_file():
+                return ref_p.read_text(encoding="utf-8", errors="replace").strip()
+        return raw
+    except OSError:
+        return "invalid-head"
+
+
+def _check_worktree_mutation(
+    worktree: Path, expected_sha: str, round_dir: Path, home: Path, phase_label: str, secrets: tuple[str, ...],
+    baseline_snap: dict[str, tuple[Any, ...]] | None = None, inotify_triggered: bool = False,
+) -> dict[str, Any]:
+    head_after = _read_head_pure(worktree)
+    cur_snap = _snapshot_worktree(worktree)
+    base_snap = cur_snap if baseline_snap is None else baseline_snap
+    changed = sorted(set(base_snap) ^ set(cur_snap) | {k for k in set(base_snap) & set(cur_snap) if base_snap[k] != cur_snap[k]})
+    if inotify_triggered and not changed:
+        changed.append("<transient-filesystem-write-event>")
+    status_out = "\n".join(f"M {p}" for p in changed)
+    mutated = head_after != expected_sha or bool(changed)
     evidence_path = None
     if mutated:
-        diff_res = gitio.git(worktree, "diff", "--binary", expected_sha)
-        snap = redact_value(f"phase={phase_label}\nexpected_sha={expected_sha}\nhead_after={head_after}\nstatus_porcelain:\n{status_out}\ndiff:\n{diff_res.output}\n", secrets)
+        snap = redact_value(f"phase={phase_label}\nexpected_sha={expected_sha}\nhead_after={head_after}\nchanged:\n{status_out}\n", secrets)
         evidence_path = str(write_evidence(round_dir, f"reviewer-mutation-{phase_label}", snap, home))
     return {"phase": phase_label, "head_before": expected_sha, "head_after": head_after, "status_porcelain": redact_value(status_out, secrets),
             "worktree_clean": not mutated, "candidate_modified_by_reviewer": mutated, "mutation_evidence_path": evidence_path}
@@ -346,17 +423,21 @@ def _check_worktree_mutation(worktree: Path, expected_sha: str, round_dir: Path,
 def _run_phase_exec(
     worktree: Path, round_dir: Path, home: Path, isolated_home: Path, worker_env: dict[str, str], agy_bin: str,
     prompt: str, phase_tag: str, expected_sha: str, secrets: tuple[str, ...], deadline: float, limit_s: int,
-    *, continue_session_id: str | None = None,
+    *, continue_session_id: str | None = None, baseline_snap: dict[str, tuple[Any, ...]] | None = None,
 ) -> dict[str, Any]:
     cont = ("--conversation", str(continue_session_id)) if continue_session_id else ()
     argv = (str(agy_bin), *cont, "--print", prompt, "--output-format", "stream-json", "--sandbox", "--mode", "auto")
     t_out = max(1, int(math.ceil(remaining_seconds(deadline, f"independent review {phase_tag}", limit_s))))
-    code, out_s, err_s, _, timed_out = worker_module.execute_stream(worktree, argv, worker_env, t_out, isolated_home=isolated_home)
+    ifd = _open_inotify_watch(worktree)
+    try:
+        code, out_s, err_s, _, timed_out = worker_module.execute_stream(worktree, argv, worker_env, t_out, isolated_home=isolated_home)
+    finally:
+        wrote_ev = _drain_inotify_watch(ifd)
     stdout_p = str(write_evidence(round_dir, f"{phase_tag}-stdout", redact_value(out_s, secrets), home))
     stderr_p = str(write_evidence(round_dir, f"{phase_tag}-stderr", redact_value(err_s, secrets), home))
     ev, res, perr = worker_module.parse_stream_events(out_s)
     denied = worker_module.has_permission_denial(ev, res, err_s)
-    mut = _check_worktree_mutation(worktree, expected_sha, round_dir, home, phase_tag, secrets)
+    mut = _check_worktree_mutation(worktree, expected_sha, round_dir, home, phase_tag, secrets, baseline_snap, wrote_ev)
     ok = not timed_out and perr is None and not denied and code == 0 and isinstance(res, dict) and res.get("status") == "SUCCESS"
     sid = str(res.get("conversation_id") or "").strip() or None if isinstance(res, dict) else None
     resp = str(res.get("response") or "") if isinstance(res, dict) else ""
@@ -375,6 +456,7 @@ def review_candidate_independently(
     isolated_home = worker_module.prepare_isolated_home(round_dir, Path.home(), root=home)
     safe_dir(isolated_home / ".tmp", create=True, root=home)
     worker_env, stripped_keys = worker_module.sanitized_env(dict(os.environ), worktree, isolated_home)
+    worker_env["GIT_OPTIONAL_LOCKS"] = worker_env["PYTHONNOUSERSITE"] = "1"
     secrets = collect_redaction_secrets()
     resolved_sha = worker_module.prepare_isolated_git_checkout(repo, worktree, candidate_sha, deadline=deadline)
     try:
@@ -428,8 +510,9 @@ def review_candidate_independently(
         if not p1_has_exact_diff:
             role_issues.append("protocol violation: phase-1 prompt did not include exact base-to-candidate diff")
 
+        base_snap = _snapshot_worktree(worktree)
         p1_res: dict[str, Any] = {"executed": False, "stdout_path": None, "stderr_path": None, "session_id": None,
-                                  "mut": _check_worktree_mutation(worktree, resolved_sha, round_dir, home, "pre-phase1", secrets)}
+                                  "mut": _check_worktree_mutation(worktree, resolved_sha, round_dir, home, "pre-phase1", secrets, base_snap)}
         p2_res: dict[str, Any] = {"executed": False, "stdout_path": None, "stderr_path": None, "session_id": None, "mut": p1_res["mut"]}
         p2_prompt_path, hypotheses_path, hypotheses_sha256 = None, None, None
         hypotheses: list[str] = []
@@ -439,7 +522,10 @@ def review_candidate_independently(
 
         if probes_ok and diff_ok and bool(b_sid) and bool(agy_bin and str(agy_bin).strip()) and p1_omitted_summary and p1_has_exact_diff:
             try:
-                p1_res = _run_phase_exec(worktree, round_dir, home, isolated_home, worker_env, str(agy_bin), p1_prompt_red, "phase1", resolved_sha, secrets, deadline, limit_s)
+                p1_res = _run_phase_exec(
+                    worktree, round_dir, home, isolated_home, worker_env, str(agy_bin), p1_prompt_red, "phase1", resolved_sha, secrets, deadline, limit_s,
+                    baseline_snap=base_snap,
+                )
                 p2_res["mut"] = p1_res["mut"]
                 if p1_res["mut"]["candidate_modified_by_reviewer"]:
                     role_issues.append("independent reviewer mutated the candidate worktree during phase 1")
@@ -466,7 +552,7 @@ def review_candidate_independently(
             try:
                 p2_res = _run_phase_exec(
                     worktree, round_dir, home, isolated_home, worker_env, str(agy_bin), p2_prompt_red, "phase2", resolved_sha, secrets, deadline, limit_s,
-                    continue_session_id=p1_res["session_id"],
+                    continue_session_id=p1_res["session_id"], baseline_snap=base_snap,
                 )
                 if p2_res["mut"]["candidate_modified_by_reviewer"]:
                     role_issues.append("independent reviewer mutated the candidate worktree during phase 2")
@@ -488,7 +574,7 @@ def review_candidate_independently(
         worktree_mutated = bool(mutation_record["candidate_modified_by_reviewer"])
         if probes_ok and diff_ok and not worktree_mutated:
             obs_ver = _run_observed_verification(worktree, round_dir, home, child, conf, tuple(diff_info["changed_paths"]), deleted_paths, resolved_sha, secrets, deadline, limit_s)
-            post_ver_mut = _check_worktree_mutation(worktree, resolved_sha, round_dir, home, "post-verification", secrets)
+            post_ver_mut = _check_worktree_mutation(worktree, resolved_sha, round_dir, home, "post-verification", secrets, base_snap)
             if post_ver_mut["candidate_modified_by_reviewer"]:
                 worktree_mutated, mutation_record = True, post_ver_mut
                 role_issues.append("candidate worktree was mutated during verification checks")

@@ -395,6 +395,50 @@ class IndependentReviewTest(unittest.TestCase):
             self.assertNotIn("STD-WEAKENED-99", p1_txt.split("Exact Base-to-Candidate Diff:", 1)[0])
             self.assertEqual((rec["outcome"], rec["review_verified"], rec["assessment"]["project_standards"]["status"]), ("changes-requested", False, "unsatisfied"))
 
+    def test_m5_reviewer_write_and_host_execution_bypasses(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo, home, _, base_sha, _, _, _, _, run_rev = self._setup_workspace(root)
+            edit_restore = _make_fake_agy(
+                root, "agy-edit-restore",
+                "import os, pathlib\nf = pathlib.Path('src/chat_bridge/auth.py')\norig, st = f.read_bytes(), f.stat()\n"
+                "f.write_bytes(orig + b'\\n# transient\\n'); f.write_bytes(orig); os.utime(f, ns=(st.st_atime_ns, st.st_mtime_ns))\n"
+                + _make_staged_reviewer_script(session_id="rev-m5-er"),
+            )
+            r1 = run_rev(round_num=1, agy_bin=str(edit_restore))
+            self.assertEqual((r1["outcome"], r1["review_verified"], r1["worktree_integrity"]["candidate_modified_by_reviewer"]), ("invalid-review", False, True))
+            ignored_agy = _make_fake_agy(
+                root, "agy-ignored",
+                "import pathlib\npathlib.Path('.git/info/exclude').write_text('*.ignored\\n', encoding='utf-8')\n"
+                "pathlib.Path('secret.ignored').write_text('x', encoding='utf-8')\n"
+                + _make_staged_reviewer_script(session_id="rev-m5-ig"),
+            )
+            r2 = run_rev(round_num=2, agy_bin=str(ignored_agy))
+            self.assertEqual((r2["outcome"], r2["review_verified"], r2["worktree_integrity"]["candidate_modified_by_reviewer"]), ("invalid-review", False, True))
+            git_marker = root / "host-git-executed.sentinel"
+            git_cfg_agy = _make_fake_agy(
+                root, "agy-gitcfg",
+                f"import pathlib\npathlib.Path('.git/config').write_text('[core]\\n\\tfsmonitor = touch {git_marker}\\n', encoding='utf-8')\n"
+                + _make_staged_reviewer_script(session_id="rev-m5-cfg"),
+            )
+            r3 = run_rev(round_num=3, agy_bin=str(git_cfg_agy))
+            self.assertFalse(git_marker.exists())
+            self.assertEqual((r3["outcome"], r3["review_verified"], r3["worktree_integrity"]["candidate_modified_by_reviewer"]), ("invalid-review", False, True))
+            site_marker = root / "sitecustomize-executed.sentinel"
+            git(repo, "checkout", "-q", "-b", "task/101-site", base_sha)
+            (repo / "src/chat_bridge/auth.py").write_text(CLEAN_AUTH_PY, encoding="utf-8")
+            (repo / "tests/test_auth.py").write_text((repo / "tests/test_auth.py").read_text(encoding="utf-8") + EXPIRED_TEST_APPEND, encoding="utf-8")
+            (repo / "tests/sitecustomize.py").write_text(f"import pathlib; pathlib.Path({str(site_marker)!r}).write_text('pwn')\n", encoding="utf-8")
+            git(repo, "add", "."); git(repo, "commit", "-q", "-m", "plant sitecustomize in tests")
+            cand_site = git(repo, "rev-parse", "HEAD")
+            child_site = {**PARSED_CHILD, "scope": {**PARSED_CHILD["scope"], "in_scope": "src/chat_bridge/auth.py, tests/test_auth.py, tests/sitecustomize.py"}}
+            r4 = run_rev(round_num=4, candidate_sha=cand_site, child=child_site, qa_record=_valid_qa_record(cand_site, base_sha),
+                         security_record=_valid_security_record(cand_site, base_sha, home))
+            self.assertFalse(site_marker.exists())
+            self.assertTrue(r4["observed_verification"]["executed"])
+            r5 = run_rev(round_num=5)
+            self.assertEqual((r5["outcome"], r5["review_verified"], r5["worktree_integrity"]["candidate_modified_by_reviewer"]), ("review-passed", True, False))
+
 
 def run_disposable_demo(tmp: Path) -> dict:
     repo, home, _ = _make_disposable_product_workspace(tmp)
