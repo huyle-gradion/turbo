@@ -34,16 +34,25 @@ def _scan_rounds(base_dir: Path | None, home: Path | None, pat: str, cur_r: int,
         out.append((r_idx, r_obj))
     return out, None
 
-def _verify_file_digest(path_val: Any, sha_val: Any, home: Path | None, label: str) -> str | None:
+def _verify_file_digest(path_val: Any, sha_val: Any, home: Path | None, label: str, *, rev_bind: tuple[str, str, str] | None = None) -> str | None:
     if not isinstance(path_val, str) or not path_val.strip() or not isinstance(sha_val, str) or not sha_val.strip():
         return f"{label} is missing stored output_path or output_sha256"
     p = Path(path_val)
     try:
         if p.is_symlink() or not p.is_file() or (home is not None and not p.resolve().is_relative_to(home.resolve())):
             return f"{label} stored evidence file {p} is missing or outside runtime home"
-        if runner.digest_text(p.read_text(encoding="utf-8", errors="replace")) != sha_val:
+        if runner.digest_text(txt := p.read_text(encoding="utf-8", errors="replace")) != sha_val:
             return f"{label} stored evidence file {p} sha256 mismatch"
-    except OSError:
+        if rev_bind is not None:
+            kv = dict(ci_gate.KEY_VAL_RE.findall(txt))
+            if not all(ci_gate.SHA40_RE.fullmatch(str(kv.get(k) or "")) for k in ("candidate_sha", "base_sha", "tested_sha")):
+                return f"{label} stored evidence {p} is missing revision provenance"
+            if (kv["candidate_sha"], kv["base_sha"], kv["tested_sha"]) != rev_bind:
+                return f"stale:{label} stored evidence {p} revision provenance mismatch"
+            if (rp := p.resolve().parent / "record.json") != p.resolve() and rp.is_file() and not rp.is_symlink():
+                if isinstance(drec := read_json(rp, home or rp.parent), dict) and any(drec.get(k) not in (None, exp) for k, exp in zip(("candidate_sha", "base_sha", "tested_sha"), rev_bind)):
+                    return f"stale:{label} stored record {rp} revision provenance mismatch"
+    except (errors_module.FactoryError, OSError):
         return f"{label} stored evidence file {p} is unreadable"
     return None
 
@@ -135,8 +144,8 @@ def evaluate_ci_prerequisite(
             return _fail("ci-skipped" if c.get("conclusion") in ("skipped", "neutral", "cancelled") else "ci-failed", f"CI check {cname!r} conclusion is {c.get('conclusion')!r}")
         if not str(c.get("html_url") or "").startswith(ci_gate._URL_PREFIXES) or not str(c.get("artifact_url") or "").startswith(ci_gate._URL_PREFIXES):
             return _fail("ci-evidence-invalid", f"CI check {cname!r} is missing accessible GitHub log or artifact URL")
-        if (err := _verify_file_digest(c.get("output_path"), c.get("output_sha256"), home, f"CI check {cname!r}")) is not None:
-            return _fail("ci-evidence-invalid", err)
+        if (err := _verify_file_digest(c.get("output_path"), c.get("output_sha256"), home, f"CI check {cname!r}", rev_bind=(candidate_sha, base_sha, rec_tested))) is not None:
+            return _fail("stale-ci-evidence" if err.startswith("stale:") else "ci-evidence-invalid", err.removeprefix("stale:"))
     if (missing_req := sorted(req_names - {str(c.get("name") or "").strip() for c in checks})):
         return _fail("ci-missing", f"missing required CI checks on {candidate_sha}: {', '.join(missing_req)}")
     if (pr := ci_record.get("pr")) is not None:
@@ -191,14 +200,10 @@ def evaluate_qa_prerequisite(
     cur_qa_fids = {str(f.get("finding_id")): f for f in (qa_record.get("findings") or ()) if isinstance(f, dict) and f.get("finding_id")}
     if not prior_qa_fids.issubset(cur_qa_fids):
         return _fail("qa-findings-open", f"historical automated-qa findings omitted from reconciliation: {', '.join(sorted(prior_qa_fids - set(cur_qa_fids)))}")
-    for cov in qa_record.get("criterion_coverage") or ():
-        for chk in (cov.get("deterministic_check"), *(cov.get("evaluation_cases") or ())):
-            if isinstance(chk, dict) and (chk.get("output_path") is not None or chk.get("output_sha256") is not None):
-                if (err := _verify_file_digest(chk.get("output_path"), chk.get("output_sha256"), home, "QA check")) is not None: return _fail("qa-invalid", err)
-    for rc in qa_record.get("regression_checks") or ():
-        if isinstance(rc, dict) and (rc.get("output_path") is not None or rc.get("output_sha256") is not None):
-            if (err := _verify_file_digest(rc.get("output_path"), rc.get("output_sha256"), home, "QA regression check")) is not None: return _fail("qa-invalid", err)
     qa_tested, ci_reval = str(qa_record.get("tested_sha") or ""), qa_record.get("ci_revalidation") or {}
+    for chk in (*(c for cov in (qa_record.get("criterion_coverage") or ()) if isinstance(cov, dict) for c in (cov.get("deterministic_check"), *(cov.get("evaluation_cases") or ()))), *(qa_record.get("regression_checks") or ())):
+        if isinstance(chk, dict) and (err := _verify_file_digest(chk.get("output_path"), chk.get("output_sha256"), home, "QA check", rev_bind=(candidate_sha, base_sha, qa_tested))) is not None:
+            return _fail("stale-qa-evidence" if err.startswith("stale:") else "qa-invalid", err.removeprefix("stale:"))
     qa_kind = str(qa_record.get("revision_kind") or ci_reval.get("revision_kind") or ("fast-forward-head" if qa_tested == candidate_sha else "integration-merge"))
     if expected_tested_sha and qa_tested != expected_tested_sha:
         return _fail("stale-qa-evidence", f"QA tested_sha {qa_tested} does not match CI tested_sha {expected_tested_sha}")

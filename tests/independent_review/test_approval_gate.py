@@ -34,8 +34,8 @@ def _valid_ci_record(
     ]
     checks = []
     for idx, req in enumerate(req_list, start=1):
-        log_txt = f"ci check {req['name']} passed on {t_sha}\n"
-        log_p = ci_dir / f"ci-{idx}-{req['name'].replace('/', '-')}-{candidate_sha[:8]}.log"
+        log_txt = f"candidate_sha={candidate_sha}\nbase_sha={base_sha}\ntested_sha={t_sha}\nrevision_kind={r_kind}\nci check {req['name']} passed on {t_sha}\n"
+        log_p = ci_dir / f"ci-{idx}-{req['name'].replace('/', '-')}-{candidate_sha[:8]}-{t_sha[:8]}.log"
         log_p.write_text(log_txt, encoding="utf-8")
         checks.append({
             **req, "run_id": 100 + idx, "workflow_run_id": 200, "run_attempt": 1,
@@ -62,6 +62,7 @@ def _valid_ci_record(
 class ApprovalGateGroup1Test(unittest.TestCase):
     def _setup_workspace(self, root: Path):
         repo, home, _ = _make_disposable_product_workspace(root)
+        _valid_security_record("0" * 40, "0" * 40, home)
         base_sha = git(repo, "rev-parse", "refs/heads/main")
         conf = config_module.load(RuntimePaths(repo=repo, home=home))
         child_dir = home / "deliveries" / "900" / "attempt-1" / "children" / "101"
@@ -287,12 +288,27 @@ class ApprovalGateGroup1Test(unittest.TestCase):
                 repo=repo, home=home, child_dir=child_dir, child=PARSED_CHILD, conf=conf, base_sha=base_sha, candidate_sha=cand_b,
                 builder_session_id="builder-b", builder_summary="Candidate B", qa_record=qa_b, security_record=sec_b, round_num=2, agy_bin=str(good_agy), deadline=time.monotonic() + 30.0, limit_s=30,
             )
+            ci_a_deep = json.loads(json.dumps(ci_a).replace(cand_a, cand_b))
+            for idx, c in enumerate(ci_a["checks"]): ci_a_deep["checks"][idx]["output_path"] = c["output_path"]
+            qa_a_deep = json.loads(json.dumps(qa_a).replace(cand_a, cand_b))
+            qa_a_deep["criterion_coverage"][0]["deterministic_check"]["output_path"] = qa_a["criterion_coverage"][0]["deterministic_check"]["output_path"]
+            qa_a_deep["regression_checks"][0]["output_path"] = qa_a["regression_checks"][0]["output_path"]
+            plain_log = home / "plain-unchanged.log"; plain_log.write_text("ok\n", encoding="utf-8"); plain_sha = runner.digest_text("ok\n")
+            qa_no_art = {**qa_b, "criterion_coverage": [{**qa_b["criterion_coverage"][0], "deterministic_check": {k: v for k, v in qa_b["criterion_coverage"][0]["deterministic_check"].items() if k not in ("output_path", "output_sha256")}}]}
+            qa_no_reg_art = {**qa_b, "regression_checks": [{k: v for k, v in qa_b["regression_checks"][0].items() if k not in ("output_path", "output_sha256")}]}
             for label, bad_kw in (
                 ("stale-ci-a", {"ci_record": ci_a}),
                 ("relabelled-ci-a", {"ci_record": {**ci_a, "candidate_sha": cand_b, "tested_sha": cand_b}}),
+                ("deep-relabelled-ci-a", {"ci_record": ci_a_deep}),
+                ("ci-unchanged-digest-no-prov", {"ci_record": {**ci_b, "checks": [{**ci_b["checks"][0], "output_path": str(plain_log), "output_sha256": plain_sha}, *ci_b["checks"][1:]]}}),
                 ("relabelled-merge-ci-a", {"ci_record": {**ci_merge, "candidate_sha": cand_b}, "qa_record": {**qa_merge, "candidate_sha": cand_b}}),
                 ("stale-qa-a", {"qa_record": qa_a}),
                 ("relabelled-qa-a", {"qa_record": {**qa_a, "candidate_sha": cand_b, "tested_sha": cand_b}}),
+                ("deep-relabelled-qa-a", {"qa_record": qa_a_deep}),
+                ("qa-missing-det-art", {"qa_record": qa_no_art}),
+                ("qa-missing-reg-art", {"qa_record": qa_no_reg_art}),
+                ("qa-missing-reg-list", {"qa_record": {**qa_b, "regression_checks": None}}),
+                ("qa-unchanged-digest-no-prov", {"qa_record": {**qa_b, "regression_checks": [{**qa_b["regression_checks"][0], "output_path": str(plain_log), "output_sha256": plain_sha}]}}),
                 ("stale-sec-a", {"security_record": sec_a}),
                 ("relabelled-sec-a", {"security_record": {**sec_a, "reviewed_revision": cand_b}}),
                 ("stale-rev-a", {"review_record": rev_a}),

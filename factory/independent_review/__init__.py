@@ -170,16 +170,15 @@ def _validate_qa_record(candidate_sha: str, base_sha: str, qa_record: dict[str, 
         if not parents_ok: return {"status": "stale-qa-evidence", "verified": False, "blockers": [f"unverified integration-merge tested_sha {rec_tested}"]}
     if any(ci_reval.get(k) not in (None, exp) for k, exp in (("candidate_sha", candidate_sha), ("base_sha", base_sha), ("tested_sha", rec_tested))):
         return {"status": "stale-qa-evidence", "verified": False, "blockers": ["ci_revalidation revision bindings do not match QA record"]}
+    _chk_ok = lambda x: isinstance(x, dict) and x.get("passed") is True and x.get("executed") is True and x.get("timed_out") is not True and x.get("status") != "invalid-rubric" and type(x.get("exit_code")) is int and x.get("exit_code") == 0 and isinstance(x.get("output_path"), str) and bool(x["output_path"].strip()) and isinstance(x.get("output_sha256"), str) and bool(x["output_sha256"].strip())
     cov_ok = all(
         isinstance(c, dict) and isinstance(c.get("criterion_id"), str) and bool(c["criterion_id"].strip()) and c["criterion_id"] != "CRITERIA-MISSING"
-        and c.get("passed") is True and isinstance(det := c.get("deterministic_check"), dict) and det.get("passed") is True and det.get("executed") is True
-        and det.get("timed_out") is not True and det.get("status") != "invalid-rubric" and isinstance(ecs := c.get("evaluation_cases", []), list)
-        and all(isinstance(ec, dict) and ec.get("passed") is True and ec.get("executed") is True and ec.get("timed_out") is not True and ec.get("status") != "invalid-rubric" for ec in ecs)
+        and c.get("passed") is True and _chk_ok(c.get("deterministic_check")) and isinstance(ecs := c.get("evaluation_cases", []), list) and all(_chk_ok(ec) for ec in ecs)
         for c in cov
     )
     req_cids = {str(cr.get("id") or "AC").strip() for cr in ((child or {}).get("criteria") or ()) if isinstance(cr, dict)} if isinstance(child, dict) else set()
     cov_cids = {c["criterion_id"].strip() for c in cov if isinstance(c, dict) and isinstance(c.get("criterion_id"), str)}
-    reg_ok = qa_record.get("regression_passed") is True and (reg_checks is None or (isinstance(reg_checks, list) and bool(reg_checks) and all(isinstance(rc, dict) and rc.get("passed") is True and rc.get("executed") is True and rc.get("timed_out") is not True for rc in reg_checks)))
+    reg_ok = qa_record.get("regression_passed") is True and isinstance(reg_checks, list) and bool(reg_checks) and all(_chk_ok(rc) for rc in reg_checks)
     findings_ok = isinstance(open_fids, list) and len(open_fids) == 0 and isinstance(findings, list) and all(isinstance(f, dict) and f.get("status") == "resolved" and f.get("resolution_blocker") is None and f.get("latest_candidate_sha", candidate_sha) == candidate_sha for f in findings)
     role_ok = (qa_record.get("role") == "automated-qa" and qa_record.get("status") == "qa-verified" and qa_record.get("qa_verified") is True and ci_reval.get("verified") is True and ci_reval.get("status") in (None, "verified") and not ci_reval.get("blockers")
                and role_sep.get("role") in (None, "automated-qa") and role_sep.get("candidate_modified_by_qa") is False and role_sep.get("worktree_clean") is True and role_sep.get("head_before", candidate_sha) == candidate_sha and role_sep.get("head_after", candidate_sha) == candidate_sha

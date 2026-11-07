@@ -48,19 +48,30 @@ def _make_staged_reviewer_script(*, session_id: str = "ind-rev-1", phase2_sessio
         "    print(json.dumps({'event': 'result', 'result': {'conversation_id': out_sid, 'status': 'SUCCESS', 'response': resp}}))\n"
     )
 
-def _valid_qa_record(candidate_sha: str, base_sha: str, tested_sha: str | None = None) -> dict:
+_LAST_QA_HOME: Path | None = None
+
+def _valid_qa_record(candidate_sha: str, base_sha: str, tested_sha: str | None = None, home: Path | None = None) -> dict:
     t_sha = tested_sha or candidate_sha
+    r_kind = "fast-forward-head" if t_sha == candidate_sha else "integration-merge"
+    qa_dir = ((home or _LAST_QA_HOME or Path(tempfile.gettempdir())) / "qa-fixture")
+    qa_dir.mkdir(parents=True, exist_ok=True)
+    log_txt = f"candidate_sha={candidate_sha}\nbase_sha={base_sha}\ntested_sha={t_sha}\nrevision_kind={r_kind}\nqa check ok\n"
+    log_p = qa_dir / f"qa-{candidate_sha[:8]}-{t_sha[:8]}.log"
+    log_p.write_text(log_txt, encoding="utf-8")
+    log_sha = runner.digest_text(log_txt)
     return {
         "schema": 1, "role": "automated-qa", "round": 1, "status": "qa-verified", "qa_verified": True, "candidate_sha": candidate_sha, "base_sha": base_sha, "tested_sha": t_sha,
         "ci_revalidation": {"status": "verified", "verified": True, "candidate_sha": candidate_sha, "base_sha": base_sha, "tested_sha": t_sha, "blockers": []},
         "role_separation": {"role": "automated-qa", "head_before": candidate_sha, "head_after": candidate_sha, "worktree_clean": True, "candidate_modified_by_qa": False},
-        "criterion_coverage": [{"criterion_id": "AC-1", "description": "Reject expired auth tokens", "passed": True, "deterministic_check": {"command": "python3 -m unittest -v", "executed": True, "passed": True, "timed_out": False, "exit_code": 0, "status": "passed"}, "evaluation_cases": []}],
-        "regression_checks": [{"id": "gate-2", "kind": "guard", "executed": True, "passed": True, "timed_out": False, "exit_code": 0}],
+        "criterion_coverage": [{"criterion_id": "AC-1", "description": "Reject expired auth tokens", "passed": True, "deterministic_check": {"command": "python3 -m unittest -v", "executed": True, "passed": True, "timed_out": False, "exit_code": 0, "status": "passed", "output_path": str(log_p), "output_sha256": log_sha}, "evaluation_cases": []}],
+        "regression_checks": [{"id": "gate-2", "kind": "guard", "executed": True, "passed": True, "timed_out": False, "exit_code": 0, "output_path": str(log_p), "output_sha256": log_sha}],
         "regression_passed": True, "open_finding_ids": [], "findings": [],
         "parent_acceptance_boundary": {"parent_gid": "900", "parent_accepted": False, "parent_acceptance_status": "pending-human-acceptance"},
     }
 
 def _valid_security_record(candidate_sha: str, base_sha: str, home: Path) -> dict:
+    global _LAST_QA_HOME
+    _LAST_QA_HOME = home
     sec_dir = home / "sec-fixture"; sec_dir.mkdir(parents=True, exist_ok=True)
     out_p, chk_p = sec_dir / "rev-stdout.txt", sec_dir / "chk.txt"
     out_p.write_text("ok\n", encoding="utf-8"); chk_p.write_text("ok\n", encoding="utf-8")
