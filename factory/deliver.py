@@ -7,12 +7,12 @@ import json, math, os, re, shutil, time
 from pathlib import Path
 from typing import Any
 
-from factory import config as config_module, gitio, intake as intake_module, runner, worker as worker_module
+from factory import ci_gate, config as config_module, gitio, intake as intake_module, runner, worker as worker_module
 from factory.config import now
 from factory.deliver_checks import (
     AttemptTimeoutError, GitHubError, collect_redaction_secrets, evaluate_scope, git_timed,
     inspect_diff_categories, open_and_confirm_pr, parse_repo_slug, remaining_seconds,
-    resolve_github_api, resolve_github_token, run_child_verifications, verify_origin_remote,
+    resolve_github_api, resolve_github_token, verify_origin_remote,
 )
 from factory.errors import UsageError
 from factory.intake import redact_value
@@ -38,6 +38,8 @@ class DeliverResult:
     attempt: int
     status: str
     pr_opened: bool
+    verified: bool
+    verification_scope: str
     merged: bool
     factory_revision: str
     feature_branch: str
@@ -157,10 +159,13 @@ def deliver_feature(paths: RuntimePaths, spec: DeliverSpec) -> DeliverResult:
     def _finish(
         status: str, blockers: list[str], child_payload: dict[str, Any] | None,
         measurements: dict[str, Any], evidence: dict[str, Any], active_secrets: tuple[str, ...] = secrets,
+        *, pr_opened: bool = False,
     ) -> DeliverResult:
+        is_verified = status == "verified"
         res = DeliverResult(
             schema=1, task_gid=task_gid, attempt=attempt, status=status,
-            pr_opened=(status == "pr-opened"), merged=False, factory_revision=factory_rev,
+            pr_opened=pr_opened, verified=is_verified, verification_scope=ci_gate.VERIFICATION_SCOPE_NOTE,
+            merged=False, factory_revision=factory_rev,
             feature_branch=feature_branch, parent=redact_value(intake_res.parent, active_secrets),
             child=redact_value(child_payload, active_secrets) if child_payload is not None else None,
             blockers=redact_value(blockers, active_secrets), measurements=measurements,
@@ -198,10 +203,21 @@ def deliver_feature(paths: RuntimePaths, spec: DeliverSpec) -> DeliverResult:
         return _finish(f"intake-{intake_res.status}", list(intake_res.blockers), None, _default_meas(), base_evidence)
     child = intake_res.children[0]
     child_gid = str(child["gid"])
+    pre_policy_detail = ci_gate.evaluate_spec_check_policy(child, conf)
+    if pre_conflicts := pre_policy_detail["conflicts"]:
+        return _finish(
+            "spec-check-conflict", pre_conflicts,
+            {
+                "gid": child_gid, "name": child["name"], "status": "spec-check-conflict",
+                "verified": False, "spec_check_policy": pre_policy_detail, "pr": None,
+            },
+            _default_meas(), base_evidence,
+        )
     child_dir = safe_dir(attempt_dir / "children" / child_gid, create=True, root=paths.home)
     worktree_dir = child_dir / "worktree"
     gh_trace: list[dict[str, Any]] = []
     measurements = _default_meas()
+    pr_info: dict[str, Any] | None = None
 
     try:
         repo_slug = parse_repo_slug(str(intake_res.parent.get("repository") or child.get("repository") or ""))
@@ -270,6 +286,11 @@ def deliver_feature(paths: RuntimePaths, spec: DeliverSpec) -> DeliverResult:
         gate3 = conf.gates.get("3")
         protected_paths = gate3.paths if gate3 is not None and gate3.kind == "protected-paths" else ()
         scope_ok, scope_violations, scope_detail = evaluate_scope(tuple(diff_info["changed_paths"]), child, protected_paths)
+        post_policy_detail = ci_gate.evaluate_spec_check_policy(
+            child, conf, tuple(diff_info["changed_paths"]), repo=worktree_dir,
+        )
+        post_conflicts = post_policy_detail["conflicts"]
+        scope_detail["spec_check_policy"] = post_policy_detail
 
         fetch_after = git_timed(paths.repo, deadline, limit_s, "git fetch origin", "fetch", "origin")
         main_after = gitio.commit_sha(paths.repo, "refs/heads/main") if gitio.branch_exists(paths.repo, "main") else main_before
@@ -299,6 +320,8 @@ def deliver_feature(paths: RuntimePaths, spec: DeliverSpec) -> DeliverResult:
             builder_status, blockers = "missing-implementation", ["builder produced no committed changes relative to the feature branch base"]
         elif not gitio.is_ancestor(worktree_dir, base_sha, candidate_sha):
             builder_status, blockers = "scope-violation", ["builder rewrote history or diverged from the feature branch base"]
+        elif post_conflicts:
+            builder_status, blockers = "spec-check-conflict", post_conflicts
         elif not scope_ok:
             builder_status, blockers = "scope-violation", list(scope_violations)
         elif not diff_info["has_implementation_changes"]:
@@ -306,21 +329,7 @@ def deliver_feature(paths: RuntimePaths, spec: DeliverSpec) -> DeliverResult:
         elif not diff_info["has_test_changes"]:
             builder_status, blockers = "missing-tests", ["builder committed implementation changes without relevant test changes"]
 
-        checks: list[dict[str, Any]] = []
-        if builder_status == "completed":
-            try:
-                checks_ok, checks, check_failures = run_child_verifications(
-                    worktree_dir, child, conf, child_dir, paths.home, worker_env, deadline, limit_s
-                )
-            except worker_module.SandboxUnavailableError as exc:
-                builder_status = "unsafe-environment"
-                blockers.append(str(exc))
-            else:
-                if not checks_ok:
-                    builder_status = "verification-failed"
-                    blockers.extend(check_failures)
-
-        pr_info: dict[str, Any] | None = None
+        ci_verification: dict[str, Any] | None = None
         if builder_status == "completed":
             try:
                 gh_token = resolve_github_token(gh_is_loopback)
@@ -342,9 +351,28 @@ def deliver_feature(paths: RuntimePaths, spec: DeliverSpec) -> DeliverResult:
                     raise GitHubError(f"failed to push child branch {head_branch} to origin: {push_child.output}")
                 pr_info = open_and_confirm_pr(
                     gh_api_url, gh_token, repo_slug, intake_res.parent, child, head_branch,
-                    candidate_sha, feature_branch, checks, scope_detail, gh_trace, deadline, limit_s,
+                    candidate_sha, feature_branch, [], scope_detail, gh_trace, deadline, limit_s,
                 )
-                final_status = "pr-opened"
+                ci_verification = ci_gate.evaluate_child_pr_ci_gate(
+                    repo=paths.repo, home=paths.home, child_dir=child_dir, base_url=gh_api_url, token=gh_token,
+                    repo_slug=repo_slug, parent=intake_res.parent, child=child, conf=conf, pr_info=pr_info,
+                    head_branch=head_branch, candidate_sha=candidate_sha, base_branch=feature_branch,
+                    base_sha=base_sha, scope_detail=scope_detail, trace=gh_trace, deadline=deadline, limit_s=limit_s,
+                    changed_paths=tuple(diff_info["changed_paths"]),
+                    poll_interval_s=0.05 if gh_is_loopback else 2.0,
+                    max_missing_polls=3 if gh_is_loopback else 15,
+                    artifact_retry_delay_s=0.0 if gh_is_loopback else 2.0,
+                )
+                pr_info = ci_verification.get("pr") or pr_info
+                final_status = str(ci_verification["status"])
+                blockers.extend(ci_verification.get("blockers") or [])
+            except AttemptTimeoutError as exc:
+                if pr_info is not None:
+                    pr_info = {**pr_info, "pr_confirmed": True, "ci_verified": False, "verified": False}
+                    final_status = "ci-pending"
+                    blockers.append(f"CI verification still pending when time allowance expired: {exc}")
+                else:
+                    raise
             except GitHubError as exc:
                 final_status = "pr-failed"
                 blockers.append(str(exc))
@@ -352,13 +380,20 @@ def deliver_feature(paths: RuntimePaths, spec: DeliverSpec) -> DeliverResult:
             final_status = builder_status
 
         measurements["elapsed_ms"] = int((time.monotonic() - started) * 1000)
-        gh_trace_text = json.dumps(redact_value({"requests": gh_trace, "pr": pr_info}, secrets), indent=2, sort_keys=True) + "\n"
+        gh_trace_text = json.dumps(
+            redact_value({"requests": gh_trace, "pr": pr_info, "ci_verification": ci_verification}, secrets),
+            indent=2, sort_keys=True,
+        ) + "\n"
         gh_evidence_path = write_evidence(child_dir, "github-pr", gh_trace_text, paths.home)
         child_payload = {
             "gid": child_gid, "name": child["name"], "status": final_status,
+            "verified": final_status == "verified", "verification_scope": ci_gate.VERIFICATION_SCOPE_NOTE,
             "base_branch": feature_branch, "base_sha": base_sha, "head_branch": head_branch,
-            "candidate_sha": candidate_sha, "diff": diff_info, "scope_check": scope_detail,
-            "verification_checks": checks, "pr": pr_info,
+            "candidate_sha": candidate_sha,
+            "tested_sha": ci_verification.get("tested_sha") if isinstance(ci_verification, dict) else None,
+            "diff": diff_info, "scope_check": scope_detail,
+            "verification_checks": ci_verification.get("checks", []) if isinstance(ci_verification, dict) else [],
+            "ci_verification": ci_verification, "pr": pr_info,
             "safety": {
                 "sandbox_flag": "--sandbox", "permission_mode": "auto", "bypass_permissions_used": False,
                 "isolated_home": str(isolated_home), "stripped_env_keys": stripped_keys, "probes": probes,
@@ -373,11 +408,11 @@ def deliver_feature(paths: RuntimePaths, spec: DeliverSpec) -> DeliverResult:
             "worktree_status_path": str(wt_status_path), "github_evidence_path": str(gh_evidence_path),
             "github_evidence_sha256": runner.digest_text(gh_trace_text), "github_requests": gh_trace,
         }
-        return _finish(final_status, blockers, child_payload, measurements, evidence)
+        return _finish(final_status, blockers, child_payload, measurements, evidence, pr_opened=(pr_info is not None))
     except AttemptTimeoutError as exc:
         measurements["elapsed_ms"] = int((time.monotonic() - started) * 1000)
-        child_timeout_payload = {"gid": child_gid, "name": child["name"], "status": "timed-out", "pr": None}
-        return _finish("timed-out", [str(exc)], child_timeout_payload, measurements, base_evidence)
+        child_timeout_payload = {"gid": child_gid, "name": child["name"], "status": "timed-out", "verified": False, "pr": pr_info}
+        return _finish("timed-out", [str(exc)], child_timeout_payload, measurements, base_evidence, pr_opened=(pr_info is not None))
     finally:
         if worktree_dir.exists():
             shutil.rmtree(worktree_dir, ignore_errors=True)

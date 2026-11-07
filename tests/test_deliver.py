@@ -86,7 +86,8 @@ def _run_deliver(
     ]
     if agy_bin:
         argv.extend(["--agy-bin", agy_bin])
-    res = subprocess.run(argv, cwd=str(repo), capture_output=True, text=True, env=env, timeout=180)
+    proc_timeout = max(180, int(time_limit[:-1]) + 30) if time_limit.endswith("s") and time_limit[:-1].isdigit() else 180
+    res = subprocess.run(argv, cwd=str(repo), capture_output=True, text=True, env=env, timeout=proc_timeout)
     return res, (json.loads(res.stdout) if res.stdout.strip().startswith("{") else {})
 
 
@@ -149,27 +150,37 @@ class DeliverChildTest(unittest.TestCase):
                     task="https://app.asana.com/0/12345/900", agy_bin=str(fake_wrapper),
                 )
                 self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
-                self.assertEqual((payload["status"], payload["pr_opened"], payload["merged"]), ("pr-opened", True, False))
-                self.assertNotIn(payload["status"], ("completed", "verified", "merged", "accepted"))
+                self.assertEqual(
+                    (payload["status"], payload["pr_opened"], payload["verified"], payload["merged"]),
+                    ("verified", True, True, False),
+                )
+                self.assertIn("not independently reviewed", payload["verification_scope"])
+                self.assertNotIn(payload["status"], ("completed", "merged", "accepted"))
                 child_rec = payload["child"]
                 self.assertEqual(
-                    (child_rec["gid"], child_rec["status"], child_rec["base_branch"], child_rec["base_sha"]),
-                    ("101", "pr-opened", "feature/chat-auth", main_sha_before),
+                    (child_rec["gid"], child_rec["status"], child_rec["verified"], child_rec["base_branch"], child_rec["base_sha"]),
+                    ("101", "verified", True, "feature/chat-auth", main_sha_before),
                 )
                 self.assertEqual(child_rec["scope_check"]["status"], "deterministic-only-semantic-unverified")
                 self.assertFalse(child_rec["scope_check"]["semantic_verified"])
+                ci_ver = child_rec["ci_verification"]
+                self.assertEqual((ci_ver["status"], ci_ver["verified"], ci_ver["candidate_sha"], ci_ver["base_sha"]), ("verified", True, child_rec["candidate_sha"], main_sha_before))
+                self.assertEqual(ci_ver["revision_kind"], "integration-merge")
                 pr_info = child_rec["pr"]
                 self.assertEqual(
-                    (pr_info["number"], pr_info["base_ref"], pr_info["head_ref"], pr_info["head_sha"], pr_info["verified"]),
-                    (1, "feature/chat-auth", child_rec["head_branch"], child_rec["candidate_sha"], True),
+                    (pr_info["number"], pr_info["base_ref"], pr_info["head_ref"], pr_info["head_sha"], pr_info["verified"], pr_info["ci_verified"]),
+                    (1, "feature/chat-auth", child_rec["head_branch"], child_rec["candidate_sha"], True, True),
                 )
-                for token in ("900", "101", child_rec["candidate_sha"], "deterministic-only-semantic-unverified"):
+                for token in (
+                    "900", "101", child_rec["candidate_sha"], main_sha_before, ci_ver["tested_sha"],
+                    "criterion/AC-1", "guard/gate-2", "https://github.com/example/chat-bridge/actions/runs/",
+                ):
                     self.assertIn(token, pr_info["body"])
                 self.assertEqual(git(bare, "rev-parse", "refs/heads/main"), main_sha_before)
                 self.assertEqual(git(bare, "rev-parse", "refs/heads/feature/chat-auth"), main_sha_before)
                 self.assertEqual(git(bare, "rev-parse", f"refs/heads/{child_rec['head_branch']}"), child_rec["candidate_sha"])
                 self.assertTrue(all(r["method"] == "GET" for r in asana.requests))
-                self.assertEqual([r["method"] for r in gh.requests], ["POST", "GET"])
+                self.assertIn("PATCH", [r["method"] for r in gh.requests])
 
     def test_unsupported_multi_child_or_existing_diverged_feature_branch_refuses_cleanly(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -270,23 +281,21 @@ class DeliverChildTest(unittest.TestCase):
                     "print(json.dumps({'event': 'result', 'result': {'conversation_id': 'c4', 'status': 'SUCCESS', 'response': 'Done'}}))\n",
                 ),
                 (
-                    "verification-failed",
+                    "spec-check-conflict",
                     "import json, pathlib, subprocess\n"
-                    "pathlib.Path('src/chat_bridge/auth.py').write_text('def validate_token(token: str):\\n    return {}\\n', encoding='utf-8')\n"
+                    "pathlib.Path('.github/workflows').mkdir(parents=True, exist_ok=True)\n"
+                    "pathlib.Path('.github/workflows/ci.yml').write_text('name: weakened\\n', encoding='utf-8')\n"
+                    "pathlib.Path('src/chat_bridge/auth.py').write_text('def validate_token(token: str):\\n    return {\"sub\": token}\\n', encoding='utf-8')\n"
                     "p = pathlib.Path('tests/test_auth.py')\n"
-                    "p.write_text(p.read_text(encoding='utf-8') + '\\n    def test_broken(self):\\n        self.assertEqual(1, 2)\\n', encoding='utf-8')\n"
-                    "subprocess.run(['git', 'add', 'src/chat_bridge/auth.py', 'tests/test_auth.py'], check=True)\n"
-                    "subprocess.run(['git', 'commit', '-q', '-m', 'broken impl and test'], check=True)\n"
+                    "p.write_text(p.read_text(encoding='utf-8') + '\\n    def test_ok(self):\\n        self.assertEqual(1, 1)\\n', encoding='utf-8')\n"
+                    "subprocess.run(['git', 'add', '.'], check=True)\n"
+                    "subprocess.run(['git', 'commit', '-q', '-m', 'redefine CI workflow'], check=True)\n"
                     "print(json.dumps({'event': 'result', 'result': {'conversation_id': 'c5', 'status': 'SUCCESS', 'response': 'Done'}}))\n",
                 ),
                 (
                     "timed-out",
-                    "import json, pathlib, subprocess\n"
-                    "pathlib.Path('src/chat_bridge/auth.py').write_text('def validate_token(token: str):\\n    return {\"sub\": token}\\n', encoding='utf-8')\n"
-                    "p = pathlib.Path('tests/test_auth.py')\n"
-                    "p.write_text(p.read_text(encoding='utf-8') + '\\n    def test_hang(self):\\n        import time; time.sleep(10); self.assertTrue(True)\\n', encoding='utf-8')\n"
-                    "subprocess.run(['git', 'add', 'src/chat_bridge/auth.py', 'tests/test_auth.py'], check=True)\n"
-                    "subprocess.run(['git', 'commit', '-q', '-m', 'slow verification test'], check=True)\n"
+                    "import json, pathlib, subprocess, time\n"
+                    "time.sleep(5)\n"
                     "print(json.dumps({'event': 'result', 'result': {'conversation_id': 'c6', 'status': 'SUCCESS', 'response': 'Done'}}))\n",
                 ),
             )
@@ -297,7 +306,7 @@ class DeliverChildTest(unittest.TestCase):
                 for idx, (expected_status, body_script) in enumerate(cases, start=1):
                     with self.subTest(case=expected_status, attempt=idx):
                         wrapper = _make_fake_agy(root, f"fake-agy-{idx}", body_script)
-                        limit_arg = "2s" if expected_status == "timed-out" else "30s"
+                        limit_arg = "1s" if expected_status == "timed-out" else "30s"
                         res, payload = _run_deliver(
                             repo, home, asana.base_url, gh.base_url, agy_bin=str(wrapper), time_limit=limit_arg
                         )
@@ -482,6 +491,7 @@ class DeliverChildTest(unittest.TestCase):
                 "    assert subprocess.run([sys.executable, '-I', '-S', '-c', f'open({target!r}, \"rb\").read()'], env=env_copy, capture_output=True).returncode != 0\n"
                 "    assert subprocess.run([sys.executable, '-I', '-S', '-c', f'open({target!r}, \"wb\").write(b\"pwn\")'], env=env_copy, capture_output=True).returncode != 0\n"
                 "    assert subprocess.run([cat_bin, target], env=env_copy, capture_output=True).returncode != 0\n"
+                "pathlib.Path('AGENTS.md').write_text('# Hostile rules\\n', encoding='utf-8')\n"
                 "pathlib.Path('src/chat_bridge/auth.py').write_text('def validate_token(token: str): return {}\\n', encoding='utf-8')\n"
                 "p = pathlib.Path('tests/test_auth.py')\n"
                 "p.write_text(p.read_text(encoding='utf-8') + '\\n    def test_fail(self): self.assertEqual(1, 2)\\n', encoding='utf-8')\n"
@@ -498,7 +508,7 @@ class DeliverChildTest(unittest.TestCase):
                 _DisposableGitHubServer(bare_repo=bare) as gh,
             ):
                 res_fail, rec_fail = _run_deliver(repo, home, asana.base_url, gh.base_url, agy_bin=str(hostile_wrapper))
-                self.assertEqual((res_fail.returncode, rec_fail["status"]), (1, "verification-failed"))
+                self.assertEqual((res_fail.returncode, rec_fail["status"]), (1, "scope-violation"))
                 self.assertEqual(repo_sentinel.read_text(encoding="utf-8"), "REPO_SENTINEL_INTACT\n")
                 self.assertEqual(home_sentinel.read_text(encoding="utf-8"), "HOME_SENTINEL_INTACT\n")
                 self.assertEqual(git(repo, "rev-parse", "refs/heads/main"), main_sha)
@@ -517,7 +527,7 @@ class DeliverChildTest(unittest.TestCase):
                 git(repo, "branch", f"{base_child_branch}-attempt-2", main_sha)
                 git(repo, "push", "-q", "origin", base_child_branch, f"{base_child_branch}-attempt-2")
                 res_ok, rec_ok = _run_deliver(repo, home, asana.base_url, gh.base_url, agy_bin=str(good_wrapper))
-                self.assertEqual((res_ok.returncode, rec_ok["status"], rec_ok["attempt"]), (0, "pr-opened", 2))
+                self.assertEqual((res_ok.returncode, rec_ok["status"], rec_ok["verified"], rec_ok["attempt"]), (0, "verified", True, 2))
                 self.assertEqual(rec_ok["child"]["head_branch"], f"{base_child_branch}-attempt-3")
                 self.assertEqual(git(bare, "rev-parse", f"refs/heads/{base_child_branch}"), main_sha)
                 self.assertEqual(git(bare, "rev-parse", f"refs/heads/{base_child_branch}-attempt-2"), main_sha)
@@ -525,6 +535,45 @@ class DeliverChildTest(unittest.TestCase):
                     git(bare, "rev-parse", f"refs/heads/{base_child_branch}-attempt-3"),
                     rec_ok["child"]["candidate_sha"],
                 )
+
+    def test_broken_behavior_fails_mapped_ci_check_and_restoring_passes_plus_pending_and_conflict_stops(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo, home, bare = _make_disposable_product_workspace(root)
+            broken_script = GOOD_BUILDER_SCRIPT.replace('token.startswith("expired:")', "False")
+            broken_wrapper = _make_fake_agy(root, "fake-broken", broken_script)
+            fixed_wrapper = _make_fake_agy(root, "fake-fixed", GOOD_BUILDER_SCRIPT)
+            conflict_child = {
+                "gid": "101", "name": "Conflict slice", "completed": False,
+                "notes": READY_CHILD["notes"].replace("- Out of scope: billing", "- Out of scope: `tests/test_auth.py`"),
+            }
+            with (
+                _DisposableAsanaServer(PARENT_TASK, [{"data": [conflict_child], "next_page": None}]) as asana_conf,
+                _DisposableGitHubServer(bare_repo=bare) as gh_conf,
+            ):
+                res_conf, rec_conf = _run_deliver(repo, home, asana_conf.base_url, gh_conf.base_url, agy_bin=str(fixed_wrapper))
+                self.assertEqual((res_conf.returncode, rec_conf["status"], rec_conf["pr_opened"], rec_conf["verified"]), (1, "spec-check-conflict", False, False))
+            with (
+                _DisposableAsanaServer(PARENT_TASK, [{"data": [READY_CHILD], "next_page": None}]) as asana,
+                _DisposableGitHubServer(bare_repo=bare) as gh,
+            ):
+                res_brk, rec_brk = _run_deliver(repo, home, asana.base_url, gh.base_url, agy_bin=str(broken_wrapper))
+                self.assertEqual((res_brk.returncode, rec_brk["status"], rec_brk["pr_opened"], rec_brk["verified"], rec_brk["merged"]), (1, "ci-failed", True, False, False))
+                self.assertEqual((rec_brk["child"]["pr"]["pr_confirmed"], rec_brk["child"]["pr"]["ci_verified"]), (True, False))
+                self.assertTrue(any("criterion/AC-1 (failure)" in b for b in rec_brk["blockers"]))
+                self.assertIn("criterion/AC-1`: **FAILURE**", rec_brk["child"]["pr"]["body"])
+                res_fix, rec_fix = _run_deliver(repo, home, asana.base_url, gh.base_url, agy_bin=str(fixed_wrapper))
+                self.assertEqual((res_fix.returncode, rec_fix["status"], rec_fix["pr_opened"], rec_fix["verified"], rec_fix["merged"]), (0, "verified", True, True, False))
+                self.assertEqual((rec_fix["child"]["pr"]["pr_confirmed"], rec_fix["child"]["pr"]["ci_verified"]), (True, True))
+                self.assertIn("criterion/AC-1`: **SUCCESS**", rec_fix["child"]["pr"]["body"])
+            with (
+                _DisposableAsanaServer(PARENT_TASK, [{"data": [READY_CHILD], "next_page": None}]) as asana_pend,
+                _DisposableGitHubServer(bare_repo=bare, ci_spec={"mode": "none"}) as gh_pend,
+            ):
+                res_p, rec_p = _run_deliver(repo, home, asana_pend.base_url, gh_pend.base_url, agy_bin=str(fixed_wrapper), time_limit="2s")
+                self.assertEqual((res_p.returncode, rec_p["status"], rec_p["pr_opened"], rec_p["verified"]), (1, "ci-pending", True, False))
+                self.assertEqual((rec_p["child"]["pr"]["pr_confirmed"], rec_p["child"]["pr"]["ci_verified"]), (True, False))
+                self.assertEqual(len(rec_p["child"]["verification_checks"]), 4)
 
     @unittest.skipUnless(os.environ.get("TURBO_LIVE_AGY") == "1", "requires TURBO_LIVE_AGY=1 and authenticated agy")
     def test_live_authenticated_agy_builder_delivers_prepared_child_and_opens_pr(self) -> None:
@@ -552,10 +601,164 @@ class DeliverChildTest(unittest.TestCase):
                     repo, home, asana.base_url, gh.base_url, task="https://app.asana.com/0/12345/900", time_limit="90s"
                 )
                 self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
-                self.assertEqual((payload["status"], payload["pr_opened"], payload["merged"]), ("pr-opened", True, False))
+                self.assertEqual((payload["status"], payload["pr_opened"], payload["verified"], payload["merged"]), ("verified", True, True, False))
                 self.assertEqual(git(bare, "rev-parse", "refs/heads/main"), main_sha_before)
                 self.assertEqual(payload["child"]["pr"]["base_ref"], "feature/chat-auth")
                 self.assertTrue(payload["child"]["pr"]["verified"])
+
+    @unittest.skipUnless(os.environ.get("TURBO_LIVE_GITHUB_CI") == "1", "requires TURBO_LIVE_GITHUB_CI=1 and gh auth")
+    def test_live_github_hosted_ci_workflow_gates_broken_and_fixed_child_prs(self) -> None:
+        import base64
+        import time as time_mod
+        from factory import ci_gate
+
+        gh_token = subprocess.run(["gh", "auth", "token"], capture_output=True, text=True, check=True).stdout.strip()
+        gh_user = subprocess.run(["gh", "api", "user", "-q", ".login"], capture_output=True, text=True, check=True).stdout.strip()
+        repo_slug = f"{gh_user}/turbo-disp-ci-20-{int(time_mod.time())}"
+        subprocess.run(["gh", "repo", "create", repo_slug, "--private"], check=True, capture_output=True, text=True)
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                repo, home, _ = _make_disposable_product_workspace(root)
+                wf_dir = repo / ".github" / "workflows"
+                wf_dir.mkdir(parents=True, exist_ok=True)
+                matrix_items = (
+                    ("guard/gate-1", "guard", "gate-1", "python3 -c \"print('gate-1 ok')\""),
+                    ("guard/gate-2", "guard", "gate-2", "python3 -m unittest discover -s tests -p test_smoke_guard.py -v"),
+                    ("guard/gate-3", "guard", "gate-3", "python3 -c \"print('gate-3 ok')\""),
+                    ("criterion/AC-1", "criterion", "ac-1", "python3 -m unittest discover -s tests -p test_auth.py -v"),
+                )
+                inc_yaml = "".join(
+                    f"          - check_name: {cn}\n            check_kind: {ck}\n            suffix: {sf}\n            cmd: {cm}\n"
+                    for cn, ck, sf, cm in matrix_items
+                )
+                ci_runner_py = (
+                    "import json, os, pathlib, shlex, subprocess\n"
+                    "subprocess.run(['git', 'diff', '--quiet', os.environ['BASE_SHA'], os.environ['TESTED_SHA'], '--', '.github', 'AGENTS.md'], check=True)\n"
+                    "cmd = os.environ['CHECK_CMD']\n"
+                    "p = subprocess.run(shlex.split(cmd), capture_output=True, text=True)\n"
+                    "out = (p.stdout + p.stderr).strip() + '\\n'\n"
+                    "cn = os.environ['CHECK_NAME']\n"
+                    "run_id = int(os.environ['RUN_ID'])\n"
+                    "run_attempt = int(os.environ['RUN_ATTEMPT'])\n"
+                    "base_ref = os.environ.get('BASE_REF', '')\n"
+                    "pol_sha = '0' * 40 if base_ref.endswith('-untrusted') else os.environ['BASE_SHA']\n"
+                    "rec = {\n"
+                    "    'workflow_run_id': run_id,\n"
+                    "    'run_attempt': run_attempt,\n"
+                    "    'workflow_path': '.github/workflows/ci.yml',\n"
+                    "    'workflow_event': 'pull_request',\n"
+                    "    'workflow_head_sha': os.environ['CANDIDATE_SHA'],\n"
+                    "    'policy_sha': pol_sha,\n"
+                    "    'candidate_sha': os.environ['CANDIDATE_SHA'],\n"
+                    "    'base_sha': os.environ['BASE_SHA'],\n"
+                    "    'tested_sha': os.environ['TESTED_SHA'],\n"
+                    "    'revision_kind': 'integration-merge',\n"
+                    "    'check_name': cn,\n"
+                    "    'kind': os.environ['CHECK_KIND'],\n"
+                    "    'command': cmd,\n"
+                    "    'exit_code': p.returncode,\n"
+                    "    'conclusion': 'success' if p.returncode == 0 else 'failure',\n"
+                    "    'html_url': os.environ['RUN_URL'],\n"
+                    "    'log_text': out,\n"
+                    "}\n"
+                    "d = pathlib.Path('ci-ev')\n"
+                    "d.mkdir(exist_ok=True)\n"
+                    "(d / 'turbo-ci-evidence.json').write_text(json.dumps({'schema': 1, 'workflow_run_id': run_id, 'run_attempt': run_attempt, 'checks': {cn: rec}}))\n"
+                    "with open(os.environ['GITHUB_OUTPUT'], 'a') as f:\n"
+                    "    f.write(f'exit_code={p.returncode}\\n')\n"
+                )
+                runner_b64 = base64.b64encode(ci_runner_py.encode("utf-8")).decode("ascii")
+                (wf_dir / "ci.yml").write_text(
+                    f"name: CI\non:\n  pull_request:\n    branches: ['feature/**']\njobs:\n  checks:\n"
+                    f"    name: ${{{{ matrix.check_name }}}}\n    runs-on: ubuntu-latest\n    strategy:\n"
+                    f"      fail-fast: false\n      matrix:\n        include:\n{inc_yaml}    steps:\n"
+                    f"      - uses: actions/checkout@v4\n        with:\n          fetch-depth: 0\n"
+                    f"      - name: Run check\n        id: run_check\n        env:\n"
+                    f"          CHECK_NAME: ${{{{ matrix.check_name }}}}\n"
+                    f"          CHECK_KIND: ${{{{ matrix.check_kind }}}}\n"
+                    f"          CHECK_CMD: ${{{{ matrix.cmd }}}}\n"
+                    f"          CANDIDATE_SHA: ${{{{ github.event.pull_request.head.sha }}}}\n"
+                    f"          BASE_SHA: ${{{{ github.event.pull_request.base.sha }}}}\n"
+                    f"          BASE_REF: ${{{{ github.event.pull_request.base.ref }}}}\n"
+                    f"          TESTED_SHA: ${{{{ github.sha }}}}\n"
+                    f"          RUN_ID: ${{{{ github.run_id }}}}\n"
+                    f"          RUN_ATTEMPT: ${{{{ github.run_attempt }}}}\n"
+                    f"          RUN_URL: https://github.com/${{{{ github.repository }}}}/actions/runs/${{{{ github.run_id }}}}\n"
+                    f"        run: python3 -I -c \"import base64; exec(base64.b64decode('{runner_b64}'))\"\n"
+                    f"      - uses: actions/upload-artifact@v4\n        if: always()\n        with:\n"
+                    f"          name: turbo-ci-evidence-${{{{ matrix.suffix }}}}\n"
+                    f"          path: ci-ev/turbo-ci-evidence.json\n"
+                    f"      - if: steps.run_check.outputs.exit_code != '0'\n"
+                    f"        run: exit ${{{{ steps.run_check.outputs.exit_code }}}}\n",
+                    encoding="utf-8",
+                )
+                (repo / "tests" / "test_smoke_guard.py").write_text(
+                    "import unittest\nclass SmokeGuard(unittest.TestCase):\n    def test_guard(self): self.assertTrue(True)\n",
+                    encoding="utf-8",
+                )
+                git(repo, "config", "credential.helper", "!gh auth git-credential")
+                git(repo, "add", ".")
+                git(repo, "commit", "-q", "-m", "add CI workflow")
+                git(repo, "remote", "set-url", "origin", f"https://github.com/{repo_slug}.git")
+                git(repo, "push", "-q", "-u", "origin", "main")
+                live_parent = {"gid": "900", "name": "Add chat authentication", "notes": SINGLE_CHILD_PARENT_NOTES.replace("example/chat-bridge", repo_slug)}
+                live_child = {"gid": "101", "name": "Reject expired auth tokens", "completed": False, "notes": READY_CHILD["notes"].replace("example/chat-bridge", repo_slug)}
+                untrusted_parent = {
+                    "gid": "900", "name": "Add chat authentication",
+                    "notes": live_parent["notes"].replace("feature/chat-auth", "feature/chat-auth-untrusted"),
+                }
+                untrusted_child = {
+                    "gid": "101", "name": "Reject expired auth tokens", "completed": False,
+                    "notes": live_child["notes"].replace("feature/chat-auth", "feature/chat-auth-untrusted"),
+                }
+                broken_w = _make_fake_agy(root, "live-broken", GOOD_BUILDER_SCRIPT.replace('token.startswith("expired:")', "False"))
+                fixed_w = _make_fake_agy(root, "live-fixed", GOOD_BUILDER_SCRIPT)
+                env_gh = {"TURBO_GITHUB_TOKEN": None, "GITHUB_TOKEN": gh_token}
+                with _DisposableAsanaServer(live_parent, [{"data": [live_child], "next_page": None}]) as asana:
+                    res1, rec1 = _run_deliver(repo, home, asana.base_url, "https://api.github.com", agy_bin=str(broken_w), time_limit="180s", env_extra=env_gh)
+                    self.assertEqual((res1.returncode, rec1["status"], rec1["pr_opened"], rec1["verified"]), (1, "ci-failed", True, False))
+                    self.assertEqual((rec1["child"]["pr"]["pr_confirmed"], rec1["child"]["pr"]["ci_verified"]), (True, False))
+                    self.assertIn("criterion/AC-1`: **FAILURE**", rec1["child"]["pr"]["body"])
+
+                    res2, rec2 = _run_deliver(repo, home, asana.base_url, "https://api.github.com", agy_bin=str(fixed_w), time_limit="180s", env_extra=env_gh)
+                    self.assertEqual((res2.returncode, rec2["status"], rec2["pr_opened"], rec2["verified"]), (0, "verified", True, True))
+                    self.assertEqual((rec2["child"]["pr"]["pr_confirmed"], rec2["child"]["pr"]["ci_verified"]), (True, True))
+                    self.assertIn("criterion/AC-1`: **SUCCESS**", rec2["child"]["pr"]["body"])
+
+                with _DisposableAsanaServer(untrusted_parent, [{"data": [untrusted_child], "next_page": None}]) as asana_untrusted:
+                    res_neg, rec_neg = _run_deliver(
+                        repo, home, asana_untrusted.base_url, "https://api.github.com",
+                        agy_bin=str(fixed_w), time_limit="180s", env_extra=env_gh,
+                    )
+                    self.assertEqual((res_neg.returncode, rec_neg["status"], rec_neg["pr_opened"], rec_neg["verified"]), (1, "ci-untrusted-producer", True, False))
+                    self.assertEqual((rec_neg["child"]["pr"]["pr_confirmed"], rec_neg["child"]["pr"]["ci_verified"]), (True, False))
+                    self.assertTrue(any("policy_sha" in b for b in rec_neg["blockers"]), rec_neg["blockers"])
+
+                # Advance feature/chat-auth on hosted origin and verify stale-revision invalidation
+                cand_sha_green = rec2["child"]["candidate_sha"]
+                git(repo, "push", "-q", "origin", f"{cand_sha_green}:refs/heads/feature/chat-auth")
+                stale_reval = ci_gate.revalidate_child_verification(
+                    repo=repo, base_url="https://api.github.com", token=gh_token, repo_slug=repo_slug,
+                    child_record=rec2["child"], trace=[], deadline=time_mod.monotonic() + 30.0, limit_s=30,
+                )
+                self.assertEqual((stale_reval["status"], stale_reval["verified"]), ("stale-revision", False))
+                if proof_out := os.environ.get("TURBO_LIVE_GITHUB_CI_PROOF_PATH"):
+                    Path(proof_out).write_text(
+                        json.dumps(
+                            {
+                                "repo_slug": repo_slug,
+                                "red": rec1,
+                                "green": rec2,
+                                "negative_provenance": rec_neg,
+                                "stale_revision": stale_reval,
+                            },
+                            indent=2,
+                        ),
+                        encoding="utf-8",
+                    )
+        finally:
+            subprocess.run(["gh", "api", "-X", "DELETE", f"repos/{repo_slug}"], check=False, capture_output=True)
 
 
 if __name__ == "__main__":

@@ -477,12 +477,14 @@ class DeliverChecksTest(unittest.TestCase):
                     "            self.assertNotEqual(cat_read.returncode, 0, f'cat allowed for {target}')\n",
                     encoding="utf-8",
                 )
-                child = {
-                    "gid": "101", "name": "Verify isolation",
-                    "criteria": [{"id": "AC-1", "verification": "python3 -m unittest discover -s tests -p test_isolation.py -v"}],
-                }
-                ok, checks, failures = deliver_checks.run_child_verifications(worktree_dir, child, conf, child_dir, home, worker_env, deadline, 30)
-                self.assertTrue(ok and checks[0]["ok"], f"{failures} / {Path(checks[0]['output_path']).read_text(encoding='utf-8')}")
+                verify_home = child_dir / "verify-home"
+                verify_home.mkdir(parents=True, exist_ok=True)
+                verify_env = {**worker_env, "HOME": str(verify_home)}
+                iso_argv = ("python3", "-m", "unittest", "discover", "-s", "tests", "-p", "test_isolation.py", "-v")
+                code, out_s, err_s, _, timed_out = worker_module.execute_stream(
+                    worktree_dir, iso_argv, verify_env, 30, isolated_home=verify_home, allow_network=False,
+                )
+                self.assertEqual((code, timed_out), (0, False), out_s + err_s)
                 self.assertEqual(accepted, [])
                 self.assertEqual(repo_sentinel.read_text(encoding="utf-8"), "REPO_SENTINEL_INTACT\n")
                 self.assertEqual(home_sentinel.read_text(encoding="utf-8"), "CONTROLLER_CRED_INTACT\n")
@@ -491,15 +493,16 @@ class DeliverChecksTest(unittest.TestCase):
                 stop_listener.set()
                 listener.close()
                 accept_thread.join(timeout=1.0)
-            missing_bin_child = {"gid": "101", "name": "Missing", "criteria": [{"id": "AC-1", "verification": "pytest -q"}]}
-            ok_miss, checks_miss, failures_miss = deliver_checks.run_child_verifications(
-                worktree_dir, missing_bin_child, conf, child_dir, home, {**worker_env, "PATH": "/nonexistent-bin"}, deadline, 30,
-            )
-            self.assertEqual((ok_miss, checks_miss[0]["ok"], checks_miss[0]["executed"]), (False, False, False))
-            self.assertTrue(any("pytest" in f for f in failures_miss))
+            with self.assertRaises(OSError):
+                worker_module.execute_stream(
+                    worktree_dir, ("pytest", "-q"), {**verify_env, "PATH": "/nonexistent-bin"}, 30,
+                    isolated_home=verify_home, allow_network=False,
+                )
             with mock.patch("factory.sandbox.sandbox_available", return_value=False):
                 with self.assertRaises(worker_module.SandboxUnavailableError):
-                    deliver_checks.run_child_verifications(worktree_dir, child, conf, child_dir, home, worker_env, deadline, 30)
+                    worker_module.execute_stream(
+                        worktree_dir, iso_argv, verify_env, 30, isolated_home=verify_home, allow_network=False,
+                    )
 
     def test_github_helpers_contract_missing_fields_mismatches_redirects_and_redaction_secrets(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
