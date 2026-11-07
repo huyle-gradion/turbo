@@ -17,15 +17,10 @@ from tests.independent_review.test_independent_review import (
 )
 from tests.security_review.test_reviewer import REVIEWER_SCRIPT
 
-
-def _valid_ci_record(
-    candidate_sha: str, base_sha: str, home: Path, *, tested_sha: str | None = None,
-    revision_kind: str | None = None, child: dict | None = None, conf: config_module.Config | None = None,
-) -> dict:
+def _valid_ci_record(candidate_sha: str, base_sha: str, home: Path, *, tested_sha: str | None = None, revision_kind: str | None = None, child: dict | None = None, conf: config_module.Config | None = None) -> dict:
     t_sha = tested_sha or candidate_sha
     r_kind = revision_kind or ("fast-forward-head" if t_sha == candidate_sha else "integration-merge")
-    ci_dir = home / "ci-fixture"
-    ci_dir.mkdir(parents=True, exist_ok=True)
+    ci_dir = home / "ci-fixture"; ci_dir.mkdir(parents=True, exist_ok=True)
     req_list = ci_selection.build_required_ci_checks(child or PARSED_CHILD, conf) if conf is not None else [
         {"id": "gate-1", "name": "guard/gate-1", "kind": "guard", "assesses": "gate-1"},
         {"id": "gate-2", "name": "guard/gate-2", "kind": "guard", "assesses": "gate-2"},
@@ -38,9 +33,8 @@ def _valid_ci_record(
         log_p = ci_dir / f"ci-{idx}-{req['name'].replace('/', '-')}-{candidate_sha[:8]}-{t_sha[:8]}.log"
         log_p.write_text(log_txt, encoding="utf-8")
         checks.append({
-            **req, "run_id": 100 + idx, "workflow_run_id": 200, "run_attempt": 1,
-            "workflow_path": ".github/workflows/ci.yml", "policy_sha": base_sha, "artifact_id": 300 + idx,
-            "producer": "github-actions", "status": "completed", "conclusion": "success",
+            **req, "run_id": 100 + idx, "workflow_run_id": 200, "run_attempt": 1, "workflow_path": ".github/workflows/ci.yml",
+            "policy_sha": base_sha, "artifact_id": 300 + idx, "producer": "github-actions", "status": "completed", "conclusion": "success",
             "candidate_sha": candidate_sha, "base_sha": base_sha, "tested_sha": t_sha, "revision_kind": r_kind,
             "html_url": f"https://github.com/example/chat-bridge/runs/{100 + idx}",
             "artifact_url": f"https://github.com/example/chat-bridge/actions/runs/200/artifacts/{300 + idx}",
@@ -48,24 +42,18 @@ def _valid_ci_record(
         })
     return {
         "status": "verified", "verified": True, "verification_scope": ci_gate.VERIFICATION_SCOPE_NOTE,
-        "candidate_sha": candidate_sha, "base_sha": base_sha, "policy_sha": base_sha,
-        "tested_sha": t_sha, "revision_kind": r_kind,
+        "candidate_sha": candidate_sha, "base_sha": base_sha, "policy_sha": base_sha, "tested_sha": t_sha, "revision_kind": r_kind,
         "trusted_producers": ["github-actions"], "trusted_workflows": [".github/workflows/ci.yml"],
         "required_checks": req_list, "checks": checks, "blockers": [],
-        "pr": {
-            "pr_confirmed": True, "ci_verified": True, "verified": True, "state": "open",
-            "merged": False, "head_sha": candidate_sha, "base_sha": base_sha,
-        },
+        "pr": {"pr_confirmed": True, "ci_verified": True, "verified": True, "state": "open", "merged": False, "head_sha": candidate_sha, "base_sha": base_sha},
     }
-
 
 class ApprovalGateGroup1Test(unittest.TestCase):
     def _setup_workspace(self, root: Path):
         repo, home, _ = _make_disposable_product_workspace(root)
         _valid_security_record("0" * 40, "0" * 40, home)
         base_sha = git(repo, "rev-parse", "refs/heads/main")
-        conf = config_module.load(RuntimePaths(repo=repo, home=home))
-        child_dir = home / "deliveries" / "900" / "attempt-1" / "children" / "101"
+        conf, child_dir = config_module.load(RuntimePaths(repo=repo, home=home)), home / "deliveries" / "900" / "attempt-1" / "children" / "101"
         git(repo, "checkout", "-q", "-b", "task/101-gate", base_sha)
         (repo / "src/chat_bridge/auth.py").write_text(CLEAN_AUTH_PY, encoding="utf-8")
         (repo / "tests/test_auth.py").write_text((repo / "tests/test_auth.py").read_text(encoding="utf-8") + EXPIRED_TEST_APPEND, encoding="utf-8")
@@ -92,11 +80,7 @@ class ApprovalGateGroup1Test(unittest.TestCase):
             ]
             agy1 = _make_fake_agy(root, "agy-ac1-r1", _make_staged_reviewer_script(session_id="rev-ac1-1", outcome="changes-requested", assessment={**DEFAULT_ASSESSMENT, "edge_cases": {"status": "unsatisfied", "summary": "blockers"}}, findings=r1_findings))
             ci1, qa1, sec1 = _valid_ci_record(cand1, base_sha, home, child=child_ac1, conf=conf), _valid_qa_record(cand1, base_sha), _valid_security_record(cand1, base_sha, home)
-            gate1 = independent_review.evaluate_approval_gate(
-                candidate_sha=cand1, base_sha=base_sha, ci_record=ci1, qa_record=qa1, security_record=sec1,
-                repo=repo, home=home, child_dir=child_dir, child=child_ac1, conf=conf,
-                builder_session_id="builder-1", builder_summary="Round 1", round_num=1, agy_bin=str(agy1),
-            )
+            gate1 = independent_review.evaluate_approval_gate(candidate_sha=cand1, base_sha=base_sha, ci_record=ci1, qa_record=qa1, security_record=sec1, repo=repo, home=home, child_dir=child_dir, child=child_ac1, conf=conf, builder_session_id="builder-1", builder_summary="Round 1", round_num=1, agy_bin=str(agy1))
             self.assertEqual((gate1["delivery_approved"], gate1["outcome"], gate1["approved_revision"]), (False, "rejected", None))
             self.assertEqual(set(gate1["historical_blockers"]["unresolved_ids"]), {fid1, fid2})
 
@@ -106,25 +90,11 @@ class ApprovalGateGroup1Test(unittest.TestCase):
             cand2 = git(repo, "rev-parse", "HEAD")
             ci2, qa2, sec2 = _valid_ci_record(cand2, base_sha, home, child=child_ac1, conf=conf), _valid_qa_record(cand2, base_sha), _valid_security_record(cand2, base_sha, home)
             agy2_omit = _make_fake_agy(root, "agy-ac1-r2", _make_staged_reviewer_script(session_id="rev-ac1-2", outcome="review-passed", reconciliations=[{"finding_id": fid1, "resolution": "fixed", "evidence": "b1 fixed"}]))
-            r2 = independent_review.review_candidate_independently(
-                repo=repo, home=home, child_dir=child_dir, child=child_ac1, conf=conf, base_sha=base_sha, candidate_sha=cand2,
-                builder_session_id="builder-1", builder_summary="Round 2", qa_record=qa2, security_record=sec2, round_num=2, agy_bin=str(agy2_omit), deadline=time.monotonic() + 30.0, limit_s=30,
-            )
-            gate2 = independent_review.evaluate_approval_gate(
-                candidate_sha=cand2, base_sha=base_sha, ci_record=ci2, qa_record=qa2, security_record=sec2,
-                review_record=r2, repo=repo, home=home, child_dir=child_dir, child=child_ac1, conf=conf,
-            )
+            r2 = independent_review.review_candidate_independently(repo=repo, home=home, child_dir=child_dir, child=child_ac1, conf=conf, base_sha=base_sha, candidate_sha=cand2, builder_session_id="builder-1", builder_summary="Round 2", qa_record=qa2, security_record=sec2, round_num=2, agy_bin=str(agy2_omit), deadline=time.monotonic() + 30.0, limit_s=30)
+            gate2 = independent_review.evaluate_approval_gate(candidate_sha=cand2, base_sha=base_sha, ci_record=ci2, qa_record=qa2, security_record=sec2, review_record=r2, repo=repo, home=home, child_dir=child_dir, child=child_ac1, conf=conf)
             self.assertEqual((gate2["delivery_approved"], gate2["approved_revision"]), (False, None))
-            # Even if r2 record is tampered to strip omitted fid2 and claim review-passed, persisted history rejects it
-            tampered_r2 = {
-                **r2, "outcome": "review-passed", "review_verified": True, "blocking_findings": [], "open_finding_ids": [],
-                "findings": [f for f in r2["findings"] if f["finding_id"] != fid2],
-                "previous_findings_resolution": [r for r in r2["previous_findings_resolution"] if r["finding_id"] != fid2],
-            }
-            gate2_tampered = independent_review.evaluate_approval_gate(
-                candidate_sha=cand2, base_sha=base_sha, ci_record=ci2, qa_record=qa2, security_record=sec2,
-                review_record=tampered_r2, repo=repo, home=home, child_dir=child_dir, child=child_ac1, conf=conf,
-            )
+            tampered_r2 = {**r2, "outcome": "review-passed", "review_verified": True, "blocking_findings": [], "open_finding_ids": [], "findings": [f for f in r2["findings"] if f["finding_id"] != fid2], "previous_findings_resolution": [r for r in r2["previous_findings_resolution"] if r["finding_id"] != fid2]}
+            gate2_tampered = independent_review.evaluate_approval_gate(candidate_sha=cand2, base_sha=base_sha, ci_record=ci2, qa_record=qa2, security_record=sec2, review_record=tampered_r2, repo=repo, home=home, child_dir=child_dir, child=child_ac1, conf=conf)
             self.assertEqual((gate2_tampered["delivery_approved"], gate2_tampered["status"]), (False, "unresolved-historical-blockers"))
 
             # Round 3: remove temp_mod.py and reconcile both blockers with passing execution evidence -> APPROVED
@@ -132,10 +102,7 @@ class ApprovalGateGroup1Test(unittest.TestCase):
             git(repo, "add", "-A"); git(repo, "commit", "-q", "-m", "round 3 complete fix")
             cand3 = git(repo, "rev-parse", "HEAD")
             sec_agy = _make_fake_agy(root, "agy-sec-r3", REVIEWER_SCRIPT)
-            real_sec3 = security_review.review_candidate_security(
-                repo=repo, home=home, child_dir=child_dir, child=child_ac1, conf=conf, base_sha=base_sha,
-                candidate_sha=cand3, round_num=1, agy_bin=str(sec_agy), builder_session_id="builder-1", deadline=time.monotonic() + 30.0, limit_s=30,
-            )
+            real_sec3 = security_review.review_candidate_security(repo=repo, home=home, child_dir=child_dir, child=child_ac1, conf=conf, base_sha=base_sha, candidate_sha=cand3, round_num=1, agy_bin=str(sec_agy), builder_session_id="builder-1", deadline=time.monotonic() + 30.0, limit_s=30)
             qa3_round = {**_valid_qa_record(cand3, base_sha), "round": 1}
             qa_round_dir = child_dir / "automated-qa" / "round-1"; qa_round_dir.mkdir(parents=True, exist_ok=True)
             (qa_round_dir / "record.json").write_text(json.dumps(qa3_round), encoding="utf-8")
@@ -143,24 +110,11 @@ class ApprovalGateGroup1Test(unittest.TestCase):
             (child_dir / "automated-qa" / "record.json").write_text(json.dumps(qa3_summary), encoding="utf-8")
             ci3 = _valid_ci_record(cand3, base_sha, home, child=child_ac1, conf=conf)
             (child_dir / "ci-verification.json").write_text(json.dumps(ci3), encoding="utf-8")
-            agy3 = _make_fake_agy(root, "agy-ac1-r3", _make_staged_reviewer_script(
-                session_id="rev-ac1-3", outcome="review-passed",
-                reconciliations=[{"finding_id": fid1, "resolution": "fixed", "evidence": "b1 guard present"}, {"finding_id": fid2, "resolution": "no-longer-applicable", "evidence": "temp_mod removed"}],
-            ))
-            r3 = independent_review.review_candidate_independently(
-                repo=repo, home=home, child_dir=child_dir, child=child_ac1, conf=conf, base_sha=base_sha, candidate_sha=cand3,
-                builder_session_id="builder-1", builder_summary="Round 3", qa_record=qa3_summary, security_record=real_sec3,
-                round_num=3, agy_bin=str(agy3), deadline=time.monotonic() + 30.0, limit_s=30,
-            )
+            agy3 = _make_fake_agy(root, "agy-ac1-r3", _make_staged_reviewer_script(session_id="rev-ac1-3", outcome="review-passed", reconciliations=[{"finding_id": fid1, "resolution": "fixed", "evidence": "b1 guard present"}, {"finding_id": fid2, "resolution": "no-longer-applicable", "evidence": "temp_mod removed"}]))
+            r3 = independent_review.review_candidate_independently(repo=repo, home=home, child_dir=child_dir, child=child_ac1, conf=conf, base_sha=base_sha, candidate_sha=cand3, builder_session_id="builder-1", builder_summary="Round 3", qa_record=qa3_summary, security_record=real_sec3, round_num=3, agy_bin=str(agy3), deadline=time.monotonic() + 30.0, limit_s=30)
             self.assertFalse(r3["delivery_approved"])
-            gate3 = independent_review.evaluate_approval_gate(
-                candidate_sha=cand3, base_sha=base_sha, repo=repo, home=home, child_dir=child_dir,
-                child=child_ac1, conf=conf, load_from_child_dir=True,
-            )
-            self.assertEqual(
-                (gate3["delivery_approved"], gate3["status"], gate3["outcome"], gate3["approved_revision"], gate3["tested_sha"], gate3["revision_kind"], gate3["historical_blockers"]["all_verified_resolved"], set(gate3["historical_blockers"]["resolved_ids"])),
-                (True, "approved", "approved", cand3, cand3, "fast-forward-head", True, {fid1, fid2}),
-            )
+            gate3 = independent_review.evaluate_approval_gate(candidate_sha=cand3, base_sha=base_sha, repo=repo, home=home, child_dir=child_dir, child=child_ac1, conf=conf, load_from_child_dir=True)
+            self.assertEqual((gate3["delivery_approved"], gate3["status"], gate3["outcome"], gate3["approved_revision"], gate3["tested_sha"], gate3["revision_kind"], gate3["historical_blockers"]["all_verified_resolved"], set(gate3["historical_blockers"]["resolved_ids"])), (True, "approved", "approved", cand3, cand3, "fast-forward-head", True, {fid1, fid2}))
 
             # Prerequisite failure matrix on cand3: missing, failing, stale, invalid, untrusted, or mismatched must reject
             def eval_g(**over):
@@ -183,6 +137,12 @@ class ApprovalGateGroup1Test(unittest.TestCase):
                 ("ci-stale-policy", {"ci_record": {**ci3, "policy_sha": cand1}}, "stale-ci-evidence"),
                 ("ci-cached-result", {"ci_record": {**ci3, "checks": [{**ci3["checks"][0], "cached_result": True}, *ci3["checks"][1:]]}}, "stale-ci-evidence"),
                 ("ci-closed-pr", {"ci_record": {**ci3, "pr": {**ci3["pr"], "state": "closed"}}}, "stale-ci-evidence"),
+                ("ci-pr-no-state", {"ci_record": {**ci3, "pr": {k: v for k, v in ci3["pr"].items() if k != "state"}}}, "stale-ci-evidence"),
+                ("ci-pr-no-merged", {"ci_record": {**ci3, "pr": {k: v for k, v in ci3["pr"].items() if k != "merged"}}}, "stale-ci-evidence"),
+                ("ci-pr-no-head", {"ci_record": {**ci3, "pr": {k: v for k, v in ci3["pr"].items() if k != "head_sha"}}}, "stale-ci-evidence"),
+                ("ci-pr-no-base", {"ci_record": {**ci3, "pr": {k: v for k, v in ci3["pr"].items() if k != "base_sha"}}}, "stale-ci-evidence"),
+                ("ci-no-req-checks", {"ci_record": {**ci3, "required_checks": []}}, "ci-evidence-invalid"),
+                ("ci-omitted-ctx", {"child": None, "conf": None, "ci_record": {**ci3, "required_checks": []}}, "ci-evidence-invalid"),
                 ("ci-drifted-branch", {"ci_record": {**ci3, "head_branch": "main"}}, "stale-ci-evidence"),
                 ("qa-missing", {"qa_record": None}, "qa-missing"),
                 ("qa-failed", {"qa_record": {**qa3_round, "status": "qa-failed", "qa_verified": False}}, "qa-failed"),
@@ -207,14 +167,8 @@ class ApprovalGateGroup1Test(unittest.TestCase):
             for bad_r in (None, True, False, 0, -1, "3"):
                 for k, base_rec in (("qa_record", qa3_round), ("security_record", real_sec3), ("review_record", r3)):
                     self.assertFalse(eval_g(**{k: {**base_rec, "round": bad_r}})["delivery_approved"], f"M1 {k} round={bad_r!r}")
-                if bad_r is not None:
-                    self.assertFalse(eval_g(round_num=bad_r)["delivery_approved"], f"M1 round_num={bad_r!r}")
-            # M1: child_dir supplied with home=None must still enforce persisted unresolved history on gate2_tampered
-            self.assertFalse(independent_review.evaluate_approval_gate(
-                candidate_sha=cand2, base_sha=base_sha, ci_record=ci2, qa_record=qa2, security_record=sec2,
-                review_record=tampered_r2, repo=repo, home=None, child_dir=child_dir, child=child_ac1, conf=conf,
-            )["delivery_approved"])
-            # M1: same-candidate prior QA/security blockers and newer superseding rounds cannot be bypassed
+                if bad_r is not None: self.assertFalse(eval_g(round_num=bad_r)["delivery_approved"], f"M1 round_num={bad_r!r}")
+            self.assertFalse(independent_review.evaluate_approval_gate(candidate_sha=cand2, base_sha=base_sha, ci_record=ci2, qa_record=qa2, security_record=sec2, review_record=tampered_r2, repo=repo, home=None, child_dir=child_dir, child=child_ac1, conf=conf)["delivery_approved"])
             (qa_round_dir / "record.json").write_text(json.dumps({**qa3_round, "round": 1, "findings": [{"finding_id": "QA-101-AC-1-DET", "status": "open"}]}), encoding="utf-8")
             self.assertEqual(eval_g(qa_record={**qa3_round, "round": 2, "findings": []})["status"], "qa-findings-open")
             (qa_round_dir / "record.json").write_text(json.dumps(qa3_round), encoding="utf-8")
@@ -222,7 +176,6 @@ class ApprovalGateGroup1Test(unittest.TestCase):
             (sec_r1_dir / "record.json").write_text(json.dumps({**real_sec3, "round": 1, "findings": [{"finding_id": "SEC-HIST-1", "blocking": True, "status": "open"}]}), encoding="utf-8")
             self.assertEqual(eval_g(security_record={**real_sec3, "round": 2, "findings": []})["status"], "security-blockers-unresolved")
             shutil.rmtree(sec_r1_dir)
-            # Corrupt prior-blockers.json must fail closed
             (child_dir / "prior-blockers.json").write_text("{corrupt", encoding="utf-8")
             corrupt_res = eval_g()
             self.assertEqual((corrupt_res["delivery_approved"], corrupt_res["status"]), (False, "corrupt-prior-history"))
@@ -232,62 +185,37 @@ class ApprovalGateGroup1Test(unittest.TestCase):
             root = Path(tmp)
             repo, home, base_sha, cand_a, conf, child_dir, good_agy = self._setup_workspace(root)
             ci_a, qa_a, sec_a = _valid_ci_record(cand_a, base_sha, home, conf=conf), _valid_qa_record(cand_a, base_sha), _valid_security_record(cand_a, base_sha, home)
-            rev_a = independent_review.review_candidate_independently(
-                repo=repo, home=home, child_dir=child_dir, child=PARSED_CHILD, conf=conf, base_sha=base_sha, candidate_sha=cand_a,
-                builder_session_id="builder-a", builder_summary="Candidate A", qa_record=qa_a, security_record=sec_a, round_num=1, agy_bin=str(good_agy), deadline=time.monotonic() + 30.0, limit_s=30,
-            )
+            rev_a = independent_review.review_candidate_independently(repo=repo, home=home, child_dir=child_dir, child=PARSED_CHILD, conf=conf, base_sha=base_sha, candidate_sha=cand_a, builder_session_id="builder-a", builder_summary="Candidate A", qa_record=qa_a, security_record=sec_a, round_num=1, agy_bin=str(good_agy), deadline=time.monotonic() + 30.0, limit_s=30)
             self.assertFalse(rev_a["delivery_approved"])
-            gate_a = independent_review.evaluate_approval_gate(
-                candidate_sha=cand_a, base_sha=base_sha, ci_record=ci_a, qa_record=qa_a, security_record=sec_a,
-                review_record=rev_a, repo=repo, home=home, child_dir=child_dir, child=PARSED_CHILD, conf=conf,
-            )
+            gate_a = independent_review.evaluate_approval_gate(candidate_sha=cand_a, base_sha=base_sha, ci_record=ci_a, qa_record=qa_a, security_record=sec_a, review_record=rev_a, repo=repo, home=home, child_dir=child_dir, child=PARSED_CHILD, conf=conf)
             self.assertEqual((gate_a["delivery_approved"], gate_a["approved_revision"], gate_a["candidate_sha"], gate_a["tested_sha"], gate_a["revision_kind"]), (True, cand_a, cand_a, cand_a, "fast-forward-head"))
             self.assertTrue(independent_review.verify_candidate_approval(cand_a, base_sha, gate_a, repo=repo, home=home)["delivery_approved"])
 
-            # Integration-merge tested-revision semantics on cand_a
             git(repo, "checkout", "-q", "-b", "merge-sim-ac2", base_sha)
             git(repo, "merge", "--no-ff", "-q", "-m", "Merge cand_a into base", cand_a)
             merge_sha = git(repo, "rev-parse", "HEAD")
             git(repo, "checkout", "-q", "task/101-gate")
             ci_merge = _valid_ci_record(cand_a, base_sha, home, tested_sha=merge_sha, revision_kind="integration-merge", conf=conf)
             qa_merge = {**_valid_qa_record(cand_a, base_sha, tested_sha=merge_sha), "revision_kind": "integration-merge"}
-            gate_merge = independent_review.evaluate_approval_gate(
-                candidate_sha=cand_a, base_sha=base_sha, ci_record=ci_merge, qa_record=qa_merge, security_record=sec_a,
-                review_record=rev_a, repo=repo, home=home, child_dir=child_dir, child=PARSED_CHILD, conf=conf,
-            )
+            gate_merge = independent_review.evaluate_approval_gate(candidate_sha=cand_a, base_sha=base_sha, ci_record=ci_merge, qa_record=qa_merge, security_record=sec_a, review_record=rev_a, repo=repo, home=home, child_dir=child_dir, child=PARSED_CHILD, conf=conf)
             self.assertEqual((gate_merge["delivery_approved"], gate_merge["approved_revision"], gate_merge["tested_sha"], gate_merge["revision_kind"]), (True, cand_a, merge_sha, "integration-merge"))
-            mismatch_merge = independent_review.evaluate_approval_gate(
-                candidate_sha=cand_a, base_sha=base_sha, ci_record=ci_merge, qa_record=qa_a, security_record=sec_a,
-                review_record=rev_a, repo=repo, home=home, child_dir=child_dir, child=PARSED_CHILD, conf=conf,
-            )
+            mismatch_merge = independent_review.evaluate_approval_gate(candidate_sha=cand_a, base_sha=base_sha, ci_record=ci_merge, qa_record=qa_a, security_record=sec_a, review_record=rev_a, repo=repo, home=home, child_dir=child_dir, child=PARSED_CHILD, conf=conf)
             self.assertEqual((mismatch_merge["delivery_approved"], mismatch_merge["status"]), (False, "stale-qa-evidence"))
 
-            # Re-approve cand_a on disk before creating subsequent candidate B
-            gate_a = independent_review.evaluate_approval_gate(
-                candidate_sha=cand_a, base_sha=base_sha, ci_record=ci_a, qa_record=qa_a, security_record=sec_a,
-                review_record=rev_a, repo=repo, home=home, child_dir=child_dir, child=PARSED_CHILD, conf=conf,
-            )
+            gate_a = independent_review.evaluate_approval_gate(candidate_sha=cand_a, base_sha=base_sha, ci_record=ci_a, qa_record=qa_a, security_record=sec_a, review_record=rev_a, repo=repo, home=home, child_dir=child_dir, child=PARSED_CHILD, conf=conf)
             (repo / "src/chat_bridge/auth.py").write_text(CLEAN_AUTH_PY + "# candidate B change\n", encoding="utf-8")
             git(repo, "add", "."); git(repo, "commit", "-q", "-m", "candidate B")
             cand_b = git(repo, "rev-parse", "HEAD")
             self.assertNotEqual(cand_a, cand_b)
 
-            # Approval issued for cand_a is rejected when evaluated for subsequent candidate B
             ver_b_from_a = independent_review.verify_candidate_approval(cand_b, base_sha, gate_a, repo=repo, home=home)
             self.assertEqual((ver_b_from_a["delivery_approved"], ver_b_from_a["approved_revision"], ver_b_from_a["status"], ver_b_from_a["stale_approved_revision"]), (False, None, "stale-candidate-revision", cand_a))
-            gate_b_stale = independent_review.evaluate_approval_gate(
-                candidate_sha=cand_b, base_sha=base_sha, ci_record=ci_a, qa_record=qa_a, security_record=sec_a,
-                review_record=rev_a, prior_approval=gate_a, repo=repo, home=home, child_dir=child_dir, child=PARSED_CHILD, conf=conf,
-            )
+            gate_b_stale = independent_review.evaluate_approval_gate(candidate_sha=cand_b, base_sha=base_sha, ci_record=ci_a, qa_record=qa_a, security_record=sec_a, review_record=rev_a, prior_approval=gate_a, repo=repo, home=home, child_dir=child_dir, child=PARSED_CHILD, conf=conf)
             self.assertEqual((gate_b_stale["delivery_approved"], gate_b_stale["approved_revision"], gate_b_stale["status"], gate_b_stale["prior_approval_rejected"], gate_b_stale["superseded_approved_revision"]), (False, None, "stale-candidate-revision", True, cand_a))
             self.assertFalse(json.loads((child_dir / "approval-gate.json").read_text(encoding="utf-8"))["delivery_approved"])
 
-            # Fresh prerequisites for cand_b, but test partial/relabelled cand_a evidence first
             ci_b, qa_b, sec_b = _valid_ci_record(cand_b, base_sha, home, conf=conf), _valid_qa_record(cand_b, base_sha), _valid_security_record(cand_b, base_sha, home)
-            rev_b = independent_review.review_candidate_independently(
-                repo=repo, home=home, child_dir=child_dir, child=PARSED_CHILD, conf=conf, base_sha=base_sha, candidate_sha=cand_b,
-                builder_session_id="builder-b", builder_summary="Candidate B", qa_record=qa_b, security_record=sec_b, round_num=2, agy_bin=str(good_agy), deadline=time.monotonic() + 30.0, limit_s=30,
-            )
+            rev_b = independent_review.review_candidate_independently(repo=repo, home=home, child_dir=child_dir, child=PARSED_CHILD, conf=conf, base_sha=base_sha, candidate_sha=cand_b, builder_session_id="builder-b", builder_summary="Candidate B", qa_record=qa_b, security_record=sec_b, round_num=2, agy_bin=str(good_agy), deadline=time.monotonic() + 30.0, limit_s=30)
             ci_a_deep = json.loads(json.dumps(ci_a).replace(cand_a, cand_b))
             for idx, c in enumerate(ci_a["checks"]): ci_a_deep["checks"][idx]["output_path"] = c["output_path"]
             qa_a_deep = json.loads(json.dumps(qa_a).replace(cand_a, cand_b))
@@ -318,7 +246,6 @@ class ApprovalGateGroup1Test(unittest.TestCase):
                 res_b = independent_review.evaluate_approval_gate(**kw_b)
                 self.assertEqual((res_b["delivery_approved"], res_b["approved_revision"]), (False, None), f"expected rejection for {label}")
 
-            # Non-gate producers cannot issue delivery_approved=True
             for non_gate_rec in (rev_b, {**rev_b, "delivery_approved": True}, {**ci_b, "delivery_approved": True}, {**qa_b, "delivery_approved": True}, {**sec_b, "delivery_approved": True}):
                 v_ng = independent_review.verify_candidate_approval(cand_b, base_sha, non_gate_rec, repo=repo, home=home)
                 self.assertEqual((v_ng["delivery_approved"], v_ng["status"]), (False, "authority-violation"))
@@ -327,20 +254,11 @@ class ApprovalGateGroup1Test(unittest.TestCase):
                 auth_res = independent_review.evaluate_approval_gate(**auth_kw)
                 self.assertEqual((auth_res["delivery_approved"], auth_res["status"]), (False, "authority-violation"))
 
-            # Full fresh evidence on cand_b issues new approval bound to cand_b while gate_a remains rejected for cand_b
-            gate_b = independent_review.evaluate_approval_gate(
-                candidate_sha=cand_b, base_sha=base_sha, ci_record=ci_b, qa_record=qa_b, security_record=sec_b,
-                review_record=rev_b, prior_approval=gate_a, repo=repo, home=home, child_dir=child_dir, child=PARSED_CHILD, conf=conf,
-            )
+            gate_b = independent_review.evaluate_approval_gate(candidate_sha=cand_b, base_sha=base_sha, ci_record=ci_b, qa_record=qa_b, security_record=sec_b, review_record=rev_b, prior_approval=gate_a, repo=repo, home=home, child_dir=child_dir, child=PARSED_CHILD, conf=conf)
             self.assertEqual((gate_b["delivery_approved"], gate_b["approved_revision"], gate_b["superseded_approved_revision"]), (True, cand_b, cand_a))
             self.assertTrue(independent_review.verify_candidate_approval(cand_b, base_sha, gate_b, repo=repo, home=home)["delivery_approved"])
             self.assertFalse(independent_review.verify_candidate_approval(cand_b, base_sha, gate_a, repo=repo, home=home)["delivery_approved"])
-            fab_min = {
-                "role": "delivery-approval-gate", "verification_scope": independent_review.APPROVAL_GATE_SCOPE_NOTE,
-                "approved_revision": cand_b, "candidate_sha": cand_b, "base_sha": base_sha, "tested_sha": cand_b,
-                "revision_kind": "fast-forward-head", "delivery_approved": True, "status": "approved", "outcome": "approved", "blockers": [],
-                "prerequisites": {k: {"verified": True, "candidate_sha": cand_b, "base_sha": base_sha} for k in ("ci", "automated_qa", "security_review", "independent_review")},
-            }
+            fab_min = {"role": "delivery-approval-gate", "verification_scope": independent_review.APPROVAL_GATE_SCOPE_NOTE, "approved_revision": cand_b, "candidate_sha": cand_b, "base_sha": base_sha, "tested_sha": cand_b, "revision_kind": "fast-forward-head", "delivery_approved": True, "status": "approved", "outcome": "approved", "blockers": [], "prerequisites": {k: {"verified": True, "candidate_sha": cand_b, "base_sha": base_sha} for k in ("ci", "automated_qa", "security_review", "independent_review")}}
             for label, bad_ap in (
                 ("minimal-fabricated", fab_min),
                 ("relabelled-gate-a", json.loads(json.dumps(gate_a).replace(cand_a, cand_b))),
@@ -356,35 +274,21 @@ class ApprovalGateGroup1Test(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             repo, home, base_sha, cand_sha, conf, child_dir, good_agy = self._setup_workspace(root)
-            ci_ok = _valid_ci_record(cand_sha, base_sha, home, conf=conf)
-            qa_ok = _valid_qa_record(cand_sha, base_sha)
-            sec_ok = _valid_security_record(cand_sha, base_sha, home)
+            ci_ok, qa_ok, sec_ok = _valid_ci_record(cand_sha, base_sha, home, conf=conf), _valid_qa_record(cand_sha, base_sha), _valid_security_record(cand_sha, base_sha, home)
 
             def run_gate(sub_name: str, **over):
-                c_dir = child_dir / sub_name
-                kw = {
-                    "candidate_sha": cand_sha, "base_sha": base_sha, "ci_record": ci_ok, "qa_record": qa_ok,
-                    "security_record": sec_ok, "repo": repo, "home": home, "child_dir": c_dir, "child": PARSED_CHILD,
-                    "conf": conf, "builder_session_id": "builder-ac4", "builder_summary": "All checks passed.",
-                    "round_num": 1, "agy_bin": str(good_agy),
-                }
+                kw = {"candidate_sha": cand_sha, "base_sha": base_sha, "ci_record": ci_ok, "qa_record": qa_ok, "security_record": sec_ok, "repo": repo, "home": home, "child_dir": child_dir / sub_name, "child": PARSED_CHILD, "conf": conf, "builder_session_id": "builder-ac4", "builder_summary": "All checks passed.", "round_num": 1, "agy_bin": str(good_agy)}
                 kw.update(over)
                 res = independent_review.evaluate_approval_gate(**kw)
                 self.assertTrue(res["prerequisites"]["ci"]["verified"] and res["prerequisites"]["automated_qa"]["verified"] and res["prerequisites"]["security_review"]["verified"])
                 return res
 
-            # Baseline: clean review + valid CI/QA/Security approves
             ok_gate = run_gate("baseline-ok")
             self.assertEqual((ok_gate["delivery_approved"], ok_gate["approved_revision"], ok_gate["status"]), (True, cand_sha, "approved"))
             valid_rev = independent_review.read_json(child_dir / "baseline-ok" / "independent-review.json", home)
 
-            # 1. Reviewer edits (Phase 1 & Phase 2 mutations, edit-then-restore, and tampered review record)
-            edit_restore_agy = _make_fake_agy(
-                root, "agy-ac4-er",
-                "import os, pathlib\nf = pathlib.Path('src/chat_bridge/auth.py')\norig, st = f.read_bytes(), f.stat()\n"
-                "f.write_bytes(orig + b'\\n# transient\\n'); f.write_bytes(orig); os.utime(f, ns=(st.st_atime_ns, st.st_mtime_ns))\n"
-                + _make_staged_reviewer_script(session_id="rev-ac4-er"),
-            )
+            # 1. Reviewer edits
+            edit_restore_agy = _make_fake_agy(root, "agy-ac4-er", "import os, pathlib\nf = pathlib.Path('src/chat_bridge/auth.py')\norig, st = f.read_bytes(), f.stat()\nf.write_bytes(orig + b'\\n# transient\\n'); f.write_bytes(orig); os.utime(f, ns=(st.st_atime_ns, st.st_mtime_ns))\n" + _make_staged_reviewer_script(session_id="rev-ac4-er"))
             for idx, (phase, kind) in enumerate(((1, "unstaged"), (1, "staged"), (1, "untracked"), (1, "commit"), (2, "unstaged"), (2, "untracked")), start=1):
                 mut_agy = _make_fake_agy(root, f"agy-ac4-mut-{idx}", _make_staged_reviewer_script(session_id=f"rev-ac4-m{idx}", mutate_in_phase=phase, mutate_kind=kind))
                 res_m = run_gate(f"mut-{idx}", agy_bin=str(mut_agy))
@@ -395,43 +299,26 @@ class ApprovalGateGroup1Test(unittest.TestCase):
             res_mut_tampered = run_gate("mut-tampered", review_record={**mut_rec, "outcome": "review-passed", "review_verified": True, "role_separation_verified": True, "role_issues": []})
             self.assertEqual((res_mut_tampered["delivery_approved"], res_mut_tampered["status"]), (False, "reviewer-modified-worktree"))
 
-            # 2. Reused builder identity (Phase 1 match, Phase 2 match, missing builder_session_id, tampered record)
+            # 2. Reused builder identity
             p1_reused_agy = _make_fake_agy(root, "agy-ac4-id1", _make_staged_reviewer_script(session_id="builder-ac4"))
             p2_reused_agy = _make_fake_agy(root, "agy-ac4-id2", _make_staged_reviewer_script(session_id="fresh-ac4", phase2_session_id="builder-ac4"))
-            for label, kw_id in (
-                ("p1-reused", {"agy_bin": str(p1_reused_agy)}),
-                ("p2-reused", {"agy_bin": str(p2_reused_agy)}),
-                ("missing-builder-id", {"builder_session_id": ""}),
-                ("tampered-same-id", {"review_record": {**valid_rev, "reviewer_session_id": "builder-ac4"}}),
-            ):
+            for label, kw_id in (("p1-reused", {"agy_bin": str(p1_reused_agy)}), ("p2-reused", {"agy_bin": str(p2_reused_agy)}), ("missing-builder-id", {"builder_session_id": ""}), ("tampered-same-id", {"review_record": {**valid_rev, "reviewer_session_id": "builder-ac4"}})):
                 res_id = run_gate(f"id-{label}", **kw_id)
                 self.assertEqual((res_id["delivery_approved"], res_id["approved_revision"], res_id["status"]), (False, None, "reused-builder-identity"), label)
 
-            # 3. Invalid review protocol (summary leak in Phase 1, missing diff, empty hypotheses, session drift, fenced JSON, unsatisfied dimension)
+            # 3. Invalid review protocol
             with mock.patch.object(independent_review, "build_phase1_prompt", return_value="ROLE: independent-reviewer\nPHASE: 1\nBuilder summary: leaked!\nExact Base-to-Candidate Diff:\n" + Path(valid_rev["inspected_scope"]["diff_path"]).read_text(encoding="utf-8")):
                 res_leak = run_gate("proto-leak")
             with mock.patch.object(independent_review, "build_phase1_prompt", return_value="ROLE: independent-reviewer\nPHASE: 1\nExact Base-to-Candidate Diff:\nno-diff\n"):
                 res_nodiff = run_gate("proto-nodiff")
             empty_hyp_agy = _make_fake_agy(root, "agy-ac4-eh", _make_staged_reviewer_script(session_id="rev-eh", hypotheses=[]))
             drift_agy = _make_fake_agy(root, "agy-ac4-drift", _make_staged_reviewer_script(session_id="rev-d1", phase2_session_id="rev-d2"))
-            fenced_agy = _make_fake_agy(
-                root, "agy-ac4-fenced",
-                _make_staged_reviewer_script(session_id="rev-fenced").replace(
-                    "print(json.dumps({'event': 'result', 'result': {'conversation_id': out_sid, 'status': 'SUCCESS', 'response': resp}}))",
-                    "print(json.dumps({'event': 'result', 'result': {'conversation_id': out_sid, 'status': 'SUCCESS', 'response': '```json\\n' + resp + '\\n```'}}))",
-                ),
-            )
+            fenced_agy = _make_fake_agy(root, "agy-ac4-fenced", _make_staged_reviewer_script(session_id="rev-fenced").replace("print(json.dumps({'event': 'result', 'result': {'conversation_id': out_sid, 'status': 'SUCCESS', 'response': resp}}))", "print(json.dumps({'event': 'result', 'result': {'conversation_id': out_sid, 'status': 'SUCCESS', 'response': '```json\\n' + resp + '\\n```'}}))"))
             unsat_agy = _make_fake_agy(root, "agy-ac4-unsat", _make_staged_reviewer_script(session_id="rev-unsat", outcome="review-passed", assessment={**DEFAULT_ASSESSMENT, "edge_cases": {"status": "unsatisfied", "summary": "missing"}}))
-            for label, res_p in (
-                ("leak", res_leak), ("nodiff", res_nodiff),
-                ("empty-hyp", run_gate("proto-eh", agy_bin=str(empty_hyp_agy))),
-                ("drift", run_gate("proto-drift", agy_bin=str(drift_agy))),
-                ("fenced", run_gate("proto-fenced", agy_bin=str(fenced_agy))),
-                ("unsat", run_gate("proto-unsat", agy_bin=str(unsat_agy))),
-            ):
+            for label, res_p in (("leak", res_leak), ("nodiff", res_nodiff), ("empty-hyp", run_gate("proto-eh", agy_bin=str(empty_hyp_agy))), ("drift", run_gate("proto-drift", agy_bin=str(drift_agy))), ("fenced", run_gate("proto-fenced", agy_bin=str(fenced_agy))), ("unsat", run_gate("proto-unsat", agy_bin=str(unsat_agy)))):
                 self.assertEqual((res_p["delivery_approved"], res_p["approved_revision"], res_p["status"]), (False, None, "invalid-review-protocol"), label)
 
-            # 4. Unsupported success claims (builder claim contradicted by failing check, prose-only reconciliation claims, forged check log)
+            # 4. Unsupported success claims & M4 substituted review inputs
             fail_child = {**PARSED_CHILD, "criteria": [{**PARSED_CHILD["criteria"][0], "verification": "python3 -c \"import sys; sys.exit(1)\""}]}
             res_bclaim = run_gate("claim-builder-false", child=fail_child, builder_summary="All tests passed with 0 failures!")
             self.assertEqual((res_bclaim["delivery_approved"], res_bclaim["approved_revision"], res_bclaim["status"]), (False, None, "unsupported-success-claim"))
@@ -440,7 +327,6 @@ class ApprovalGateGroup1Test(unittest.TestCase):
             concealed_rev = {**valid_rev, "builder_summary_claim": {"summary": "All checks passed.", "treated_as_execution_evidence": False, "contradicted_by_observed_execution": False}, "observed_verification": {**valid_rev["observed_verification"], "ok": True, "checks": [{**valid_rev["observed_verification"]["checks"][0], "ok": False, "exit_code": 1}, *valid_rev["observed_verification"]["checks"][1:]]}}
             self.assertEqual((run_gate("m4-concealed-contra", review_record=concealed_rev)["delivery_approved"], run_gate("m4-concealed-contra", review_record=concealed_rev)["status"]), (False, "unsupported-success-claim"))
 
-            # M4: substituted review inputs (stripped standards, older diff, out-of-scope marked acceptable, unrelated Phase-2 prompt, missing context)
             old_diff_p, bad_p1_p, bad_p2_p = home / "m4-old.diff", home / "m4-p1.txt", home / "m4-p2.txt"
             old_diff_txt = "diff --git a/src/chat_bridge/auth.py b/src/chat_bridge/auth.py\n--- a/src/chat_bridge/auth.py\n+++ b/src/chat_bridge/auth.py\n@@ -1 +1 @@\n-# old\n+# new\n"
             old_diff_p.write_text(old_diff_txt, encoding="utf-8")
