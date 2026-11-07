@@ -189,13 +189,13 @@ def _validate_qa_record(candidate_sha: str, base_sha: str, qa_record: dict[str, 
         return {"status": st, "verified": False, "blockers": [f"automated QA contract not satisfied on {candidate_sha}"]}
     return {"status": "qa-verified", "verified": True, "blockers": []}
 
-def evaluate_upstream_evidence(candidate_sha: str, base_sha: str, qa_record: dict[str, Any] | None, security_record: dict[str, Any] | None, *, home: Path | None = None, repo: Path | None = None, child: dict[str, Any] | None = None, deadline: float | None = None, limit_s: int = 30) -> tuple[dict[str, Any], dict[str, Any], list[dict[str, Any]]]:
+def evaluate_upstream_evidence(candidate_sha: str, base_sha: str, qa_record: dict[str, Any] | None, security_record: dict[str, Any] | None, *, home: Path | None = None, repo: Path | None = None, child: dict[str, Any] | None = None, child_dir: Path | None = None, deadline: float | None = None, limit_s: int = 30) -> tuple[dict[str, Any], dict[str, Any], list[dict[str, Any]]]:
     gaps: list[dict[str, Any]] = []
-    qa_eval = _validate_qa_record(candidate_sha, base_sha, qa_record, repo=repo, child=child, deadline=deadline, limit_s=limit_s)
+    qa_eval = evaluate_qa_prerequisite(candidate_sha, base_sha, qa_record, child_dir=child_dir, home=home, repo=repo, child=child, deadline=deadline, limit_s=limit_s)
     if not qa_eval["verified"]:
         rule = "stale-qa-evidence" if qa_eval["status"] == "stale-qa-evidence" else "qa-evidence-unverified"
         gaps.append(_gap_finding("automated-qa", rule, f"Automated QA evidence gap ({qa_eval['status']})", "; ".join(qa_eval["blockers"]), f"Run automated QA on candidate {candidate_sha} (base {base_sha}) and resolve all QA findings.", "observed-upstream-gate"))
-    sec_eval = security_review.evaluate_security_review_gate(candidate_sha, base_sha, security_record, home=home)
+    sec_eval = evaluate_security_prerequisite(candidate_sha, base_sha, security_record, child_dir=child_dir, home=home)
     if not sec_eval["verified"]:
         rule = "stale-security-evidence" if sec_eval["status"] == "stale-security-review" else "security-evidence-unverified"
         gaps.append(_gap_finding("security-review", rule, f"Security review evidence gap ({sec_eval['status']})", "; ".join(sec_eval["blockers"]), f"Run security review on candidate {candidate_sha} (base {base_sha}) and resolve all security blockers.", "observed-upstream-gate"))
@@ -646,7 +646,7 @@ def review_candidate_independently(*, repo: Path, home: Path, child_dir: Path, c
             diff_text = redact_value(diff_res.output + ("\n" if not diff_res.output.endswith("\n") else ""), secrets)
             diff_path = write_evidence(round_dir, "reviewed-diff", diff_text, home)
             standards = load_project_standards(repo, base_sha, child, conf, deadline, limit_s)
-            qa_eval, sec_eval, upstream_gaps = evaluate_upstream_evidence(resolved_sha, base_sha, qa_record, security_record, home=home, repo=repo, child=child, deadline=deadline, limit_s=limit_s)
+            qa_eval, sec_eval, upstream_gaps = evaluate_upstream_evidence(resolved_sha, base_sha, qa_record, security_record, home=home, repo=repo, child=child, child_dir=child_dir, deadline=deadline, limit_s=limit_s)
 
             role_issues = [f"sandbox or execution unavailable: {sandbox_error}"] if sandbox_error else ([] if probes_ok else ["independent reviewer safety probes failed"])
             if not diff_ok: role_issues.append("failed to produce non-empty exact base-to-candidate diff")
@@ -801,3 +801,15 @@ def main(argv: list[str] | None = None) -> int:
         with tempfile.TemporaryDirectory() as tmp: summary = run_disposable_demo(Path(tmp))
     print(json.dumps(summary, indent=2, sort_keys=True)); print("DEMO_INDEPENDENT_REVIEW_OK")
     return 0
+
+
+from factory.independent_review.approval import (  # noqa: E402
+    APPROVAL_GATE_SCOPE_NOTE,
+    evaluate_approval_gate,
+    evaluate_ci_prerequisite,
+    evaluate_independent_review_prerequisite,
+    evaluate_qa_prerequisite,
+    evaluate_security_prerequisite,
+    load_prerequisite_evidence,
+    verify_candidate_approval,
+)
