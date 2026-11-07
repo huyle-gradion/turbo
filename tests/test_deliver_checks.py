@@ -18,7 +18,7 @@ from unittest import mock
 from urllib.parse import parse_qs, urlparse
 import zipfile
 
-from factory import config as config_module, deliver_checks, worker as worker_module
+from factory import ci_gate, config as config_module, deliver_checks, worker as worker_module
 from factory.errors import UsageError
 from support import config, git, home_dir, make_repo
 
@@ -654,6 +654,253 @@ class DeliverChecksTest(unittest.TestCase):
         finally:
             blob_srv.shutdown()
             blob_srv.server_close()
+
+    def test_ci_gate_evaluator_covers_provenance_reruns_artifacts_drift_and_preserved_checks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            bare = root / "origin.git"
+            bare.mkdir()
+            git(bare, "init", "--bare", "-q", "-b", "main")
+            repo, home = make_repo(root), home_dir(root)
+            (repo / "AGENTS.md").write_text("# Rules\n", encoding="utf-8")
+            (repo / "tests").mkdir(exist_ok=True)
+            (repo / "tests" / "test_auth.py").write_text(
+                "import unittest\nclass T(unittest.TestCase):\n    def test_ok(self): self.assertEqual(1, 1)\n",
+                encoding="utf-8",
+            )
+            git(repo, "add", ".")
+            git(repo, "commit", "-q", "-m", "base")
+            git(repo, "remote", "add", "origin", str(bare))
+            git(repo, "push", "-q", "origin", "main")
+            base_sha = git(repo, "rev-parse", "HEAD")
+            git(repo, "checkout", "-q", "-b", "feature/chat-auth")
+            git(repo, "push", "-q", "origin", "feature/chat-auth")
+            git(repo, "checkout", "-q", "-b", "task/101-auth")
+            (repo / "README.md").write_text("candidate\n", encoding="utf-8")
+            git(repo, "add", "README.md")
+            git(repo, "commit", "-q", "-m", "candidate")
+            candidate_sha = git(repo, "rev-parse", "HEAD")
+            git(repo, "push", "-q", "origin", "task/101-auth")
+            config(repo, home)
+            conf = config_module.load(config_module.RuntimePaths(repo=repo, home=home))
+            parent = {"gid": "900", "name": "Feature"}
+            child = {
+                "gid": "101", "name": "Slice", "outcome": "Deliver slice",
+                "scope": {"in_scope": "`README.md`, `tests/`", "out_of_scope": "none", "constraints": "none"},
+                "criteria": [{
+                    "id": "AC-1", "description": "Auth works", "parent_coverage": ["P-AC-1"],
+                    "verification": "python3 -m unittest discover -s tests -p test_auth.py -v",
+                }],
+            }
+            scope_detail = {"status": "deterministic-verified", "provenance": "deterministic rules enforced"}
+
+            def _make_run(
+                run_id: int, job_idx: int, name: str, *, status: str = "completed",
+                conclusion: str | None = "success", producer: str = "github-actions",
+                started_at: str = "2026-11-06T10:00:00Z", completed_at: str = "2026-11-06T10:00:05Z",
+                cand: str = candidate_sha, base: str = base_sha, tested: str = candidate_sha,
+                policy: str = base_sha, run_attempt: int | None = 1, html_url: str | None = None,
+            ) -> tuple[dict[str, Any], dict[str, Any]]:
+                jid = run_id * 100 + job_idx
+                url = html_url if html_url is not None else f"https://github.com/example/chat-bridge/actions/runs/{run_id}/job/{jid}"
+                summary = (
+                    f"candidate_sha={cand}\nbase_sha={base}\npolicy_sha={policy}\n"
+                    f"tested_sha={tested}\nrevision_kind=fast-forward-head\n"
+                    + (f"run_attempt={run_attempt}\n" if run_attempt is not None else "")
+                )
+                cr: dict[str, Any] = {
+                    "id": jid, "name": name, "head_sha": candidate_sha, "status": status,
+                    "conclusion": conclusion, "started_at": started_at, "completed_at": completed_at,
+                    "html_url": url, "details_url": url, "app": {"slug": producer},
+                    "output": {"title": name, "summary": summary, "text": f"log for {name}\n"},
+                }
+                if run_attempt is not None:
+                    cr["run_attempt"] = run_attempt
+                ev = {
+                    "workflow_run_id": run_id, "run_attempt": run_attempt if run_attempt is not None else 1,
+                    "workflow_path": ".github/workflows/ci.yml", "workflow_event": "pull_request",
+                    "workflow_head_sha": cand, "policy_sha": policy, "candidate_sha": cand,
+                    "base_sha": base, "tested_sha": tested, "revision_kind": "fast-forward-head",
+                    "check_name": name, "command": f"run {name}",
+                    "exit_code": 0 if conclusion == "success" else 1, "conclusion": conclusion or "pending",
+                    "html_url": url, "log_text": f"raw log for {name}\n",
+                }
+                return cr, ev
+
+            req_names = ("guard/gate-1", "guard/gate-2", "guard/gate-3", "criterion/AC-1")
+            child_dir = home / "deliveries" / "900" / "attempt-1" / "children" / "101"
+            with _DisposableGitHubServer(bare_repo=bare, page_size=2) as gh_ok:
+                pr_info = deliver_checks.open_and_confirm_pr(
+                    gh_ok.base_url, "tok-1", "example/chat-bridge", parent, child,
+                    "task/101-auth", candidate_sha, "feature/chat-auth", [], scope_detail, [], time.monotonic() + 30.0, 30,
+                )
+                with mock.patch("factory.ci_gate._verify_tested_revision_in_git", wraps=ci_gate._verify_tested_revision_in_git) as spy_git_rev:
+                    gate_res = ci_gate.evaluate_child_pr_ci_gate(
+                        repo=repo, home=home, child_dir=child_dir, base_url=gh_ok.base_url, token="tok-1",
+                        repo_slug="example/chat-bridge", parent=parent, child=child, conf=conf, pr_info=pr_info,
+                        head_branch="task/101-auth", candidate_sha=candidate_sha, base_branch="feature/chat-auth",
+                        base_sha=base_sha, scope_detail=scope_detail, trace=[], deadline=time.monotonic() + 30.0,
+                        limit_s=30, max_missing_polls=1, artifact_retry_delay_s=0.0, sleep_fn=lambda _: None,
+                    )
+                    self.assertEqual(spy_git_rev.call_count, 1)
+                self.assertEqual((gate_res["status"], gate_res["verified"]), ("verified", True))
+                self.assertEqual((gate_res["pr"]["pr_confirmed"], gate_res["pr"]["ci_verified"], gate_res["pr"]["verified"]), (True, True, True))
+                self.assertIn(f"`verified` for candidate `{candidate_sha}` against base `{base_sha}`", gate_res["pr"]["body"])
+                self.assertGreaterEqual(len([r for r in gh_ok.requests if r["path"].endswith("/check-runs")]), 2)
+
+                def _eval_custom(
+                    crs: list[dict[str, Any]], ev_map: dict[str, dict[str, Any]], *, expired: bool = False,
+                    omit_artifact: bool = False, extra_artifacts: list[tuple[int, dict[str, dict[str, Any]]]] | None = None,
+                    wf_overrides: dict[int, dict[str, Any]] | None = None,
+                    on_patch: Callable[[dict[str, Any]], None] | None = None,
+                    timeout_s: float = 10.0, cancel_sup: bool = False, run_attempt: int = 1,
+                    max_polls: int | None = 1,
+                ) -> dict[str, Any]:
+                    gh_ok.ci_spec = {"mode": "none"}
+                    gh_ok.check_runs_by_sha[candidate_sha] = crs
+                    gh_ok.on_patch_pull = on_patch
+                    gh_ok.workflow_runs_by_id = dict(wf_overrides or {})
+                    gh_ok.artifacts_by_run.clear()
+                    gh_ok.artifact_zips.clear()
+                    if not omit_artifact:
+                        arts = [{
+                            "id": 990, "name": "turbo-ci-evidence", "expired": expired,
+                            "archive_download_url": f"{gh_ok.base_url}/repos/example/chat-bridge/actions/artifacts/990/zip",
+                            "url": f"{gh_ok.base_url}/repos/example/chat-bridge/actions/artifacts/990",
+                        }]
+                        gh_ok.artifact_zips[990] = _build_evidence_zip(ev_map, run_id=700, run_attempt=run_attempt)
+                        for extra_id, extra_map in extra_artifacts or ():
+                            arts.append({
+                                "id": extra_id, "name": f"turbo-ci-evidence-{extra_id}", "expired": False,
+                                "archive_download_url": f"{gh_ok.base_url}/repos/example/chat-bridge/actions/artifacts/{extra_id}/zip",
+                                "url": f"{gh_ok.base_url}/repos/example/chat-bridge/actions/artifacts/{extra_id}",
+                            })
+                            gh_ok.artifact_zips[extra_id] = _build_evidence_zip(extra_map, run_id=700, run_attempt=run_attempt)
+                        gh_ok.artifacts_by_run[700] = arts
+                    return ci_gate.evaluate_child_pr_ci_gate(
+                        repo=repo, home=home, child_dir=child_dir, base_url=gh_ok.base_url, token="tok-1",
+                        repo_slug="example/chat-bridge", parent=parent, child=child, conf=conf, pr_info=pr_info,
+                        head_branch="task/101-auth", candidate_sha=candidate_sha, base_branch="feature/chat-auth",
+                        base_sha=base_sha, scope_detail=scope_detail, trace=[], deadline=time.monotonic() + timeout_s,
+                        limit_s=max(1, int(timeout_s)), poll_interval_s=0.05, max_missing_polls=1, max_polls=max_polls,
+                        artifact_retry_delay_s=0.0, sleep_fn=lambda _: None, cancel_superseded=cancel_sup,
+                    )
+
+                base_pairs = [_make_run(700, idx, n) for idx, n in enumerate(req_names, start=1)]
+                base_crs = [p[0] for p in base_pairs]
+                base_evs = {p[0]["name"]: p[1] for p in base_pairs}
+
+                # Newer queued rerun attempt MUST block reuse of older completed success deterministically
+                queued_rerun_cr, _ = _make_run(
+                    700, 5, "criterion/AC-1", status="queued", conclusion=None, started_at="", completed_at="", run_attempt=2,
+                )
+                res_queued_rerun = _eval_custom([*base_crs, queued_rerun_cr], base_evs)
+                self.assertEqual((res_queued_rerun["status"], res_queued_rerun["verified"]), ("ci-pending", False))
+                self.assertEqual(len(res_queued_rerun["checks"]), 4)
+                self.assertEqual([c["run_id"] for c in res_queued_rerun["checks"]], [70001, 70002, 70003, 70005])
+                self.assertEqual((res_queued_rerun["pr"]["pr_confirmed"], res_queued_rerun["pr"]["ci_verified"]), (True, False))
+
+                # Evaluator timeout handling: expired deadline during polling or post-poll workflow/artifact inspection returns ci-pending with observed checks
+                res_pre_poll_timeout = _eval_custom([*base_crs, queued_rerun_cr], base_evs, timeout_s=-1.0, max_polls=None)
+                self.assertEqual((res_pre_poll_timeout["status"], res_pre_poll_timeout["verified"], len(res_pre_poll_timeout["checks"])), ("ci-pending", False, 4))
+                self.assertEqual((res_pre_poll_timeout["pr"]["pr_confirmed"], res_pre_poll_timeout["pr"]["ci_verified"]), (True, False))
+
+                completed_rerun_cr, _ = _make_run(
+                    700, 6, "criterion/AC-1", status="completed", conclusion="success",
+                    started_at="2026-11-06T10:02:00Z", completed_at="2026-11-06T10:02:05Z", run_attempt=2,
+                )
+                with mock.patch("factory.deliver_checks._fetch_workflow_run", side_effect=deliver_checks.AttemptTimeoutError("attempt timed out during rerun selection")):
+                    res_sel_timeout = _eval_custom([*base_crs, completed_rerun_cr], base_evs, run_attempt=2)
+                self.assertEqual((res_sel_timeout["status"], res_sel_timeout["verified"]), ("ci-pending", False))
+                self.assertEqual([c["run_id"] for c in res_sel_timeout["checks"]], [70001, 70002, 70003, 70006])
+                self.assertEqual((res_sel_timeout["pr"]["pr_confirmed"], res_sel_timeout["pr"]["ci_verified"]), (True, False))
+
+                with mock.patch("factory.ci_gate._fetch_workflow_run", side_effect=deliver_checks.AttemptTimeoutError("attempt timed out during workflow run fetch")):
+                    res_wf_timeout = _eval_custom(base_crs, base_evs)
+                self.assertEqual((res_wf_timeout["status"], res_wf_timeout["verified"]), ("ci-pending", False))
+                self.assertEqual([c["run_id"] for c in res_wf_timeout["checks"]], [70001, 70002, 70003, 70004])
+                self.assertEqual((res_wf_timeout["pr"]["pr_confirmed"], res_wf_timeout["pr"]["ci_verified"]), (True, False))
+
+                with mock.patch("factory.ci_gate._fetch_run_evidence_artifacts", side_effect=deliver_checks.AttemptTimeoutError("attempt timed out during CI artifact download")):
+                    res_art_timeout = _eval_custom(base_crs, base_evs)
+                self.assertEqual((res_art_timeout["status"], res_art_timeout["verified"]), ("ci-pending", False))
+                self.assertEqual([c["run_id"] for c in res_art_timeout["checks"]], [70001, 70002, 70003, 70004])
+                self.assertEqual((res_art_timeout["pr"]["pr_confirmed"], res_art_timeout["pr"]["ci_verified"]), (True, False))
+
+                # Ambiguous rerun ordering (missing timestamps/attempts or contradictory attempt vs timestamp) fails closed
+                ambig_cr1, _ = _make_run(700, 4, "criterion/AC-1", conclusion="success", started_at="", completed_at="", run_attempt=None)
+                ambig_cr2, _ = _make_run(700, 5, "criterion/AC-1", conclusion="success", started_at="", completed_at="", run_attempt=None)
+                res_ambig = _eval_custom([*base_crs[:3], ambig_cr1, ambig_cr2], base_evs)
+                self.assertEqual((res_ambig["status"], res_ambig["verified"]), ("ci-evidence-invalid", False))
+
+                contradict_cr1, _ = _make_run(
+                    700, 4, "criterion/AC-1", conclusion="failure",
+                    started_at="2026-11-06T10:10:00Z", completed_at="2026-11-06T10:10:05Z", run_attempt=1,
+                )
+                contradict_cr2, _ = _make_run(
+                    700, 5, "criterion/AC-1", conclusion="success",
+                    started_at="2026-11-06T10:01:00Z", completed_at="2026-11-06T10:01:05Z", run_attempt=2,
+                )
+                res_contradict = _eval_custom([*base_crs[:3], contradict_cr1, contradict_cr2], base_evs)
+                self.assertEqual((res_contradict["status"], res_contradict["verified"]), ("ci-evidence-invalid", False))
+
+                # Superseded run cancellation scope and newer completed failure overriding older success
+                old_other_pr, _ = _make_run(
+                    698, 1, "criterion/AC-1", status="completed", conclusion="success",
+                    started_at="2026-11-06T09:49:00Z", completed_at="2026-11-06T09:49:05Z", run_attempt=1,
+                )
+                old_same_pr, _ = _make_run(
+                    699, 1, "criterion/AC-1", status="completed", conclusion="success",
+                    started_at="2026-11-06T09:50:00Z", completed_at="2026-11-06T09:50:05Z", run_attempt=1,
+                )
+                rerun_fail_cr, rerun_fail_ev = _make_run(
+                    700, 5, "criterion/AC-1", conclusion="failure",
+                    started_at="2026-11-06T10:05:00Z", completed_at="2026-11-06T10:05:05Z", run_attempt=2,
+                )
+                wfs_cancel = {
+                    698: {"id": 698, "path": ".github/workflows/ci.yml", "event": "pull_request", "run_attempt": 1, "head_branch": "task/999-other", "head_sha": candidate_sha, "pull_requests": [{"number": 99}]},
+                    699: {"id": 699, "path": ".github/workflows/ci.yml", "event": "pull_request", "run_attempt": 1, "head_branch": "task/101-auth", "head_sha": candidate_sha, "pull_requests": [{"number": 1}]},
+                    700: {"id": 700, "path": ".github/workflows/ci.yml", "event": "pull_request", "run_attempt": 2, "head_branch": "task/101-auth", "head_sha": candidate_sha, "pull_requests": [{"number": 1}]},
+                }
+                res_rerun = _eval_custom(
+                    [*base_crs[:3], old_other_pr, old_same_pr, rerun_fail_cr],
+                    {**base_evs, "criterion/AC-1": rerun_fail_ev}, wf_overrides=wfs_cancel, cancel_sup=True, run_attempt=2,
+                )
+                self.assertEqual((res_rerun["status"], res_rerun["verified"], res_rerun["cancelled_workflow_runs"]), ("ci-failed", False, [699]))
+                self.assertEqual((res_rerun["pr"]["pr_confirmed"], res_rerun["pr"]["ci_verified"]), (True, False))
+
+                # Preserved checks on ci-missing and ci-untrusted-producer
+                res_missing = _eval_custom(base_crs[:3], {k: v for k, v in base_evs.items() if k != "criterion/AC-1"})
+                self.assertEqual((res_missing["status"], len(res_missing["checks"])), ("ci-missing", 4))
+                self.assertEqual((res_missing["pr"]["pr_confirmed"], res_missing["pr"]["ci_verified"]), (True, False))
+
+                untrusted_cr, untrusted_ev = _make_run(700, 4, "criterion/AC-1", producer="builder-self-attest")
+                res_untrusted = _eval_custom([*base_crs[:3], untrusted_cr], {**base_evs, "criterion/AC-1": untrusted_ev})
+                self.assertEqual((res_untrusted["status"], len(res_untrusted["checks"])), ("ci-untrusted-producer", 4))
+                self.assertEqual((res_untrusted["pr"]["pr_confirmed"], res_untrusted["pr"]["ci_verified"]), (True, False))
+
+                # Missing policy_sha, missing workflow_path, or non-zero exit_code must NEVER be filled with expected values
+                for bad_override in ({"policy_sha": ""}, {"workflow_path": ""}, {"exit_code": 1}, {"run_attempt": 99}):
+                    bad_ev = {**base_evs["criterion/AC-1"], **bad_override}
+                    self.assertEqual(_eval_custom(base_crs, {**base_evs, "criterion/AC-1": bad_ev})["status"], "ci-evidence-invalid")
+
+                # Duplicate check in artifacts fails closed
+                res_dup = _eval_custom(base_crs, base_evs, extra_artifacts=[(991, {"criterion/AC-1": base_evs["criterion/AC-1"]})])
+                self.assertEqual(res_dup["status"], "ci-evidence-invalid")
+
+                # Drift DURING patch invalidates PR body to stale-revision; drift BEFORE patch never publishes verified
+                res_stale = _eval_custom(
+                    base_crs, base_evs, on_patch=lambda _: git(bare, "update-ref", "refs/heads/feature/chat-auth", candidate_sha),
+                )
+                self.assertEqual((res_stale["status"], res_stale["verified"]), ("stale-revision", False))
+                self.assertEqual((res_stale["pr"]["pr_confirmed"], res_stale["pr"]["ci_verified"], res_stale["pr"]["verified"]), (False, False, False))
+                self.assertIn("`stale-revision`", gh_ok.pulls[1]["body"])
+                self.assertNotIn("`verified` for candidate", gh_ok.pulls[1]["body"])
+
+                patch_bodies: list[str] = []
+                res_pre_stale = _eval_custom(base_crs, base_evs, on_patch=lambda p: patch_bodies.append(str(p.get("body") or "")))
+                self.assertEqual((res_pre_stale["status"], res_pre_stale["verified"]), ("stale-revision", False))
+                self.assertTrue(all("`verified` for candidate" not in b for b in patch_bodies))
 
 
 if __name__ == "__main__":
