@@ -70,7 +70,7 @@ def _normalize_prior_findings(child_dir: Path, home: Path, round_num: int, prior
             **prev, **raw, "finding_id": fid, "category": cat if cat in FINDING_CATEGORIES else "bug", "blocking": True, "target": target, "rule": rule,
             "title": str(prev.get("title") or raw.get("title") or rule), "evidence": orig_ev, "latest_evidence": latest_ev,
             "actionable_correction": str(raw.get("actionable_correction") or prev.get("actionable_correction") or ""),
-            "verification_command": str(raw.get("verification_command") or prev.get("verification_command") or "").strip(),
+            "verification_command": str(prev.get("verification_command") or raw.get("verification_command") or "").strip(),
             "source": str(prev.get("source") or raw.get("source") or "reviewer-agent"), "status": str(raw.get("status") or prev.get("status") or "open"),
             "introduced_in_round": intro_round, "created_round": intro_round, "introduced_in_revision": intro_rev, "created_candidate_sha": intro_rev,
             "last_seen_round": int(raw.get("last_seen_round") or raw.get("latest_round") or prev.get("last_seen_round") or intro_round),
@@ -449,7 +449,7 @@ def reconcile_review_findings(
             if not ev_hist or ev_hist[-1].get("round") != round_num or ev_hist[-1].get("evidence") != cur_ev_entry["evidence"]: ev_hist.append(cur_ev_entry)
 
         rec_claim = reconcil_map.get(stable_fid) or reconcil_map.get(fid)
-        vcmd = str((rec_claim or {}).get("verification_command") or (cur_f or {}).get("verification_command") or (old_f or {}).get("verification_command") or "").strip()
+        vcmd = str((old_f or {}).get("verification_command") or (cur_f or {}).get("verification_command") or (rec_claim or {}).get("verification_command") or "").strip()
         f_ver = f_vers.get(stable_fid) or f_vers.get(fid)
 
         claim_res = str((rec_claim or {}).get("resolution") or "").strip().lower()
@@ -701,7 +701,8 @@ def review_candidate_independently(*, repo: Path, home: Path, child_dir: Path, c
             for item in (*prior_list, *agent_findings):
                 if isinstance(item, dict) and item.get("finding_id") and item.get("blocking", True):
                     fid = str(item["finding_id"])
-                    vcmd = str((reconcils.get(fid) or {}).get("verification_command") or item.get("verification_command") or "").strip()
+                    if fid in repro_targets and repro_targets[fid].get("verification_command"): continue
+                    vcmd = str(item.get("verification_command") or (reconcils.get(fid) or {}).get("verification_command") or "").strip()
                     if vcmd: repro_targets[fid] = {**item, "verification_command": vcmd}
             for rfid, rclaim in reconcils.items():
                 if rfid not in repro_targets and rclaim.get("verification_command"):

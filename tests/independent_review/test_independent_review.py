@@ -565,6 +565,31 @@ class IndependentReviewTest(unittest.TestCase):
             r3 = run_rev(round_num=3, candidate_sha=cand3, qa_record=_valid_qa_record(cand3, base_sha), security_record=_valid_security_record(cand3, base_sha, home), agy_bin=str(agy3))
             self.assertEqual((r3["outcome"], r3["review_verified"], r3["open_finding_ids"]), ("review-passed", True, []))
 
+    def test_reconcil_m3_preserve_prior_verification_command(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo, home, base_sha, _, _, child_dir, _, _, run_rev = self._setup_workspace(root)
+            vcmd_orig = "python3 -c \"import pathlib, sys; sys.exit(0 if '# m3-real-fix' in pathlib.Path('src/chat_bridge/auth.py').read_text() else 1)\""
+            fid = independent_review.compute_review_finding_id("bug", "src/chat_bridge/auth.py", "m3-repro-rule")
+            b1 = {"category": "bug", "blocking": True, "target": "src/chat_bridge/auth.py", "rule": "m3-repro-rule", "title": "M3 bug", "evidence": "r1-m3", "actionable_correction": "Add # m3-real-fix", "verification_command": vcmd_orig}
+            agy1 = _make_fake_agy(root, "agy-m3-1", _make_staged_reviewer_script(session_id="rev-m3-1", outcome="changes-requested", assessment={**DEFAULT_ASSESSMENT, "edge_cases": {"status": "unsatisfied", "summary": "m3"}}, findings=[b1]))
+            r1 = run_rev(round_num=1, agy_bin=str(agy1))
+            self.assertEqual(r1["open_finding_ids"], [fid])
+            (repo / "src/chat_bridge/auth.py").write_text(CLEAN_AUTH_PY + "# m3-still-broken\n", encoding="utf-8"); git(repo, "add", "."); git(repo, "commit", "-q", "-m", "m3 r2 unfixed")
+            cand2 = git(repo, "rev-parse", "HEAD")
+            agy2 = _make_fake_agy(root, "agy-m3-2", _make_staged_reviewer_script(session_id="rev-m3-2", outcome="review-passed", reconciliations=[{"finding_id": fid, "resolution": "fixed", "evidence": "trivial replacement", "verification_command": "python3 -c \"pass\""}]))
+            r2 = run_rev(round_num=2, candidate_sha=cand2, qa_record=_valid_qa_record(cand2, base_sha), security_record=_valid_security_record(cand2, base_sha, home), agy_bin=str(agy2))
+            self.assertEqual((r2["outcome"], r2["review_verified"], r2["open_finding_ids"]), ("changes-requested", False, [fid]))
+            f2 = r2["blocking_findings"][0]
+            fver2 = r2["observed_verification"]["finding_verifications"][fid]
+            persisted2 = json.loads((child_dir / "prior-blockers.json").read_text(encoding="utf-8"))["findings"][0]
+            self.assertEqual((f2["verification_command"], persisted2["verification_command"], fver2["command"], fver2["ok"], f2["resolution_blocker"]), (vcmd_orig, vcmd_orig, vcmd_orig, False, "check-failed"))
+            (repo / "src/chat_bridge/auth.py").write_text(CLEAN_AUTH_PY + "# m3-real-fix\n", encoding="utf-8"); git(repo, "add", "."); git(repo, "commit", "-q", "-m", "m3 r3 fixed")
+            cand3 = git(repo, "rev-parse", "HEAD")
+            agy3 = _make_fake_agy(root, "agy-m3-3", _make_staged_reviewer_script(session_id="rev-m3-3", outcome="review-passed", reconciliations=[{"finding_id": fid, "resolution": "fixed", "evidence": "real fix verified"}]))
+            r3 = run_rev(round_num=3, candidate_sha=cand3, qa_record=_valid_qa_record(cand3, base_sha), security_record=_valid_security_record(cand3, base_sha, home), agy_bin=str(agy3))
+            self.assertEqual((r3["outcome"], r3["review_verified"], r3["open_finding_ids"]), ("review-passed", True, []))
+
 def run_disposable_demo(tmp: Path) -> dict:
     repo, home, _ = _make_disposable_product_workspace(tmp)
     base_sha = git(repo, "rev-parse", "refs/heads/main")
