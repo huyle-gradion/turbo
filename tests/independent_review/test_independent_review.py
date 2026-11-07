@@ -439,6 +439,46 @@ class IndependentReviewTest(unittest.TestCase):
             r5 = run_rev(round_num=5)
             self.assertEqual((r5["outcome"], r5["review_verified"], r5["worktree_integrity"]["candidate_modified_by_reviewer"]), ("review-passed", True, False))
 
+    def test_m6_required_checks_and_truthful_execution_recording(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo, home, _, base_sha, cand_sha, _, _, _, run_rev = self._setup_workspace(root)
+            import dataclasses
+            from unittest import mock
+            non_unit_conf = config_module.load(RuntimePaths(repo=repo, home=home))
+            non_unit_conf = dataclasses.replace(non_unit_conf, gates={**non_unit_conf.gates, "2": dataclasses.replace(non_unit_conf.gates["2"], argv=(sys.executable, "-c", "print('smoke-only')"))})
+            r1 = run_rev(round_num=1, conf=non_unit_conf)
+            names1 = [c["name"] for c in r1["observed_verification"]["checks"]]
+            self.assertIn("regression/gate-2", names1)
+            self.assertIn("regression/full-suite", names1)
+            with mock.patch("factory.ci_selection.select_ci_test_plan", return_value={"mode": "affected-only", "reason": "empty", "changed_paths": ["src/chat_bridge/auth.py"], "deleted_tests": [], "test_deletion_detected": False, "essential_guards": [], "criterion_checks": [], "affected_tests": []}):
+                r2 = run_rev(round_num=2, conf=non_unit_conf)
+                self.assertIn("regression/full-suite", [c["name"] for c in r2["observed_verification"]["checks"]])
+            git(repo, "checkout", "-q", "-b", "task/101-prot-del", base_sha)
+            (repo / "factory/ci_selection.py").parent.mkdir(parents=True, exist_ok=True)
+            (repo / "factory/ci_selection.py").write_text("# modified policy\n", encoding="utf-8")
+            (repo / "tests/test_auth.py").unlink()
+            git(repo, "add", "-A"); git(repo, "commit", "-q", "-m", "touch protected policy and delete test")
+            cand_pd = git(repo, "rev-parse", "HEAD")
+            child_pd = {**PARSED_CHILD, "scope": {**PARSED_CHILD["scope"], "in_scope": "factory/ci_selection.py, tests/test_auth.py"}}
+            r3 = run_rev(round_num=3, candidate_sha=cand_pd, child=child_pd, qa_record=_valid_qa_record(cand_pd, base_sha), security_record=_valid_security_record(cand_pd, base_sha, home))
+            fids3 = {f["finding_id"] for f in r3["blocking_findings"]}
+            self.assertTrue(any("SCOPE-DRIFT" in fid for fid in fids3))
+            self.assertTrue(any("deleted-test-coverage" in fid for fid in fids3))
+            orig_exec = worker_module.execute_stream
+            def _sb_fail(wt, argv, env, timeout_s, *, isolated_home=None, allow_network=False):
+                if not allow_network:
+                    raise worker_module.SandboxUnavailableError("landlock blocked in verify")
+                return orig_exec(wt, argv, env, timeout_s, isolated_home=isolated_home, allow_network=allow_network)
+            with mock.patch.object(worker_module, "execute_stream", side_effect=_sb_fail):
+                r4 = run_rev(round_num=4, builder_summary="All checks passed.")
+            chk4 = r4["observed_verification"]["checks"][0]
+            self.assertEqual((chk4["executed"], chk4["exit_code"], r4["builder_summary_claim"]["contradicted_by_observed_execution"]), (False, None, False))
+            slow_child = {**PARSED_CHILD, "criteria": [{**PARSED_CHILD["criteria"][0], "verification": "python3 -c \"import time; time.sleep(5)\""}]}
+            r5 = run_rev(round_num=5, child=slow_child, deadline=time.monotonic() + 1.2, limit_s=1, builder_summary="All checks passed.")
+            chk5 = next(c for c in r5["observed_verification"]["checks"] if c["kind"] == "criterion")
+            self.assertEqual((chk5["executed"], chk5.get("completed"), chk5["timed_out"], chk5["ok"], r5["builder_summary_claim"]["contradicted_by_observed_execution"]), (True, False, True, False, True))
+
 
 def run_disposable_demo(tmp: Path) -> dict:
     repo, home, _ = _make_disposable_product_workspace(tmp)

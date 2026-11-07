@@ -277,21 +277,27 @@ def _run_observed_verification(
         cid, vcmd = str(crit.get("id") or "AC").strip(), str(crit.get("verification") or "").strip()
         argv = None if ci_selection.WEAKENED_CMD_RE.search(vcmd) else deliver_checks._verification_argv(vcmd)
         specs.append((f"criterion/{cid}", "criterion", cid, argv, vcmd))
-    if plan.get("mode") == "affected-only" and (aff := tuple(str(t).strip() for t in (plan.get("affected_tests") or ()) if str(t).strip())):
-        specs.append(("regression/affected-tests", "regression", "regression-suite", (sys.executable, "-m", "unittest", *aff, "-v"), f"unittest {' '.join(aff)}"))
     if (gate2 := conf.gates.get("2")) is not None and gate2.kind == "command" and gate2.argv:
         specs.append(("regression/gate-2", "regression", "gate-2", tuple(gate2.argv), " ".join(gate2.argv)))
-    elif plan.get("mode") == "full-suite":
-        specs.append(("regression/full-suite", "regression", "regression-suite", (sys.executable, "-m", "unittest", "discover", "-s", "tests", "-v"), "python3 -m unittest discover -s tests -v"))
+    aff = tuple(str(t).strip() for t in (plan.get("affected_tests") or ()) if str(t).strip())
+    if plan.get("mode") == "affected-only" and aff:
+        specs.append(("regression/affected-tests", "regression", "regression-suite", (sys.executable, "-m", "unittest", *aff, "-v"), f"unittest {' '.join(aff)}"))
+    else:
+        g2_argv = tuple(gate2.argv) if gate2 is not None and gate2.kind == "command" and gate2.argv else ()
+        if not ("unittest" in g2_argv and "discover" in g2_argv):
+            specs.append(("regression/full-suite", "regression", "regression-suite", (sys.executable, "-m", "unittest", "discover", "-s", "tests", "-v"), "python3 -m unittest discover -s tests -v"))
 
     checks, gaps = [], []
+    for dt in plan.get("deleted_tests") or ():
+        gaps.append(_gap_finding(str(dt), "deleted-test-coverage", f"Candidate deleted test file {dt}", f"deleted test path {dt!r}",
+                                 f"Restore test coverage in {dt} or justify replacement without deleting test coverage.", "observed-verification"))
     if not criteria_list:
         gaps.append(_gap_finding("criteria", "missing-criteria", "Sub-task has no acceptance criteria to verify", "child.criteria is empty",
                                  "Define executable acceptance criteria on the sub-task before independent review.", "observed-verification"))
     if not specs:
         gaps.append(_gap_finding("verification-plan", "no-executable-checks", "No executable verification checks configured", f"0 checks on {candidate_sha}",
                                  "Configure required criterion and regression checks before independent review.", "observed-verification"))
-    all_ok = bool(criteria_list) and bool(specs)
+    all_ok = bool(criteria_list) and bool(specs) and not bool(plan.get("deleted_tests"))
     for name, kind, concern_id, argv, raw_cmd in specs:
         stem = f"ind-verify-{SLUG_RE.sub('-', name.lower()).strip('-')}"
         if not argv:
@@ -299,34 +305,36 @@ def _run_observed_verification(
             ev_path = write_evidence(verify_dir, stem, msg, home)
             all_ok = False
             checks.append({"name": name, "kind": kind, "assesses": concern_id, "command": redact_value(raw_cmd, secrets), "argv": [],
-                           "executed": False, "exit_code": None, "ok": False, "timed_out": False, "duration_ms": 0, "head_sha": candidate_sha,
+                           "executed": False, "completed": False, "exit_code": None, "ok": False, "timed_out": False, "duration_ms": 0, "head_sha": candidate_sha,
                            "output_path": str(ev_path), "output_sha256": runner.digest_text(msg), "output_excerpt": msg.strip()[:400],
                            "provenance": "observed-independent-verification"})
             gaps.append(_gap_finding(concern_id, "unexecutable-check", f"Missing or unexecutable check for {concern_id}", msg.strip(),
                                      f"Provide an executable verification command for {concern_id} without skip flags.", "observed-verification"))
             continue
+        executed, completed = True, True
         try:
             timeout_s = max(1, int(math.ceil(remaining_seconds(deadline, f"independent verification {name}", limit_s))))
             code, out_s, err_s, elapsed_ms, timed_out = worker_module.execute_stream(worktree, argv, env, timeout_s, isolated_home=verify_home, allow_network=False)
+            completed = not timed_out
         except (deliver_checks.AttemptTimeoutError, TimeoutError) as exc:
-            code, out_s, err_s, elapsed_ms, timed_out = 124, "", f"[factory] check timed out: {exc}\n", 0, True
+            code, out_s, err_s, elapsed_ms, timed_out, executed, completed = 124, "", f"[factory] check timed out: {exc}\n", 0, True, True, False
         except (worker_module.SandboxUnavailableError, OSError) as exc:
-            code, out_s, err_s, elapsed_ms, timed_out = 1, "", f"[factory] check execution error: {exc}\n", 0, False
+            code, out_s, err_s, elapsed_ms, timed_out, executed, completed = None, "", f"[factory] check execution error: {exc}\n", 0, False, False, False
         combined = redact_value((out_s + err_s).strip() + "\n", secrets)
         ev_path = write_evidence(verify_dir, stem, combined, home)
-        ok = code == 0 and not timed_out
+        ok = executed and completed and code == 0 and not timed_out
         all_ok = all_ok and ok
         checks.append({"name": name, "kind": kind, "assesses": concern_id, "command": redact_value(raw_cmd, secrets),
-                       "argv": list(redact_value(list(argv), secrets)), "executed": not timed_out, "exit_code": code, "ok": ok,
+                       "argv": list(redact_value(list(argv), secrets)), "executed": executed, "completed": completed, "exit_code": code, "ok": ok,
                        "timed_out": timed_out, "duration_ms": elapsed_ms, "head_sha": candidate_sha, "output_path": str(ev_path),
                        "output_sha256": runner.digest_text(combined), "output_excerpt": combined.strip()[:400],
                        "provenance": "observed-independent-verification"})
         if not ok:
-            rule = "check-timed-out" if timed_out else "check-failed"
-            gaps.append(_gap_finding(concern_id, rule, f"Observed verification check {name} {'timed out' if timed_out else 'failed'} (exit {code})",
+            rule = "check-timed-out" if timed_out else ("check-not-executed" if not executed else "check-failed")
+            gaps.append(_gap_finding(concern_id, rule, f"Observed verification check {name} {'timed out' if timed_out else ('could not execute' if not executed else f'failed (exit {code})')}",
                                      f"command={raw_cmd!r} exit_code={code} output_path={ev_path}: {combined.strip()[:240]}",
                                      f"Fix candidate {candidate_sha} so `{raw_cmd}` exits 0 within the timeout.", "observed-verification"))
-    return {"executed": True, "ok": all_ok and len(gaps) == 0, "head_sha": candidate_sha, "selection_plan": plan,
+    return {"executed": any(c["executed"] for c in checks), "ok": all_ok and len(gaps) == 0, "head_sha": candidate_sha, "selection_plan": plan,
             "checks": checks, "verification_gaps": gaps, "provenance": "observed-independent-verification"}
 
 
@@ -476,9 +484,8 @@ def review_candidate_independently(
         del_res = git_timed(worktree, deadline, limit_s, "diff deleted", "diff", "--diff-filter=D", "--name-only", base_sha, resolved_sha)
         deleted_paths = tuple(p for ln in (del_res.output.splitlines() if del_res.ok else ()) if (p := ln.strip().strip("/")))
         diff_info = inspect_diff_categories(worktree, base_sha, resolved_sha, deadline, limit_s)
-        gate3 = conf.gates.get("3")
         scope_ok, scope_violations, scope_detail = evaluate_scope(
-            tuple(diff_info["changed_paths"]), child, gate3.paths if gate3 is not None and gate3.kind == "protected-paths" else ())
+            tuple(diff_info["changed_paths"]), child, ci_selection.protected_chain_paths(conf))
         diff_res = git_timed(worktree, deadline, limit_s, "independent review diff", "diff", "--binary", base_sha, resolved_sha)
         diff_ok = fetch_res.ok and rev_res.ok and name_status.ok and diff_res.ok and bool(diff_res.output.strip())
         if not diff_ok:
@@ -624,7 +631,7 @@ def review_candidate_independently(
             "role_issues": role_issues, "protocol_ordering": protocol_ordering, "failure_hypotheses": hypotheses,
             "builder_summary_claim": {
                 "summary": builder_summary, "treated_as_execution_evidence": False,
-                "contradicted_by_observed_execution": bool(summary_norm and (not obs_ver["ok"] or not qa_eval["verified"] or not sec_eval["verified"] or blocking_findings)),
+                "contradicted_by_observed_execution": bool(summary_norm and any(c.get("executed") and not c.get("ok") for c in (obs_ver.get("checks") or []))),
             },
             "inspected_scope": {
                 "changed_paths": diff_info["changed_paths"], "deleted_paths": list(deleted_paths),
