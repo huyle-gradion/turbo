@@ -327,7 +327,7 @@ def evaluate_independent_review_prerequisite(
         for fp in (p1_p, p1_out, p2_p, p2_out):
             if fp.is_symlink() or not fp.is_file() or (home is not None and not fp.resolve().is_relative_to(home.resolve())):
                 return _fail("invalid-review-protocol", f"missing or untrusted protocol artifact {fp}", historical_blockers=all_hist)
-        p1_prompt_txt = p1_p.read_text(encoding="utf-8", errors="replace")
+        p1_prompt_txt, p2_prompt_txt = p1_p.read_text(encoding="utf-8", errors="replace"), p2_p.read_text(encoding="utf-8", errors="replace")
         _, p1_res, p1_perr = worker_module.parse_stream_events(p1_out.read_text(encoding="utf-8", errors="replace"))
         _, p2_res, p2_perr = worker_module.parse_stream_events(p2_out.read_text(encoding="utf-8", errors="replace"))
     except (errors_module.FactoryError, OSError) as exc:
@@ -351,37 +351,47 @@ def evaluate_independent_review_prerequisite(
     safety = review_record.get("safety")
     if not isinstance(safety, dict) or safety.get("sandbox_flag") != "--sandbox" or safety.get("permission_mode") != "auto" or safety.get("bypass_permissions_used") is not False or not worker_module.probes_passed(safety.get("probes") or []):
         return _fail("invalid-review", "independent review safety probes or sandbox configuration failed", historical_blockers=all_hist)
+    if repo is None or home is None or not isinstance(child, dict) or conf is None:
+        return _fail("invalid-review", "missing required repo, home, child, or conf context for independent review verification", historical_blockers=all_hist)
+    dl, secrets = deadline or (time.monotonic() + 10.0), collect_redaction_secrets()
+    auth_diff_info = ir_pkg.inspect_diff_categories(repo, base_sha, candidate_sha, dl, limit_s)
+    auth_scope_ok, _, auth_scope_det = ir_pkg.evaluate_scope(tuple(auth_diff_info["changed_paths"]), child, ci_selection.protected_chain_paths(conf))
+    auth_diff_res = ir_pkg.git_timed(repo, dl, limit_s, "verify review diff", "diff", "--binary", base_sha, candidate_sha)
+    auth_diff_txt = redact_value(auth_diff_res.output + ("\n" if not auth_diff_res.output.endswith("\n") else ""), secrets) if auth_diff_res.ok else ""
+    auth_stds = redact_value(ir_pkg.load_project_standards(repo, base_sha, child, conf, dl, limit_s), secrets)
     scope_obj, stds = review_record.get("inspected_scope"), review_record.get("applicable_standards")
-    if not isinstance(scope_obj, dict) or scope_obj.get("deterministic_ok") is not True or scope_obj.get("scope_status") in ("violation", "diff-failed", "operational-failure"):
+    if not isinstance(scope_obj, dict) or scope_obj.get("deterministic_ok") is not True or scope_obj.get("scope_status") in ("violation", "diff-failed", "operational-failure") or not auth_scope_ok or scope_obj.get("changed_paths") != auth_diff_info["changed_paths"] or scope_obj.get("scope_status") != auth_scope_det["status"]:
         return _fail("scope-violation", "candidate scope or diff inspection failed", historical_blockers=all_hist)
     if (diff_err := _verify_file_digest(scope_obj.get("diff_path"), scope_obj.get("diff_sha256"), home, "reviewed diff")) is not None:
         return _fail("invalid-review-protocol", diff_err, historical_blockers=all_hist)
     diff_txt = Path(str(scope_obj["diff_path"])).read_text(encoding="utf-8", errors="replace")
-    if not diff_txt.strip() or diff_txt.strip() not in p1_prompt_txt:
-        return _fail("invalid-review-protocol", "phase-1 prompt did not include exact base-to-candidate diff", historical_blockers=all_hist)
-    if not isinstance(stds, list) or not stds or any(not isinstance(s, dict) or s.get("standard_sha") != base_sha or s.get("enforced") is not True for s in stds):
-        return _fail("invalid-review", "applicable project standards missing or not bound to base_sha", historical_blockers=all_hist)
-    if isinstance(child, dict):
-        exp_p1 = redact_value(ir_pkg._render_phase1_prompt(child, base_sha, candidate_sha, diff_txt, stds), collect_redaction_secrets())
-        if pre_diff_p1 != exp_p1.split("Exact Base-to-Candidate Diff:", 1)[0]:
-            return _fail("invalid-review-protocol", "phase-1 prompt pre-diff section does not match canonical summary-free template", historical_blockers=all_hist)
+    if not auth_diff_res.ok or not diff_txt.strip() or diff_txt != auth_diff_txt or diff_txt.strip() not in p1_prompt_txt:
+        return _fail("invalid-review-protocol", "phase-1 prompt or reviewed diff did not match authoritative base-to-candidate diff", historical_blockers=all_hist)
+    if not isinstance(stds, list) or not stds or any(not isinstance(s, dict) or s.get("standard_sha") != base_sha or s.get("enforced") is not True for s in stds) or stds != auth_stds:
+        return _fail("invalid-review", "applicable project standards missing or do not match authoritative base_sha standards", historical_blockers=all_hist)
     assess, b_claim, obs = review_record.get("assessment"), review_record.get("builder_summary_claim"), review_record.get("observed_verification")
+    b_sum = str((b_claim if isinstance(b_claim, dict) else {}).get("summary") or "")
+    obs_checks = (obs if isinstance(obs, dict) else {}).get("checks")
+    derived_contra = bool(b_sum.strip() and isinstance(obs_checks, list) and any(not isinstance(c, dict) or not (c.get("ok") is True and type(c.get("exit_code")) is int and c.get("exit_code") == 0 and not bool(c.get("timed_out"))) for c in obs_checks))
+    if not isinstance(b_claim, dict) or b_claim.get("treated_as_execution_evidence") is not False or b_claim.get("contradicted_by_observed_execution") is not False or derived_contra:
+        return _fail("unsupported-success-claim", "builder summary claim was contradicted by observed execution or treated as evidence", historical_blockers=all_hist)
+    exp_p1 = redact_value(ir_pkg._render_phase1_prompt(child, base_sha, candidate_sha, auth_diff_txt, auth_stds), secrets)
+    exp_hyps_sec = "Persisted Phase-1 Hypotheses:\n" + "\n".join(f"- {h}" for h in hyps) + "\n"
+    exp_bsum_sec = f"Builder Summary (untrusted claim):\n{b_sum or '(none provided)'}\nExact Base-to-Candidate Diff:\n{auth_diff_txt}"
+    if pre_diff_p1 != exp_p1.split("Exact Base-to-Candidate Diff:", 1)[0] or "PHASE: 2" not in p2_prompt_txt or exp_hyps_sec not in p2_prompt_txt or exp_bsum_sec not in p2_prompt_txt:
+        return _fail("invalid-review-protocol", "phase-1 or phase-2 prompt does not match canonical protocol inputs", historical_blockers=all_hist)
     if not isinstance(assess, dict) or any(not isinstance(assess.get(k), dict) or assess[k].get("status") != "satisfied" or not str(assess[k].get("summary") or "").strip() for k in ir_pkg.ASSESSMENT_KEYS):
         return _fail("changes-requested", "one or more required assessment dimensions are unsatisfied or missing", historical_blockers=all_hist)
-    if not isinstance(b_claim, dict) or b_claim.get("treated_as_execution_evidence") is not False or b_claim.get("contradicted_by_observed_execution") is not False:
-        return _fail("unsupported-success-claim", "builder summary claim was contradicted by observed execution or treated as evidence", historical_blockers=all_hist)
     if not isinstance(obs, dict) or obs.get("executed") is not True or obs.get("ok") is not True or obs.get("head_sha") != candidate_sha or bool(obs.get("verification_gaps")):
         return _fail("verification-failed", "observed independent verification did not pass on candidate", historical_blockers=all_hist)
-    obs_checks = obs.get("checks")
     if not isinstance(obs_checks, list) or not obs_checks or any(not isinstance(c, dict) for c in obs_checks):
         return _fail("verification-failed", "observed independent verification executed no checks", historical_blockers=all_hist)
     if not any(c.get("kind") == "criterion" for c in obs_checks) or not any(c.get("kind") in ("regression", "guard") for c in obs_checks):
         return _fail("verification-failed", "observed independent verification is missing criterion or regression/guard checks", historical_blockers=all_hist)
-    if isinstance(child, dict):
-        req_cids = {str(cr.get("id") or "AC").strip() for cr in (child.get("criteria") or ()) if isinstance(cr, dict)}
-        exec_cids = {str(c.get("assesses") or "").strip() for c in obs_checks if c.get("kind") == "criterion"}
-        if not req_cids or not req_cids.issubset(exec_cids):
-            return _fail("verification-failed", "observed independent verification did not cover all child acceptance criteria", historical_blockers=all_hist)
+    req_cids = {str(cr.get("id") or "AC").strip() for cr in (child.get("criteria") or ()) if isinstance(cr, dict)}
+    exec_cids = {str(c.get("assesses") or "").strip() for c in obs_checks if c.get("kind") == "criterion"}
+    if not req_cids or not req_cids.issubset(exec_cids):
+        return _fail("verification-failed", "observed independent verification did not cover all child acceptance criteria", historical_blockers=all_hist)
     for c in obs_checks:
         if (chk_err := ir_pkg._verify_stored_check(c, candidate_sha, home)) is not None:
             return _fail("verification-failed", chk_err, historical_blockers=all_hist)

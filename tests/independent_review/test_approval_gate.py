@@ -437,6 +437,24 @@ class ApprovalGateGroup1Test(unittest.TestCase):
             self.assertEqual((res_bclaim["delivery_approved"], res_bclaim["approved_revision"], res_bclaim["status"]), (False, None, "unsupported-success-claim"))
             res_bclaim_tampered = run_gate("claim-builder-tampered", review_record={**valid_rev, "builder_summary_claim": {"summary": "passed", "treated_as_execution_evidence": True, "contradicted_by_observed_execution": False}})
             self.assertEqual((res_bclaim_tampered["delivery_approved"], res_bclaim_tampered["status"]), (False, "unsupported-success-claim"))
+            concealed_rev = {**valid_rev, "builder_summary_claim": {"summary": "All checks passed.", "treated_as_execution_evidence": False, "contradicted_by_observed_execution": False}, "observed_verification": {**valid_rev["observed_verification"], "ok": True, "checks": [{**valid_rev["observed_verification"]["checks"][0], "ok": False, "exit_code": 1}, *valid_rev["observed_verification"]["checks"][1:]]}}
+            self.assertEqual((run_gate("m4-concealed-contra", review_record=concealed_rev)["delivery_approved"], run_gate("m4-concealed-contra", review_record=concealed_rev)["status"]), (False, "unsupported-success-claim"))
+
+            # M4: substituted review inputs (stripped standards, older diff, out-of-scope marked acceptable, unrelated Phase-2 prompt, missing context)
+            old_diff_p, bad_p1_p, bad_p2_p = home / "m4-old.diff", home / "m4-p1.txt", home / "m4-p2.txt"
+            old_diff_txt = "diff --git a/src/chat_bridge/auth.py b/src/chat_bridge/auth.py\n--- a/src/chat_bridge/auth.py\n+++ b/src/chat_bridge/auth.py\n@@ -1 +1 @@\n-# old\n+# new\n"
+            old_diff_p.write_text(old_diff_txt, encoding="utf-8")
+            bad_p1_p.write_text(independent_review._render_phase1_prompt(PARSED_CHILD, base_sha, cand_sha, old_diff_txt, valid_rev["applicable_standards"]), encoding="utf-8")
+            bad_p2_p.write_text("Role: independent-reviewer\nPHASE: 2\nUnrelated prompt\n", encoding="utf-8")
+            for m4_label, m4_over, m4_exp in (
+                ("stripped-stds", {"review_record": {**valid_rev, "applicable_standards": valid_rev["applicable_standards"][:1]}}, "invalid-review"),
+                ("older-diff", {"review_record": {**valid_rev, "inspected_scope": {**valid_rev["inspected_scope"], "diff_path": str(old_diff_p), "diff_sha256": runner.digest_text(old_diff_txt)}, "protocol_ordering": {**valid_rev["protocol_ordering"], "phase_1_prompt_path": str(bad_p1_p)}}}, "invalid-review-protocol"),
+                ("false-in-scope", {"child": {**PARSED_CHILD, "scope": {**PARSED_CHILD["scope"], "in_scope": "src/chat_bridge/auth.py"}}, "review_record": valid_rev}, "scope-violation"),
+                ("unrelated-p2", {"review_record": {**valid_rev, "protocol_ordering": {**valid_rev["protocol_ordering"], "phase_2_prompt_path": str(bad_p2_p)}}}, "invalid-review-protocol"),
+            ):
+                m4_res = run_gate(f"m4-{m4_label}", **m4_over)
+                self.assertEqual((m4_res["delivery_approved"], m4_res["status"]), (False, m4_exp), m4_label)
+            self.assertFalse(independent_review.evaluate_approval_gate(candidate_sha=cand_sha, base_sha=base_sha, ci_record=ci_ok, qa_record=qa_ok, security_record=sec_ok, review_record=valid_rev, repo=None, home=home, child_dir=child_dir / "m4-no-repo", child=PARSED_CHILD, conf=conf)["delivery_approved"])
 
             vcmd_fail = "python3 -c \"import pathlib, sys; sys.exit(0 if '# ac4-never-added' in pathlib.Path('src/chat_bridge/auth.py').read_text() else 1)\""
             fid_ac4 = independent_review.compute_review_finding_id("bug", "src/chat_bridge/auth.py", "ac4-unfixed-bug")
