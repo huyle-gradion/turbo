@@ -199,6 +199,85 @@ class IndependentReviewTest(unittest.TestCase):
             self.assertFalse(path_only_rec["protocol_ordering"]["phase_1_included_exact_diff"])
             self.assertFalse(path_only_rec["protocol_ordering"]["phase_2_executed"])
 
+    def test_ac2_substantive_assessment_observed_verification_and_upstream_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo, home, base_sha, cand_sha, conf, child_dir = self._setup_workspace(root)
+            qa_rec = _valid_qa_record(cand_sha, base_sha)
+            sec_rec = _valid_security_record(cand_sha, base_sha, home)
+            good_agy = _make_fake_agy(root, "agy-good-ac2", _make_staged_reviewer_script(session_id="rev-ac2"))
+
+            def run_rev(**overrides):
+                kwargs = {
+                    "repo": repo, "home": home, "child_dir": child_dir, "child": PARSED_CHILD, "conf": conf,
+                    "base_sha": base_sha, "candidate_sha": cand_sha, "builder_session_id": "builder-1",
+                    "builder_summary": "All checks passed with 0 failures.",
+                    "qa_record": qa_rec, "security_record": sec_rec, "agy_bin": str(good_agy),
+                    "deadline": time.monotonic() + 30.0, "limit_s": 30,
+                }
+                kwargs.update(overrides)
+                return independent_review.review_candidate_independently(**kwargs)
+
+            valid = run_rev(round_num=1)
+            self.assertEqual((valid["outcome"], valid["review_verified"]), ("review-passed", True))
+            for dim in independent_review.ASSESSMENT_KEYS:
+                self.assertEqual(valid["assessment"][dim]["status"], "satisfied")
+            obs_checks = valid["observed_verification"]["checks"]
+            self.assertTrue(any(c["name"] == "criterion/AC-1" and c["assesses"] == "AC-1" and c["ok"] for c in obs_checks))
+            for chk in obs_checks:
+                self.assertTrue(Path(chk["output_path"]).is_file())
+                self.assertEqual(chk["head_sha"], cand_sha)
+
+            # Misleading "all checks passed" builder summary contradicted by actual failing check
+            failing_child = {
+                **PARSED_CHILD,
+                "criteria": [{**PARSED_CHILD["criteria"][0], "verification": "python3 -c \"import sys; sys.exit(1)\""}],
+            }
+            misleading = run_rev(round_num=2, child=failing_child, builder_summary="All checks passed! 100% green.")
+            self.assertEqual((misleading["outcome"], misleading["review_verified"]), ("changes-requested", False))
+            self.assertFalse(misleading["observed_verification"]["ok"])
+            self.assertTrue(misleading["builder_summary_claim"]["contradicted_by_observed_execution"])
+            self.assertFalse(misleading["builder_summary_claim"]["treated_as_execution_evidence"])
+            self.assertTrue(any(f["category"] == "verification-gap" and f["rule"] == "check-failed" for f in misleading["blocking_findings"]))
+
+            # Absent / unexecutable required check
+            unexec_child = {**PARSED_CHILD, "criteria": [{**PARSED_CHILD["criteria"][0], "verification": ""}]}
+            absent_chk = run_rev(round_num=3, child=unexec_child)
+            self.assertEqual((absent_chk["outcome"], absent_chk["review_verified"]), ("changes-requested", False))
+            self.assertTrue(any(f["rule"] == "unexecutable-check" for f in absent_chk["blocking_findings"]))
+
+            # Stale QA and stale security evidence cannot become a successful review
+            stale_qa = {**qa_rec, "candidate_sha": "0" * 40}
+            stale_sec = {**sec_rec, "reviewed_revision": "0" * 40}
+            stale_res = run_rev(round_num=4, qa_record=stale_qa, security_record=stale_sec)
+            self.assertEqual((stale_res["outcome"], stale_res["review_verified"]), ("changes-requested", False))
+            self.assertEqual(stale_res["upstream_evidence"]["automated_qa"]["status"], "stale-qa-evidence")
+            self.assertEqual(stale_res["upstream_evidence"]["security_review"]["status"], "stale-security-review")
+            gap_rules = {f["rule"] for f in stale_res["blocking_findings"]}
+            self.assertIn("stale-qa-evidence", gap_rules)
+            self.assertIn("stale-security-evidence", gap_rules)
+
+            # Missing QA/security evidence and failed QA evidence
+            missing_up = run_rev(round_num=5, qa_record=None, security_record=None)
+            self.assertEqual((missing_up["outcome"], missing_up["review_verified"]), ("changes-requested", False))
+            self.assertFalse(missing_up["upstream_evidence"]["automated_qa"]["verified"])
+            self.assertFalse(missing_up["upstream_evidence"]["security_review"]["verified"])
+
+            # Timeout during observed check and malformed phase-2 reviewer output
+            orig_exec = independent_review.worker_module.execute_stream
+            def _timeout_on_verify(cwd, argv, env, timeout_s, **kw):
+                if "unittest" in argv:
+                    return 124, "", "timed out\n", 1000, True
+                return orig_exec(cwd, argv, env, timeout_s, **kw)
+            with unittest.mock.patch.object(independent_review.worker_module, "execute_stream", side_effect=_timeout_on_verify):
+                to_rec = run_rev(round_num=6)
+            self.assertEqual((to_rec["outcome"], to_rec["review_verified"]), ("changes-requested", False))
+            self.assertTrue(any(f["rule"] == "check-timed-out" for f in to_rec["blocking_findings"]))
+
+            bad_p2_agy = _make_fake_agy(root, "agy-bad-p2", _make_staged_reviewer_script(assessment={"requirement_compliance": {"status": "satisfied", "summary": "only 1"}}))
+            bad_p2_rec = run_rev(round_num=7, agy_bin=str(bad_p2_agy))
+            self.assertEqual((bad_p2_rec["outcome"], bad_p2_rec["review_verified"]), ("invalid-review", False))
+
 
 if __name__ == "__main__":
     unittest.main()
