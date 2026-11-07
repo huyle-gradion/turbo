@@ -172,7 +172,7 @@ class IndependentReviewTest(unittest.TestCase):
             self.assertEqual((r_five["outcome"], r_five["review_verified"], len(r_five["blocking_findings"]), len(r_five["non_blocking_suggestions"])), ("changes-requested", False, 4, 1))
             self.assertEqual({f["category"] for f in r_five["findings"]}, independent_review.FINDING_CATEGORIES)
             sugg_only_agy = _make_fake_agy(root, "agy-sugg-only", _make_staged_reviewer_script(session_id="rev-ac3-2", outcome="review-passed", findings=[five_cat_findings[4]]))
-            r_sugg = run_rev(round_num=2, agy_bin=str(sugg_only_agy))
+            r_sugg = run_rev(round_num=2, prior_findings=[], agy_bin=str(sugg_only_agy))
             self.assertEqual((r_sugg["outcome"], r_sugg["review_verified"], r_sugg["delivery_approved"], len(r_sugg["blocking_findings"]), len(r_sugg["non_blocking_suggestions"])), ("review-passed", True, False, 0, 1))
             f_pos1 = [{"finding_id": "LINE-10-POS-0", "category": "bug", "blocking": True, "target": "src/chat_bridge/auth.py", "rule": "empty-token-accepted", "line": 10, "title": "Empty token bug", "evidence": "line 10: return {'sub': token}", "actionable_correction": "Reject empty token."}, five_cat_findings[0]]
             f_pos2 = [five_cat_findings[0], {"finding_id": "LINE-42-POS-1", "category": "bug", "blocking": True, "target": "src/chat_bridge/auth.py", "rule": "empty-token-accepted", "line": 42, "title": "Empty token bug shifted", "evidence": "line 42: return {'sub': token}", "actionable_correction": "Reject empty token."}]
