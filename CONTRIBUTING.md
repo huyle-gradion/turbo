@@ -77,7 +77,7 @@ bash scripts/smoke.sh
 bash scripts/smoke-turbo.sh
 ```
 
-The unit suite and both smoke scripts use disposable synthetic repositories. They must not need a model account, provider credentials, a live host session, or network access.
+The unit suite and both smoke scripts use disposable synthetic repositories. They must not need a model account, provider credentials, a live host session, or network access. During iterative TDD, run the targeted test for the behavior being changed, then affected module and integration tests; before final handoff, run the full required suite and both smoke scripts once on the final candidate. In CI, `push` to `main` and pull requests with shared/cross-cutting changes, unmapped paths, or test deletions run the full suite and both smoke scripts, while narrow pull requests run essential safety guards, mapped criterion checks, explicit dependency-mapped regression tests (`factory.ci_selection.select_ci_test_plan`), and both smoke scripts.
 
 ### Initial import verification staging
 
