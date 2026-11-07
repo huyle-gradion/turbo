@@ -479,6 +479,24 @@ class IndependentReviewTest(unittest.TestCase):
             chk5 = next(c for c in r5["observed_verification"]["checks"] if c["kind"] == "criterion")
             self.assertEqual((chk5["executed"], chk5.get("completed"), chk5["timed_out"], chk5["ok"], r5["builder_summary_claim"]["contradicted_by_observed_execution"]), (True, False, True, False, True))
 
+    def test_m7_coherent_actionable_review_findings(self) -> None:
+        unsat = {**DEFAULT_ASSESSMENT, "edge_cases": {"status": "unsatisfied", "summary": "Missing edge case."}}
+        _, _, _, i1 = independent_review._parse_phase2_response(json.dumps({"outcome": "changes-requested", "assessment": unsat, "findings": []}))
+        self.assertTrue(i1)
+        _, _, _, i2 = independent_review._parse_phase2_response(json.dumps({"outcome": "review-passed", "assessment": unsat, "findings": []}))
+        self.assertTrue(i2)
+        for bad_blk in ("true", 1, None):
+            _, _, _, ib = independent_review._parse_phase2_response(json.dumps({"outcome": "changes-requested", "assessment": unsat, "findings": [
+                {"category": "bug", "blocking": bad_blk, "target": "src/a.py", "rule": "r1", "title": "t", "evidence": "e", "actionable_correction": "c"}]}))
+            self.assertTrue(ib)
+        for bad_t, bad_r in (("---", "valid-rule"), ("src/a.py", "???")):
+            _, _, _, ip = independent_review._parse_phase2_response(json.dumps({"outcome": "changes-requested", "assessment": unsat, "findings": [
+                {"category": "bug", "blocking": True, "target": bad_t, "rule": bad_r, "title": "t", "evidence": "e", "actionable_correction": "c"}]}))
+            self.assertTrue(ip)
+        out_ok, _, f_ok, i_ok = independent_review._parse_phase2_response(json.dumps({"outcome": "changes-requested", "assessment": unsat, "findings": [
+            {"category": "bug", "blocking": True, "target": "src/a.py", "rule": "null-deref", "title": "Null", "evidence": "line 9", "actionable_correction": "Guard None."}]}))
+        self.assertEqual((out_ok, len(f_ok), i_ok, f_ok[0]["finding_id"]), ("changes-requested", 1, [], "REV-BUG-src-a-py-null-deref"))
+
 
 def run_disposable_demo(tmp: Path) -> dict:
     repo, home, _ = _make_disposable_product_workspace(tmp)

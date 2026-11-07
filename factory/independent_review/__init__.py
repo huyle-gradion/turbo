@@ -229,15 +229,16 @@ def _parse_phase2_response(response_text: str) -> tuple[str | None, dict[str, di
         cat, raw_blk = str(raw.get("category") or "").strip(), raw.get("blocking")
         if cat not in FINDING_CATEGORIES:
             issues.append(f"finding[{idx}] has unsupported category {cat!r}"); continue
-        if (cat == "non-blocking-suggestion" and raw_blk is True) or (cat != "non-blocking-suggestion" and raw_blk is False):
+        if not isinstance(raw_blk, bool) or (cat == "non-blocking-suggestion" and raw_blk is True) or (cat != "non-blocking-suggestion" and raw_blk is False):
             issues.append(f"finding[{idx}] category {cat!r} conflicts with blocking={raw_blk!r}"); continue
-        blocking = cat != "non-blocking-suggestion"
+        blocking = raw_blk
         target = str(raw.get("target") or raw.get("file_path") or raw.get("criterion_id") or "").strip()
         rule = str(raw.get("rule") or "").strip()
         title = str(raw.get("title") or rule or cat).strip()
         evidence, correction = str(raw.get("evidence") or "").strip(), str(raw.get("actionable_correction") or "").strip()
-        if blocking and (not target or not rule or not evidence or not correction):
-            issues.append(f"blocker finding[{idx}] requires non-empty target, rule, concrete evidence, and actionable_correction"); continue
+        tgt_slug, rule_slug = SLUG_RE.sub("-", target.lower()).strip("-"), SLUG_RE.sub("-", rule.lower()).strip("-")
+        if blocking and (not tgt_slug or not rule_slug or not evidence or not correction):
+            issues.append(f"blocker finding[{idx}] requires alphanumeric target and rule slugs, concrete evidence, and actionable_correction"); continue
         target = target or "repository"
         rule = rule or SLUG_RE.sub("-", title.lower()).strip("-") or "suggestion"
         fid = compute_review_finding_id(cat, target, rule)
@@ -250,10 +251,11 @@ def _parse_phase2_response(response_text: str) -> tuple[str | None, dict[str, di
             "actionable_correction": correction or "Optional maintainability improvement.", "source": "reviewer-agent",
         })
     has_blocking = any(f["blocking"] for f in findings)
-    if outcome == "review-passed" and has_blocking:
-        issues.append("reviewer reported outcome='review-passed' despite blocking findings")
-    if outcome == "changes-requested" and not has_blocking and all(v.get("status") == "satisfied" for v in assessment.values()):
-        issues.append("reviewer reported outcome='changes-requested' without any blocking findings or unsatisfied assessment dimensions")
+    has_unsatisfied = any(v.get("status") != "satisfied" for v in assessment.values())
+    if outcome == "review-passed" and (has_blocking or has_unsatisfied):
+        issues.append("reviewer reported outcome='review-passed' despite blocking findings or unsatisfied assessment dimensions")
+    if (outcome == "changes-requested" or has_unsatisfied) and not has_blocking:
+        issues.append("reviewer reported outcome='changes-requested' or unsatisfied assessment without any complete blocking findings")
     return outcome, assessment, findings, issues
 
 
