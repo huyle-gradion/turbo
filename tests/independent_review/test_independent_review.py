@@ -53,9 +53,22 @@ def _make_staged_reviewer_script(
     )
 
 
-def _valid_qa_record(candidate_sha: str, base_sha: str) -> dict:
-    return {"schema": 1, "role": "automated-qa", "status": "qa-verified", "qa_verified": True,
-            "candidate_sha": candidate_sha, "base_sha": base_sha, "tested_sha": candidate_sha, "open_finding_ids": [], "findings": []}
+def _valid_qa_record(candidate_sha: str, base_sha: str, tested_sha: str | None = None) -> dict:
+    t_sha = tested_sha or candidate_sha
+    return {
+        "schema": 1, "role": "automated-qa", "status": "qa-verified", "qa_verified": True,
+        "candidate_sha": candidate_sha, "base_sha": base_sha, "tested_sha": t_sha,
+        "ci_revalidation": {"status": "verified", "verified": True, "candidate_sha": candidate_sha, "base_sha": base_sha, "tested_sha": t_sha, "blockers": []},
+        "role_separation": {"role": "automated-qa", "head_before": candidate_sha, "head_after": candidate_sha, "worktree_clean": True, "candidate_modified_by_qa": False},
+        "criterion_coverage": [{
+            "criterion_id": "AC-1", "description": "Reject expired auth tokens", "passed": True,
+            "deterministic_check": {"command": "python3 -m unittest -v", "executed": True, "passed": True, "timed_out": False, "exit_code": 0, "status": "passed"},
+            "evaluation_cases": [],
+        }],
+        "regression_checks": [{"id": "gate-2", "kind": "guard", "executed": True, "passed": True, "timed_out": False, "exit_code": 0}],
+        "regression_passed": True, "open_finding_ids": [], "findings": [],
+        "parent_acceptance_boundary": {"parent_gid": "900", "parent_accepted": False, "parent_acceptance_status": "pending-human-acceptance"},
+    }
 
 
 def _valid_security_record(candidate_sha: str, base_sha: str, home: Path) -> dict:
@@ -257,6 +270,46 @@ class IndependentReviewTest(unittest.TestCase):
             summary = run_disposable_demo(demo_dir)
             self.assertEqual((summary["valid_review"]["outcome"], summary["valid_review"]["review_verified"], summary["valid_review"]["delivery_approved"]),
                              ("review-passed", True, False))
+
+    def test_m1_automated_qa_evidence_contract_and_integration_merge(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo, home, base_sha, cand_sha, _, _, qa_rec, sec_rec, run_rev = self._setup_workspace(root)
+            git(repo, "checkout", "-q", "-b", "pr-merge-test", base_sha)
+            (repo / "README.md").write_text("base update\n", encoding="utf-8")
+            git(repo, "add", "README.md"); git(repo, "commit", "-q", "-m", "base advance")
+            git(repo, "checkout", "-q", base_sha)
+            git(repo, "checkout", "-q", "-b", "merge-sim", base_sha)
+            git(repo, "merge", "--no-ff", "-q", "-m", "Merge candidate into base", cand_sha)
+            merge_sha = git(repo, "rev-parse", "HEAD")
+            git(repo, "checkout", "-q", "task/101-clean")
+
+            merge_qa = {** _valid_qa_record(cand_sha, base_sha, tested_sha=merge_sha), "revision_kind": "integration-merge"}
+            merge_rec = run_rev(round_num=10, qa_record=merge_qa)
+            self.assertEqual((merge_rec["outcome"], merge_rec["review_verified"], merge_rec["upstream_evidence"]["automated_qa"]["verified"]),
+                             ("review-passed", True, True))
+
+            for label, bad_qa in (
+                ("missing-role-sep", {k: v for k, v in qa_rec.items() if k != "role_separation"}),
+                ("missing-ci-reval", {k: v for k, v in qa_rec.items() if k != "ci_revalidation"}),
+                ("missing-reg-passed", {k: v for k, v in qa_rec.items() if k != "regression_passed"}),
+                ("missing-coverage", {**qa_rec, "criterion_coverage": []}),
+                ("unmet-criterion", {**qa_rec, "criterion_coverage": [{**qa_rec["criterion_coverage"][0], "criterion_id": "OTHER-AC"}]}),
+                ("str-false-qa-verified", {**qa_rec, "qa_verified": "false"}),
+                ("str-false-reg-passed", {**qa_rec, "regression_passed": "false"}),
+                ("str-false-ci-reval", {**qa_rec, "ci_revalidation": {**qa_rec["ci_revalidation"], "verified": "false"}}),
+                ("unverified-merge-sha", {**qa_rec, "tested_sha": "a" * 40, "revision_kind": "integration-merge"}),
+                ("malformed-ci-reval", {**qa_rec, "ci_revalidation": "not-a-dict"}),
+                ("malformed-role-sep", {**qa_rec, "role_separation": ["not-a-dict"]}),
+                ("malformed-coverage", {**qa_rec, "criterion_coverage": ["not-a-dict"]}),
+                ("malformed-findings", {**qa_rec, "findings": ["not-a-dict"]}),
+                ("malformed-open-ids", {**qa_rec, "open_finding_ids": "not-a-list"}),
+            ):
+                qa_ev, _, gaps = independent_review.evaluate_upstream_evidence(
+                    cand_sha, base_sha, bad_qa, sec_rec, home=home, repo=repo, child=PARSED_CHILD
+                )
+                self.assertFalse(qa_ev["verified"], f"expected M1 rejection for {label}, got {qa_ev}")
+                self.assertTrue(gaps, f"expected M1 gap finding for {label}")
 
 
 def run_disposable_demo(tmp: Path) -> dict:

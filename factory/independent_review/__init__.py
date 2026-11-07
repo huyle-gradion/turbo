@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-import json, math, os, re, shutil, sys
+import json, math, os, re, shutil, sys, time
 from pathlib import Path
 from typing import Any
 
-from factory import ci_selection, config as config_module, deliver_checks, gitio, runner, security_review, worker as worker_module
+from factory import ci_gate, ci_selection, config as config_module, deliver_checks, gitio, runner, security_review, worker as worker_module
 from factory.config import now
 from factory.deliver_checks import collect_redaction_secrets, evaluate_scope, git_timed, inspect_diff_categories, remaining_seconds
 from factory.intake import redact_value
@@ -111,26 +111,80 @@ def _parse_phase1_hypotheses(response_text: str) -> tuple[list[str], list[str]]:
     return [h.strip() for h in raw_hyps], []
 
 
+def _validate_qa_record(
+    candidate_sha: str, base_sha: str, qa_record: dict[str, Any] | None,
+    *, repo: Path | None = None, child: dict[str, Any] | None = None, deadline: float | None = None, limit_s: int = 30,
+) -> dict[str, Any]:
+    if not isinstance(qa_record, dict) or not qa_record:
+        return {"status": "qa-missing", "verified": False, "blockers": [f"missing automated QA evidence for candidate {candidate_sha}"]}
+    rec_cand, rec_base, rec_tested = qa_record.get("candidate_sha"), qa_record.get("base_sha"), qa_record.get("tested_sha")
+    if not all(isinstance(x, str) and ci_gate.SHA40_RE.fullmatch(x) for x in (rec_cand, rec_base, rec_tested)):
+        return {"status": "stale-qa-evidence", "verified": False, "blockers": ["QA record is missing valid 40-char candidate_sha, base_sha, or tested_sha"]}
+    if rec_cand != candidate_sha or rec_base != base_sha:
+        return {"status": "stale-qa-evidence", "verified": False,
+                "blockers": [f"stale automated QA evidence: qa=({rec_cand}, base={rec_base}) != candidate=({candidate_sha}, base={base_sha})"]}
+    ci_reval, role_sep, cov = qa_record.get("ci_revalidation"), qa_record.get("role_separation"), qa_record.get("criterion_coverage")
+    reg_checks, findings, open_fids, boundary = qa_record.get("regression_checks"), qa_record.get("findings"), qa_record.get("open_finding_ids"), qa_record.get("parent_acceptance_boundary")
+    if not isinstance(ci_reval, dict) or not isinstance(role_sep, dict) or not isinstance(cov, list) or not cov:
+        return {"status": "qa-invalid", "verified": False, "blockers": ["QA record is missing required ci_revalidation, role_separation, or criterion_coverage"]}
+    rev_kind = qa_record.get("revision_kind") or ci_reval.get("revision_kind")
+    if rev_kind not in (None, "fast-forward-head", "integration-merge"):
+        return {"status": "stale-qa-evidence", "verified": False, "blockers": [f"invalid QA revision_kind {rev_kind!r}"]}
+    if rec_tested == candidate_sha:
+        if rev_kind == "integration-merge":
+            return {"status": "stale-qa-evidence", "verified": False, "blockers": ["integration-merge QA record cannot have tested_sha == candidate_sha"]}
+        if repo is not None and gitio.git(repo, "cat-file", "-t", candidate_sha).ok and gitio.git(repo, "cat-file", "-t", base_sha).ok and not gitio.is_ancestor(repo, base_sha, candidate_sha):
+            return {"status": "stale-qa-evidence", "verified": False, "blockers": [f"candidate_sha {candidate_sha} does not descend from base_sha {base_sha}"]}
+    else:
+        if rev_kind not in (None, "integration-merge"):
+            return {"status": "stale-qa-evidence", "verified": False, "blockers": [f"tested_sha != candidate_sha requires integration-merge, got {rev_kind!r}"]}
+        parents_ok = False
+        if repo is not None:
+            ok_git, git_kind, git_err = ci_gate._verify_tested_revision_in_git(repo, base_sha, candidate_sha, rec_tested, 0, deadline or (time.monotonic() + 10.0), limit_s)
+            if not ok_git or git_kind != "integration-merge":
+                return {"status": "stale-qa-evidence", "verified": False, "blockers": [f"invalid integration-merge tested_sha {rec_tested}: {git_err or git_kind}"]}
+            parents_ok = True
+        rec_parents = qa_record.get("merge_parents") or ci_reval.get("merge_parents")
+        if rec_parents is not None:
+            if not isinstance(rec_parents, (list, tuple)) or len(rec_parents) != 2 or set(rec_parents) != {base_sha, candidate_sha}:
+                return {"status": "stale-qa-evidence", "verified": False, "blockers": [f"integration-merge parents {rec_parents!r} do not match [base_sha, candidate_sha]"]}
+            parents_ok = True
+        if not parents_ok:
+            return {"status": "stale-qa-evidence", "verified": False, "blockers": [f"unverified integration-merge tested_sha {rec_tested}"]}
+    if any(ci_reval.get(k) not in (None, exp) for k, exp in (("candidate_sha", candidate_sha), ("base_sha", base_sha), ("tested_sha", rec_tested))):
+        return {"status": "stale-qa-evidence", "verified": False, "blockers": ["ci_revalidation revision bindings do not match QA record"]}
+    cov_ok = all(
+        isinstance(c, dict) and isinstance(c.get("criterion_id"), str) and bool(c["criterion_id"].strip()) and c["criterion_id"] != "CRITERIA-MISSING"
+        and c.get("passed") is True and isinstance(det := c.get("deterministic_check"), dict) and det.get("passed") is True and det.get("executed") is True
+        and det.get("timed_out") is not True and det.get("status") != "invalid-rubric" and isinstance(ecs := c.get("evaluation_cases", []), list)
+        and all(isinstance(ec, dict) and ec.get("passed") is True and ec.get("executed") is True and ec.get("timed_out") is not True and ec.get("status") != "invalid-rubric" for ec in ecs)
+        for c in cov
+    )
+    req_cids = {str(cr.get("id") or "AC").strip() for cr in ((child or {}).get("criteria") or ()) if isinstance(cr, dict)} if isinstance(child, dict) else set()
+    cov_cids = {c["criterion_id"].strip() for c in cov if isinstance(c, dict) and isinstance(c.get("criterion_id"), str)}
+    reg_ok = qa_record.get("regression_passed") is True and (
+        reg_checks is None or (isinstance(reg_checks, list) and bool(reg_checks) and all(isinstance(rc, dict) and rc.get("passed") is True and rc.get("executed") is True and rc.get("timed_out") is not True for rc in reg_checks))
+    )
+    findings_ok = isinstance(open_fids, list) and len(open_fids) == 0 and isinstance(findings, list) and all(
+        isinstance(f, dict) and f.get("status") == "resolved" and f.get("resolution_blocker") is None and f.get("latest_candidate_sha", candidate_sha) == candidate_sha for f in findings
+    )
+    role_ok = (qa_record.get("role") == "automated-qa" and qa_record.get("status") == "qa-verified" and qa_record.get("qa_verified") is True
+               and ci_reval.get("verified") is True and ci_reval.get("status") in (None, "verified") and not ci_reval.get("blockers")
+               and role_sep.get("role") in (None, "automated-qa") and role_sep.get("candidate_modified_by_qa") is False and role_sep.get("worktree_clean") is True
+               and role_sep.get("head_before", candidate_sha) == candidate_sha and role_sep.get("head_after", candidate_sha) == candidate_sha
+               and (boundary is None or (isinstance(boundary, dict) and boundary.get("parent_accepted") is False)))
+    if not (role_ok and cov_ok and req_cids.issubset(cov_cids) and reg_ok and findings_ok):
+        st = str(qa_record.get("status") if isinstance(qa_record.get("status"), str) and qa_record.get("status") != "qa-verified" else "qa-failed")
+        return {"status": st, "verified": False, "blockers": [f"automated QA contract not satisfied on {candidate_sha}"]}
+    return {"status": "qa-verified", "verified": True, "blockers": []}
+
+
 def evaluate_upstream_evidence(
-    candidate_sha: str, base_sha: str, qa_record: dict[str, Any] | None, security_record: dict[str, Any] | None, *, home: Path | None = None,
+    candidate_sha: str, base_sha: str, qa_record: dict[str, Any] | None, security_record: dict[str, Any] | None,
+    *, home: Path | None = None, repo: Path | None = None, child: dict[str, Any] | None = None, deadline: float | None = None, limit_s: int = 30,
 ) -> tuple[dict[str, Any], dict[str, Any], list[dict[str, Any]]]:
     gaps: list[dict[str, Any]] = []
-    if not isinstance(qa_record, dict) or not qa_record:
-        qa_eval = {"status": "qa-missing", "verified": False, "blockers": [f"missing automated QA evidence for candidate {candidate_sha}"]}
-    elif (str(qa_record.get("candidate_sha") or "") != candidate_sha or str(qa_record.get("base_sha") or "") != base_sha
-          or str(qa_record.get("tested_sha") or candidate_sha) != candidate_sha):
-        qa_eval = {"status": "stale-qa-evidence", "verified": False,
-                   "blockers": [f"stale automated QA evidence: qa=({qa_record.get('candidate_sha')}, base={qa_record.get('base_sha')}) != candidate=({candidate_sha}, base={base_sha})"]}
-    elif (qa_record.get("role") not in (None, "automated-qa") or not bool(qa_record.get("qa_verified"))
-          or str(qa_record.get("status") or "") != "qa-verified" or bool(qa_record.get("open_finding_ids"))
-          or (qa_record.get("ci_revalidation") or {}).get("verified", True) is not True
-          or (qa_record.get("role_separation") or {}).get("candidate_modified_by_qa", False) is not False
-          or qa_record.get("regression_passed", True) is not True
-          or any(not isinstance(f, dict) or f.get("status") != "resolved" for f in (qa_record.get("findings") or ()))):
-        qa_eval = {"status": str(qa_record.get("status") or "qa-failed"), "verified": False,
-                   "blockers": [f"automated QA not verified on {candidate_sha} (status={qa_record.get('status')!r}, open_findings={qa_record.get('open_finding_ids')})"]}
-    else:
-        qa_eval = {"status": "qa-verified", "verified": True, "blockers": []}
+    qa_eval = _validate_qa_record(candidate_sha, base_sha, qa_record, repo=repo, child=child, deadline=deadline, limit_s=limit_s)
     if not qa_eval["verified"]:
         rule = "stale-qa-evidence" if qa_eval["status"] == "stale-qa-evidence" else "qa-evidence-unverified"
         gaps.append(_gap_finding("automated-qa", rule, f"Automated QA evidence gap ({qa_eval['status']})", "; ".join(qa_eval["blockers"]),
@@ -344,7 +398,9 @@ def review_candidate_independently(
         diff_text = redact_value(diff_res.output + ("\n" if not diff_res.output.endswith("\n") else ""), secrets)
         diff_path = write_evidence(round_dir, "reviewed-diff", diff_text, home)
         standards = load_project_standards(repo, base_sha, child, conf, deadline, limit_s)
-        qa_eval, sec_eval, upstream_gaps = evaluate_upstream_evidence(resolved_sha, base_sha, qa_record, security_record, home=home)
+        qa_eval, sec_eval, upstream_gaps = evaluate_upstream_evidence(
+            resolved_sha, base_sha, qa_record, security_record, home=home, repo=repo, child=child, deadline=deadline, limit_s=limit_s
+        )
 
         role_issues = [f"sandbox unavailable: {sandbox_error}"] if sandbox_error else ([] if probes_ok else ["independent reviewer safety probes failed"])
         if not diff_ok:
