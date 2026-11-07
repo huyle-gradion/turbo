@@ -366,6 +366,11 @@ class IndependentReviewTest(unittest.TestCase):
             r5 = run_rev(round_num=5, child=slow_child, deadline=time.monotonic() + 1.2, limit_s=1, builder_summary="All checks passed.")
             chk5 = next(c for c in r5["observed_verification"]["checks"] if c["kind"] == "criterion")
             self.assertEqual((chk5["executed"], chk5.get("completed"), chk5["timed_out"], chk5["ok"], r5["builder_summary_claim"]["contradicted_by_observed_execution"]), (True, False, True, False, True))
+            orig_obs = independent_review._run_observed_verification
+            with mock.patch.object(independent_review, "_run_observed_verification", side_effect=lambda *a, **kw: orig_obs(*a[:-2], time.monotonic() - 1.0, a[-1], **kw)):
+                r6 = run_rev(round_num=6, builder_summary="All checks passed.")
+            chk6 = r6["observed_verification"]["checks"][0]
+            self.assertEqual((r6["observed_verification"]["executed"], chk6["executed"], chk6["exit_code"], chk6["timed_out"], r6["builder_summary_claim"]["contradicted_by_observed_execution"], r6["outcome"], r6["review_verified"]), (False, False, None, False, False, "changes-requested", False))
 
     def test_m7_coherent_actionable_review_findings(self) -> None:
         unsat = {**DEFAULT_ASSESSMENT, "edge_cases": {"status": "unsatisfied", "summary": "Missing edge case."}}

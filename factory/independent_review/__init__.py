@@ -216,13 +216,14 @@ def _run_observed_verification(worktree: Path, verify_dir: Path, home: Path, chi
             ev_path = write_evidence(verify_dir, stem, msg, home); all_ok = False
             checks.append({"name": name, "kind": kind, "assesses": concern_id, "command": redact_value(raw_cmd, secrets), "argv": [], "executed": False, "completed": False, "exit_code": None, "ok": False, "timed_out": False, "duration_ms": 0, "head_sha": candidate_sha, "output_path": str(ev_path), "output_sha256": runner.digest_text(msg), "output_excerpt": msg.strip()[:400], "provenance": "observed-independent-verification"})
             gaps.append(_gap_finding(concern_id, "unexecutable-check", f"Missing or unexecutable check for {concern_id}", msg.strip(), f"Provide an executable verification command for {concern_id} without skip flags.", "observed-verification")); continue
-        executed, completed = True, True
+        executed, completed, launched = False, False, False
         try:
             timeout_s = max(1, int(math.ceil(remaining_seconds(deadline, f"independent verification {name}", limit_s))))
+            launched = executed = True
             code, out_s, err_s, elapsed_ms, timed_out = worker_module.execute_stream(worktree, argv, env, timeout_s, isolated_home=verify_home, allow_network=False)
             completed = not timed_out
         except (deliver_checks.AttemptTimeoutError, TimeoutError) as exc:
-            code, out_s, err_s, elapsed_ms, timed_out, executed, completed = 124, "", f"[factory] check timed out: {exc}\n", 0, True, True, False
+            code, out_s, err_s, elapsed_ms, timed_out, executed, completed = (124 if launched else None), "", f"[factory] check timed out: {exc}\n", 0, launched, launched, False
         except (worker_module.SandboxUnavailableError, OSError) as exc:
             code, out_s, err_s, elapsed_ms, timed_out, executed, completed = None, "", f"[factory] check execution error: {exc}\n", 0, False, False, False
         combined = redact_value((out_s + err_s).strip() + "\n", secrets)
