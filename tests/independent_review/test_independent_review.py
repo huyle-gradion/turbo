@@ -324,6 +324,11 @@ class IndependentReviewTest(unittest.TestCase):
             self.assertFalse(site_marker.exists()); self.assertTrue(r4["observed_verification"]["executed"])
             r5 = run_rev(round_num=5)
             self.assertEqual((r5["outcome"], r5["review_verified"], r5["worktree_integrity"]["candidate_modified_by_reviewer"]), ("review-passed", True, False))
+            mode_restore = _make_fake_agy(root, "agy-mode-restore", "import pathlib\nf = pathlib.Path('src/chat_bridge/auth.py'); m = f.stat().st_mode; f.chmod(m ^ 0o111); f.chmod(m)\n" + _make_staged_reviewer_script(session_id="rev-m5-mr"))
+            r_mode = run_rev(round_num=6, agy_bin=str(mode_restore))
+            with mock.patch.object(independent_review, "_open_inotify_watch", return_value=None):
+                r_no_inotify = run_rev(round_num=7, agy_bin=str(edit_restore))
+            self.assertEqual(((r_mode["outcome"], r_mode["review_verified"], r_mode["worktree_integrity"]["candidate_modified_by_reviewer"], Path(r_mode["worktree_integrity"]["mutation_evidence_path"] or "/nonexistent").is_file()), (r_no_inotify["outcome"], r_no_inotify["review_verified"], r_no_inotify["worktree_integrity"]["candidate_modified_by_reviewer"], Path(r_no_inotify["worktree_integrity"]["mutation_evidence_path"] or "/nonexistent").is_file())), (("invalid-review", False, True, True), ("invalid-review", False, True, True)))
 
     def test_m6_required_checks_and_truthful_execution_recording(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

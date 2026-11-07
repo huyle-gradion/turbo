@@ -241,22 +241,21 @@ def _snapshot_worktree(worktree: Path) -> dict[str, tuple[Any, ...]]:
         for name in (*dirs, *files):
             p = rp / name; st = p.lstat()
             payload = f"symlink:{os.readlink(p)}" if stat.S_ISLNK(st.st_mode) else (hashlib.sha256(p.read_bytes()).hexdigest() if stat.S_ISREG(st.st_mode) else "dir")
-            snap[str(p.relative_to(worktree))] = (st.st_mode, st.st_ino, st.st_size, st.st_mtime_ns, payload)
+            snap[str(p.relative_to(worktree))] = (st.st_mode, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns, payload)
     return snap
 
 def _open_inotify_watch(worktree: Path) -> int | None:
     try:
         libc = ctypes.CDLL("libc.so.6", use_errno=True)
         if (fd := libc.inotify_init1(0o4000 | 0o2000000)) < 0: return None
-        mask = 0x002 | 0x008 | 0x040 | 0x080 | 0x100 | 0x200 | 0x400 | 0x800
+        mask = 0x002 | 0x004 | 0x008 | 0x040 | 0x080 | 0x100 | 0x200 | 0x400 | 0x800
         for root, dirs, _ in os.walk(worktree, topdown=True, followlinks=False):
-            libc.inotify_add_watch(fd, os.fsencode(root), mask)
-            for d in dirs: libc.inotify_add_watch(fd, os.fsencode(os.path.join(root, d)), mask)
+            if libc.inotify_add_watch(fd, os.fsencode(root), mask) < 0: os.close(fd); return None
         return int(fd)
     except Exception: return None
 
 def _drain_inotify_watch(fd: int | None) -> bool:
-    if fd is None: return False
+    if fd is None: return True
     try:
         chunks: list[bytes] = []
         while True:
@@ -265,7 +264,7 @@ def _drain_inotify_watch(fd: int | None) -> bool:
                 chunks.append(buf)
             except BlockingIOError: break
         return bool(b"".join(chunks))
-    except OSError: return False
+    except OSError: return True
     finally:
         try: os.close(fd)
         except OSError: pass
