@@ -2,23 +2,70 @@ name: CI
 
 on:
   push:
+    branches: [main]
   pull_request:
+    branches: [main, 'feature/**', 'feat/**']
+
+concurrency:
+  group: ci-${{ github.workflow }}-pr-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
 
 jobs:
-  verify:
+  test:
+    name: Unit tests and smoke scripts
     runs-on: ubuntu-latest
-    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Checkout
+        uses: actions/checkout@v4
         with:
-          python-version: "3.11"
-      - name: Unit tests
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install bubblewrap
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends bubblewrap
+
+      - name: Essential safety guards (always run)
+        run: PYTHONPATH=tests:. PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests/test_bundle.py tests/test_cli_paths.py tests/test_evidence_integrity.py -v
+
+      - name: Full unit test suite (push to main)
+        if: github.event_name != 'pull_request'
         run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v
-      - name: Manual smoke
+
+      - name: Selected or full regression suite (trusted base policy)
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          CHANGED=$(git diff --name-only "$BASE_SHA"...HEAD)
+          DELETED=$(git diff --diff-filter=D --name-only "$BASE_SHA"...HEAD)
+          CHAIN_DIFF=$(git diff --name-only "$BASE_SHA"...HEAD -- .github factory.json bin scripts guards tests/support.py tests/test_bundle.py tests/test_cli_paths.py tests/test_evidence_integrity.py factory/ci_selection.py factory/ci_gate.py factory/deliver_checks.py factory/config.py factory/gates.py factory/runner.py factory/sandbox.py)
+          TRUSTED_DIR=$(mktemp -d)
+          trap 'rm -rf "$TRUSTED_DIR"' EXIT
+          git archive "$BASE_SHA" | tar -x -C "$TRUSTED_DIR"
+          if [ -n "$CHAIN_DIFF" ] || [ ! -f "$TRUSTED_DIR/factory/ci_selection.py" ]; then
+            echo "Verification chain modified or base selector absent; forcing full suite on candidate checkout"
+            PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v
+          else
+            PLAN=$(python3 -I -c 'import json, pathlib, sys; sys.path.insert(0, sys.argv[1]); from factory.ci_selection import select_ci_test_plan; print(json.dumps(select_ci_test_plan(changed_paths=tuple(sys.argv[2].splitlines()), deleted_paths=tuple(sys.argv[3].splitlines()), repo=pathlib.Path("."))))' "$TRUSTED_DIR" "$CHANGED" "$DELETED")
+            echo "CI selection plan (from trusted base $BASE_SHA): $PLAN"
+            MODE=$(python3 -I -c 'import json, sys; print(json.loads(sys.argv[1])["mode"])' "$PLAN")
+            if [ "$MODE" = "full-suite" ]; then
+              PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v
+            else
+              TESTS=$(python3 -I -c 'import json, sys; print(" ".join(json.loads(sys.argv[1])["affected_tests"]))' "$PLAN")
+              PYTHONPATH=tests:. PYTHONDONTWRITEBYTECODE=1 python3 -m unittest $TESTS -v
+            fi
+          fi
+
+      - name: Manual profile smoke
         run: bash scripts/smoke.sh
-      - name: Native Turbo smoke
+
+      - name: Native-turbo profile smoke
         run: bash scripts/smoke-turbo.sh
