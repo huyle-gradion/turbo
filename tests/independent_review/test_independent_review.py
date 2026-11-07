@@ -210,7 +210,7 @@ class IndependentReviewTest(unittest.TestCase):
     def test_m1_automated_qa_evidence_contract_and_integration_merge(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            repo, home, base_sha, cand_sha, _, _, qa_rec, sec_rec, run_rev = self._setup_workspace(root)
+            repo, home, base_sha, cand_sha, _, child_dir, qa_rec, sec_rec, run_rev = self._setup_workspace(root)
             git(repo, "checkout", "-q", "-b", "pr-merge-test", base_sha)
             (repo / "README.md").write_text("base update\n", encoding="utf-8")
             git(repo, "add", "README.md"); git(repo, "commit", "-q", "-m", "base advance")
@@ -221,6 +221,8 @@ class IndependentReviewTest(unittest.TestCase):
             merge_qa = {**_valid_qa_record(cand_sha, base_sha, tested_sha=merge_sha), "revision_kind": "integration-merge"}
             merge_rec = run_rev(round_num=10, qa_record=merge_qa)
             self.assertEqual((merge_rec["outcome"], merge_rec["review_verified"], merge_rec["upstream_evidence"]["automated_qa"]["verified"]), ("review-passed", True, True))
+            bad_parents_rec = run_rev(round_num=11, qa_record={**merge_qa, "merge_parents": [{}, {}]})
+            self.assertEqual((bad_parents_rec["outcome"], bad_parents_rec["review_verified"], bad_parents_rec["upstream_evidence"]["automated_qa"]["verified"], (child_dir / "independent-review-round-11" / "record.json").is_file()), ("changes-requested", False, False, True))
             for label, bad_qa in (
                 ("missing-role-sep", {k: v for k, v in qa_rec.items() if k != "role_separation"}), ("missing-ci-reval", {k: v for k, v in qa_rec.items() if k != "ci_revalidation"}),
                 ("missing-reg-passed", {k: v for k, v in qa_rec.items() if k != "regression_passed"}), ("missing-coverage", {**qa_rec, "criterion_coverage": []}),

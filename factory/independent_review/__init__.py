@@ -103,9 +103,9 @@ def _validate_qa_record(candidate_sha: str, base_sha: str, qa_record: dict[str, 
             ok_git, git_kind, git_err = ci_gate._verify_tested_revision_in_git(repo, base_sha, candidate_sha, rec_tested, 0, deadline or (time.monotonic() + 10.0), limit_s)
             if not ok_git or git_kind != "integration-merge": return {"status": "stale-qa-evidence", "verified": False, "blockers": [f"invalid integration-merge tested_sha {rec_tested}: {git_err or git_kind}"]}
             parents_ok = True
-        rec_parents = qa_record.get("merge_parents") or ci_reval.get("merge_parents")
+        rec_parents = qa_record["merge_parents"] if "merge_parents" in qa_record else ci_reval.get("merge_parents")
         if rec_parents is not None:
-            if not isinstance(rec_parents, (list, tuple)) or len(rec_parents) != 2 or set(rec_parents) != {base_sha, candidate_sha}:
+            if not isinstance(rec_parents, (list, tuple)) or len(rec_parents) != 2 or not all(isinstance(p, str) for p in rec_parents) or set(rec_parents) != {base_sha, candidate_sha}:
                 return {"status": "stale-qa-evidence", "verified": False, "blockers": [f"integration-merge parents {rec_parents!r} do not match [base_sha, candidate_sha]"]}
             parents_ok = True
         if not parents_ok: return {"status": "stale-qa-evidence", "verified": False, "blockers": [f"unverified integration-merge tested_sha {rec_tested}"]}
