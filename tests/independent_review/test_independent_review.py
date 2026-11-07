@@ -51,7 +51,7 @@ def _make_staged_reviewer_script(*, session_id: str = "ind-rev-1", phase2_sessio
 def _valid_qa_record(candidate_sha: str, base_sha: str, tested_sha: str | None = None) -> dict:
     t_sha = tested_sha or candidate_sha
     return {
-        "schema": 1, "role": "automated-qa", "status": "qa-verified", "qa_verified": True, "candidate_sha": candidate_sha, "base_sha": base_sha, "tested_sha": t_sha,
+        "schema": 1, "role": "automated-qa", "round": 1, "status": "qa-verified", "qa_verified": True, "candidate_sha": candidate_sha, "base_sha": base_sha, "tested_sha": t_sha,
         "ci_revalidation": {"status": "verified", "verified": True, "candidate_sha": candidate_sha, "base_sha": base_sha, "tested_sha": t_sha, "blockers": []},
         "role_separation": {"role": "automated-qa", "head_before": candidate_sha, "head_after": candidate_sha, "worktree_clean": True, "candidate_modified_by_qa": False},
         "criterion_coverage": [{"criterion_id": "AC-1", "description": "Reject expired auth tokens", "passed": True, "deterministic_check": {"command": "python3 -m unittest -v", "executed": True, "passed": True, "timed_out": False, "exit_code": 0, "status": "passed"}, "evaluation_cases": []}],
@@ -65,7 +65,7 @@ def _valid_security_record(candidate_sha: str, base_sha: str, home: Path) -> dic
     out_p, chk_p = sec_dir / "rev-stdout.txt", sec_dir / "chk.txt"
     out_p.write_text("ok\n", encoding="utf-8"); chk_p.write_text("ok\n", encoding="utf-8")
     return {
-        "schema": 1, "role": "security-reviewer", "reviewer_executed": True, "reviewer_session_id": "sec-rev-1", "builder_session_id": "builder-session-1",
+        "schema": 1, "role": "security-reviewer", "round": 1, "reviewer_executed": True, "reviewer_session_id": "sec-rev-1", "builder_session_id": "builder-session-1",
         "role_separation_verified": True, "role_issues": [], "reviewer_stdout_path": str(out_p), "reviewed_revision": candidate_sha, "base_sha": base_sha, "policy_sha": base_sha,
         "inspected_scope": {"changed_paths": ["src/chat_bridge/auth.py", "tests/test_auth.py"], "deterministic_ok": True},
         "applicable_policies": [{"id": "SEC-POL-01", "name": "no-hardcoded-secrets"}], "findings": [], "blocking_findings": [], "non_blocking_suggestions": [], "previous_findings_resolution": [],

@@ -1,6 +1,6 @@
 """Behavioral tests for the exact-candidate final approval gate (Issue #58)."""
 from __future__ import annotations
-import json, sys, tempfile, time, unittest
+import json, shutil, sys, tempfile, time, unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -203,6 +203,24 @@ class ApprovalGateGroup1Test(unittest.TestCase):
                 res = eval_g(**overrides)
                 self.assertEqual((res["delivery_approved"], res["approved_revision"], res["status"]), (False, None, exp_status), f"failed prerequisite rejection for {label}: {res}")
 
+            for bad_r in (None, True, False, 0, -1, "3"):
+                for k, base_rec in (("qa_record", qa3_round), ("security_record", real_sec3), ("review_record", r3)):
+                    self.assertFalse(eval_g(**{k: {**base_rec, "round": bad_r}})["delivery_approved"], f"M1 {k} round={bad_r!r}")
+                if bad_r is not None:
+                    self.assertFalse(eval_g(round_num=bad_r)["delivery_approved"], f"M1 round_num={bad_r!r}")
+            # M1: child_dir supplied with home=None must still enforce persisted unresolved history on gate2_tampered
+            self.assertFalse(independent_review.evaluate_approval_gate(
+                candidate_sha=cand2, base_sha=base_sha, ci_record=ci2, qa_record=qa2, security_record=sec2,
+                review_record=tampered_r2, repo=repo, home=None, child_dir=child_dir, child=child_ac1, conf=conf,
+            )["delivery_approved"])
+            # M1: same-candidate prior QA/security blockers and newer superseding rounds cannot be bypassed
+            (qa_round_dir / "record.json").write_text(json.dumps({**qa3_round, "round": 1, "findings": [{"finding_id": "QA-101-AC-1-DET", "status": "open"}]}), encoding="utf-8")
+            self.assertEqual(eval_g(qa_record={**qa3_round, "round": 2, "findings": []})["status"], "qa-findings-open")
+            (qa_round_dir / "record.json").write_text(json.dumps(qa3_round), encoding="utf-8")
+            sec_r1_dir = child_dir / "security-round-1"; sec_r1_dir.mkdir(parents=True, exist_ok=True)
+            (sec_r1_dir / "record.json").write_text(json.dumps({**real_sec3, "round": 1, "findings": [{"finding_id": "SEC-HIST-1", "blocking": True, "status": "open"}]}), encoding="utf-8")
+            self.assertEqual(eval_g(security_record={**real_sec3, "round": 2, "findings": []})["status"], "security-blockers-unresolved")
+            shutil.rmtree(sec_r1_dir)
             # Corrupt prior-blockers.json must fail closed
             (child_dir / "prior-blockers.json").write_text("{corrupt", encoding="utf-8")
             corrupt_res = eval_g()

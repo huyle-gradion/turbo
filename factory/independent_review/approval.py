@@ -14,6 +14,26 @@ APPROVAL_GATE_SCOPE_NOTE = "exact-candidate-delivery-approval-gate (#58); not me
 def _fail(status: str, msg: str | list[str], **extra: Any) -> dict[str, Any]:
     return {"status": status, "verified": False, **extra, "blockers": msg if isinstance(msg, list) else [msg]}
 
+def _pos_int(v: Any) -> int | None:
+    return v if type(v) is int and v >= 1 else None
+
+def _scan_rounds(base_dir: Path | None, home: Path | None, pat: str, cur_r: int, inv_st: str, stale_st: str) -> tuple[list[tuple[int, dict[str, Any]]], dict[str, Any] | None]:
+    if base_dir is None or not (base_dir.exists() or base_dir.is_symlink()): return [], None
+    if base_dir.is_symlink() or not base_dir.is_dir(): return [], _fail(inv_st, f"invalid history directory {base_dir}")
+    eff_home, out = home or base_dir, []
+    for p in sorted(base_dir.iterdir()):
+        if not (m := re.fullmatch(pat, p.name)): continue
+        r_idx, rp = int(m.group(1)), p / "record.json"
+        if r_idx < 1 or p.is_symlink() or not p.is_dir() or rp.is_symlink() or not rp.is_file():
+            return [], _fail(inv_st, f"corrupt or missing round record in {p}")
+        try: r_obj = read_json(rp, eff_home)
+        except (errors_module.FactoryError, OSError) as exc: return [], _fail(inv_st, f"unreadable round record {rp}: {exc}")
+        if not isinstance(r_obj, dict) or (_pos_int(r_obj.get("round")) != r_idx if "round" in r_obj else False) or not isinstance(r_obj.get("findings", []), list):
+            return [], _fail(inv_st, f"invalid round record in {rp}")
+        if r_idx > cur_r: return [], _fail(stale_st, f"round {cur_r} is superseded by round {r_idx}")
+        out.append((r_idx, r_obj))
+    return out, None
+
 def _verify_file_digest(path_val: Any, sha_val: Any, home: Path | None, label: str) -> str | None:
     if not isinstance(path_val, str) or not path_val.strip() or not isinstance(sha_val, str) or not sha_val.strip():
         return f"{label} is missing stored output_path or output_sha256"
@@ -150,24 +170,22 @@ def evaluate_qa_prerequisite(
             return _fail("qa-missing", f"missing automated QA round records for {candidate_sha}")
         for pr_r in rounds_list[:-1]: prior_qa_fids.update(str(f["finding_id"]) for f in (pr_r.get("findings") or ()) if isinstance(f, dict) and f.get("finding_id"))
         qa_record = rounds_list[-1]
-    elif isinstance(qa_record, dict) and "criterion_coverage" not in qa_record and child_dir is not None and home is not None:
+    elif isinstance(qa_record, dict) and "criterion_coverage" not in qa_record and child_dir is not None:
         if qa_record.get("qa_verified") is not True or qa_record.get("status") not in (None, "qa-verified") or bool(qa_record.get("open_finding_ids")):
             return _fail(str(qa_record.get("status") or "qa-failed"), "QA summary record is not verified")
-        if (r_count := int(qa_record.get("rounds") or 0)) > 0 and (r_path := child_dir / "automated-qa" / f"round-{r_count}" / "record.json").is_file():
-            qa_record = read_json(r_path, home)
+        if (r_count := _pos_int(qa_record.get("rounds"))) is not None and (r_path := child_dir / "automated-qa" / f"round-{r_count}" / "record.json").is_file():
+            qa_record = read_json(r_path, home or child_dir)
     if isinstance(qa_record, dict) and qa_record.get("delivery_approved") is True:
         return _fail("authority-violation", "non-gate producer automated-qa cannot issue delivery_approved=True")
-    if child_dir is not None and home is not None and (qa_dir := child_dir / "automated-qa").is_dir() and isinstance(qa_record, dict):
-        cur_r = qa_record.get("round") if isinstance(qa_record.get("round"), int) else None
-        for p in sorted(qa_dir.iterdir()):
-            if p.is_dir() and (m := re.fullmatch(r"round-(\d+)", p.name)) and ((rp := p / "record.json").exists() or rp.is_symlink()):
-                r_idx = int(m.group(1))
-                try: r_obj = read_json(rp, home)
-                except (errors_module.FactoryError, OSError) as exc: return _fail("qa-invalid", f"corrupt automated-qa round history in {rp}: {exc}")
-                if not isinstance(r_obj, dict) or not isinstance(r_obj.get("findings", []), list): return _fail("qa-invalid", f"invalid automated-qa round record in {rp}")
-                if cur_r is not None and r_idx > cur_r: return _fail("stale-qa-evidence", f"automated-qa round {cur_r} is superseded by round {r_idx}")
-                if (cur_r is not None and r_idx < cur_r) or (cur_r is None and r_obj.get("candidate_sha") != candidate_sha):
-                    prior_qa_fids.update(str(f["finding_id"]) for f in (r_obj.get("findings") or ()) if isinstance(f, dict) and f.get("finding_id"))
+    cur_qa_r = _pos_int(qa_record.get("round")) if isinstance(qa_record, dict) else None
+    if isinstance(qa_record, dict) and qa_record and "criterion_coverage" in qa_record and cur_qa_r is None:
+        return _fail("qa-invalid", f"QA record has missing or invalid round {qa_record.get('round')!r}")
+    if cur_qa_r is not None:
+        scanned_qa, qa_err = _scan_rounds(child_dir / "automated-qa" if child_dir is not None else None, home, r"round-(\d+)", cur_qa_r, "qa-invalid", "stale-qa-evidence")
+        if qa_err is not None: return qa_err
+        for r_idx, r_obj in scanned_qa:
+            if r_idx <= cur_qa_r:
+                prior_qa_fids.update(str(f["finding_id"]) for f in (r_obj.get("findings") or ()) if isinstance(f, dict) and f.get("finding_id"))
     qa_eval = ir_pkg._validate_qa_record(candidate_sha, base_sha, qa_record, repo=repo, child=child, deadline=deadline, limit_s=limit_s)
     if not qa_eval["verified"]: return qa_eval
     cur_qa_fids = {str(f.get("finding_id")): f for f in (qa_record.get("findings") or ()) if isinstance(f, dict) and f.get("finding_id")}
@@ -201,24 +219,20 @@ def evaluate_security_prerequisite(
         security_record = security_record["security_review"]
     if isinstance(security_record, dict) and security_record.get("delivery_approved") is True:
         return _fail("authority-violation", "non-gate producer security-reviewer cannot issue delivery_approved=True")
+    cur_sec_r = _pos_int(security_record.get("round")) if isinstance(security_record, dict) else None
+    if isinstance(security_record, dict) and security_record and cur_sec_r is None:
+        return _fail("security-review-invalid", f"security review record has missing or invalid round {security_record.get('round')!r}")
     sec_eval = security_review.evaluate_security_review_gate(candidate_sha, base_sha, security_record, home=home)
     if not sec_eval["verified"]: return sec_eval
-    if child_dir is not None and home is not None and child_dir.is_dir() and isinstance(security_record, dict):
-        cur_r = security_record.get("round") if isinstance(security_record.get("round"), int) else None
-        prior_sec_fids: set[str] = set()
-        for p in sorted(child_dir.iterdir()):
-            if p.is_dir() and (m := re.fullmatch(r"security-round-(\d+)", p.name)) and ((rp := p / "record.json").exists() or rp.is_symlink()):
-                r_idx = int(m.group(1))
-                try: r_obj = read_json(rp, home)
-                except (errors_module.FactoryError, OSError) as exc: return _fail("security-review-invalid", f"corrupt security round history in {rp}: {exc}")
-                if not isinstance(r_obj, dict) or not isinstance(r_obj.get("findings", []), list): return _fail("security-review-invalid", f"invalid security round record in {rp}")
-                if cur_r is not None and r_idx > cur_r: return _fail("stale-security-review", f"security review round {cur_r} is superseded by round {r_idx}")
-                if (cur_r is not None and r_idx < cur_r) or (cur_r is None and r_obj.get("reviewed_revision") != candidate_sha):
-                    prior_sec_fids.update(str(f["finding_id"]) for f in (r_obj.get("findings") or ()) if isinstance(f, dict) and f.get("blocking") and f.get("finding_id"))
+    if cur_sec_r is not None and child_dir is not None:
+        scanned_sec, sec_err = _scan_rounds(child_dir, home, r"security-round-(\d+)", cur_sec_r, "security-review-invalid", "stale-security-review")
+        if sec_err is not None: return sec_err
+        prior_sec_fids = {str(f["finding_id"]) for r_idx, r_obj in scanned_sec if r_idx < cur_sec_r for f in (r_obj.get("findings") or ()) if isinstance(f, dict) and f.get("blocking") and f.get("finding_id")}
+        same_r_fids = {str(f["finding_id"]) for r_idx, r_obj in scanned_sec if r_idx == cur_sec_r for f in (r_obj.get("findings") or ()) if isinstance(f, dict) and f.get("blocking") and f.get("finding_id")}
         cur_f_map = {str(f.get("finding_id")): f for f in (security_record.get("findings") or ()) if isinstance(f, dict) and f.get("finding_id")}
         cur_r_map = {str(r.get("finding_id")): r for r in (security_record.get("previous_findings_resolution") or ()) if isinstance(r, dict) and r.get("finding_id")}
-        for sfid in sorted(prior_sec_fids):
-            if sfid not in cur_f_map or sfid not in cur_r_map or cur_f_map[sfid].get("status") != "resolved" or cur_r_map[sfid].get("status") != "resolved" or cur_r_map[sfid].get("verified_on_revision") != candidate_sha:
+        for sfid in sorted(prior_sec_fids | same_r_fids):
+            if sfid not in cur_f_map or cur_f_map[sfid].get("status") != "resolved" or (sfid in prior_sec_fids and (sfid not in cur_r_map or cur_r_map[sfid].get("status") != "resolved" or cur_r_map[sfid].get("verified_on_revision") != candidate_sha)):
                 return _fail("security-blockers-unresolved", f"historical security blocker {sfid} was omitted or unresolved on {candidate_sha}")
     return {**sec_eval, "candidate_sha": candidate_sha, "base_sha": base_sha}
 
@@ -227,30 +241,28 @@ def _load_review_history_for_gate(
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], str | None, str | None]:
     if prior_findings is not None and (not isinstance(prior_findings, list) or any(not isinstance(f, dict) for f in prior_findings)):
         return [], [], "corrupt-prior-history", "prior_findings must be a list of finding objects"
-    if child_dir is not None and home is not None:
-        if child_dir.is_dir():
-            for p in sorted(child_dir.iterdir()):
-                if p.is_dir() and (m := re.fullmatch(r"independent-review-round-(\d+)", p.name)) and ((rp := p / "record.json").exists() or rp.is_symlink()):
-                    if (r_idx := int(m.group(1))) > rec_round:
-                        return [], [], "stale-independent-review", f"independent review round {rec_round} is superseded by round {r_idx}"
+    if child_dir is not None:
+        eff_home = home or child_dir
+        _, rev_err = _scan_rounds(child_dir, eff_home, r"independent-review-round-(\d+)", rec_round, "corrupt-prior-history", "stale-independent-review")
+        if rev_err is not None: return [], [], rev_err["status"], rev_err["blockers"][0]
         if (pb_p := child_dir / "prior-blockers.json").exists() or pb_p.is_symlink():
             try:
-                pb_obj = read_json(pb_p, home)
-                if not isinstance(pb_obj, dict) or not isinstance(pb_obj.get("findings"), list) or any(not isinstance(x, dict) for x in pb_obj["findings"]):
+                pb_obj = read_json(pb_p, eff_home)
+                if not isinstance(pb_obj, dict) or not isinstance(pb_obj.get("findings"), list) or any(not isinstance(x, dict) for x in pb_obj["findings"]) or ("updated_in_round" in pb_obj and _pos_int(pb_obj.get("updated_in_round")) is None):
                     return [], [], "corrupt-prior-history", f"corrupt prior review history structure in {pb_p}"
-                if isinstance(pb_obj.get("updated_in_round"), int) and pb_obj["updated_in_round"] > rec_round:
-                    return [], [], "stale-independent-review", f"prior-blockers.json updated_in_round {pb_obj['updated_in_round']} supersedes round {rec_round}"
+                if (up_r := _pos_int(pb_obj.get("updated_in_round"))) is not None and up_r > rec_round:
+                    return [], [], "stale-independent-review", f"prior-blockers.json updated_in_round {up_r} supersedes round {rec_round}"
             except (errors_module.FactoryError, OSError) as exc:
                 return [], [], "corrupt-prior-history", f"unreadable or corrupt prior review history in {pb_p}: {exc}"
-        try: all_hist = ir_pkg._normalize_prior_findings(child_dir, home, rec_round + 1, prior_findings)
+        try: all_hist = ir_pkg._normalize_prior_findings(child_dir, eff_home, rec_round + 1, prior_findings)
         except errors_module.FactoryError as exc: return [], [], "corrupt-prior-history", str(exc)
     else:
         try: all_hist = ir_pkg._normalize_prior_findings(Path("/nonexistent"), home or Path("/tmp"), 1, prior_findings)
         except errors_module.FactoryError as exc: return [], [], "corrupt-prior-history", str(exc)
     prior_entering: list[dict[str, Any]] = []
     for pf in all_hist:
-        intro_r, intro_rev = int(pf.get("introduced_in_round") or pf.get("created_round") or 1), str(pf.get("introduced_in_revision") or pf.get("created_candidate_sha") or "")
-        prior_hist = [h for h in (pf.get("history") or ()) if isinstance(h, dict) and isinstance(h.get("round"), int) and int(h["round"]) < rec_round]
+        intro_r, intro_rev = _pos_int(pf.get("introduced_in_round") or pf.get("created_round")) or 1, str(pf.get("introduced_in_revision") or pf.get("created_candidate_sha") or "")
+        prior_hist = [h for h in (pf.get("history") or ()) if isinstance(h, dict) and (_pos_int(h.get("round")) or 0) > 0 and int(h["round"]) < rec_round]
         if prior_hist:
             last_h = prior_hist[-1]
             prior_entering.append({
@@ -278,7 +290,9 @@ def evaluate_independent_review_prerequisite(
         return _fail("independent-review-missing", f"missing independent review evidence for candidate {candidate_sha}", historical_blockers=[])
     if review_record.get("role") != "independent-reviewer" or review_record.get("delivery_approved") is not False or review_record.get("verification_scope") != ir_pkg.INDEPENDENT_REVIEW_SCOPE_NOTE:
         return _fail("authority-violation", "non-gate producer independent-reviewer cannot issue delivery_approved=True or alter role scope", historical_blockers=[])
-    rec_round = review_record.get("round") if isinstance(review_record.get("round"), int) and review_record.get("round") >= 1 else 1
+    rec_round = _pos_int(review_record.get("round"))
+    if rec_round is None:
+        return _fail("invalid-review", f"independent review record has missing or invalid round {review_record.get('round')!r}", historical_blockers=[])
     all_hist, prior_entering, hist_st, hist_err = _load_review_history_for_gate(child_dir, home, rec_round, candidate_sha, prior_findings)
     if hist_st is not None: return _fail(hist_st, hist_err or hist_st, historical_blockers=all_hist)
     rev_cand, rev_base, std_sha = review_record.get("reviewed_revision"), review_record.get("base_sha"), review_record.get("standards_sha")
@@ -423,21 +437,26 @@ def evaluate_approval_gate(
         try:
             if isinstance(loaded_ap := read_json(ap_p, home), dict): prior_approval = loaded_ap
         except errors_module.FactoryError: pass
-    if review_record is None and agy_bin is not None and repo is not None and home is not None and child_dir is not None and child is not None and conf is not None:
+    bad_round_arg = round_num is not None and _pos_int(round_num) is None
+    if not bad_round_arg and review_record is None and agy_bin is not None and repo is not None and home is not None and child_dir is not None and child is not None and conf is not None:
         review_record = ir_pkg.review_candidate_independently(
             repo=repo, home=home, child_dir=child_dir, child=child, conf=conf, base_sha=base_sha, candidate_sha=candidate_sha,
             builder_session_id=builder_session_id, builder_summary=builder_summary, qa_record=qa_record, security_record=security_record,
-            prior_findings=prior_findings, round_num=round_num or 1, agy_bin=agy_bin, deadline=deadline or (time.monotonic() + 30.0), limit_s=limit_s,
+            prior_findings=prior_findings, round_num=_pos_int(round_num) or 1, agy_bin=agy_bin, deadline=deadline or (time.monotonic() + 30.0), limit_s=limit_s,
         )
-    eff_round = round_num or (review_record.get("round") if isinstance(review_record, dict) and isinstance(review_record.get("round"), int) else 1)
+    rec_r_val = _pos_int(review_record.get("round")) if isinstance(review_record, dict) else None
+    eff_round = _pos_int(round_num) or rec_r_val or 1
     ci_eval = evaluate_ci_prerequisite(candidate_sha, base_sha, ci_record, repo=repo, home=home, child=child, conf=conf, deadline=deadline, limit_s=limit_s)
     exp_tested, exp_kind = (ci_eval.get("tested_sha"), ci_eval.get("revision_kind")) if ci_eval["verified"] else (None, None)
     qa_eval = evaluate_qa_prerequisite(candidate_sha, base_sha, qa_record, child_dir=child_dir, home=home, repo=repo, child=child, expected_tested_sha=exp_tested, expected_revision_kind=exp_kind, deadline=deadline, limit_s=limit_s)
     sec_eval = evaluate_security_prerequisite(candidate_sha, base_sha, security_record, child_dir=child_dir, home=home)
-    rev_eval = evaluate_independent_review_prerequisite(
-        candidate_sha, base_sha, review_record, child_dir=child_dir, home=home, repo=repo, child=child, conf=conf,
-        builder_session_id=builder_session_id, prior_findings=prior_findings, qa_eval=qa_eval, sec_eval=sec_eval, deadline=deadline, limit_s=limit_s,
-    )
+    if bad_round_arg or (_pos_int(round_num) is not None and rec_r_val is not None and round_num != rec_r_val):
+        rev_eval = _fail("invalid-review", f"invalid or mismatched round_num {round_num!r}", historical_blockers=[])
+    else:
+        rev_eval = evaluate_independent_review_prerequisite(
+            candidate_sha, base_sha, review_record, child_dir=child_dir, home=home, repo=repo, child=child, conf=conf,
+            builder_session_id=builder_session_id, prior_findings=prior_findings, qa_eval=qa_eval, sec_eval=sec_eval, deadline=deadline, limit_s=limit_s,
+        )
     prior_ap_rev = str(prior_approval.get("approved_revision") or prior_approval.get("candidate_sha") or "").strip() if isinstance(prior_approval, dict) else ""
     prior_ap_stale = bool(prior_ap_rev and prior_ap_rev != candidate_sha)
     all_verified = ci_eval["verified"] and qa_eval["verified"] and sec_eval["verified"] and rev_eval["verified"]
