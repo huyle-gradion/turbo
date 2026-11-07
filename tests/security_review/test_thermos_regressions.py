@@ -38,52 +38,35 @@ class ThermosRegressionsTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             repo, home, bare = _make_disposable_product_workspace(root)
-            builder_agy = _make_fake_agy(root, "agy-builder", _make_builder_script("fix-with-usage"))
-            rev_agy = _make_fake_agy(root, "agy-rev", REVIEWER_SCRIPT)
-            in_flight: list[tuple[dict, dict]] = []
-            orig_rev = security_review.review_candidate_security
-
+            builder_agy, rev_agy = _make_fake_agy(root, "agy-builder", _make_builder_script("fix-with-usage")), _make_fake_agy(root, "agy-rev", REVIEWER_SCRIPT)
+            in_flight, orig_rev = [], security_review.review_candidate_security
             def _spy_rev(**kw):
                 in_flight.append((json.loads((home / "deliveries/900/record.json").read_text(encoding="utf-8")),
                                   json.loads((kw["child_dir"].parents[1] / "record.json").read_text(encoding="utf-8"))))
                 return orig_rev(**kw)
-
-            with (_DisposableAsanaServer(PARENT_TASK, [{"data": [READY_CHILD], "next_page": None}]) as asana,
-                  _SyncingGitHubServer(bare_repo=bare) as gh,
-                  unittest.mock.patch.dict(os.environ, {"TURBO_ASANA_API_URL": asana.base_url, "ASANA_ACCESS_TOKEN": "tok-a",
-                                                        "TURBO_GITHUB_API_URL": gh.base_url, "TURBO_GITHUB_TOKEN": "tok-g"})):
+            with (_DisposableAsanaServer(PARENT_TASK, [{"data": [READY_CHILD], "next_page": None}]) as asana, _SyncingGitHubServer(bare_repo=bare) as gh,
+                  unittest.mock.patch.dict(os.environ, {"TURBO_ASANA_API_URL": asana.base_url, "ASANA_ACCESS_TOKEN": "tok-a", "TURBO_GITHUB_API_URL": gh.base_url, "TURBO_GITHUB_TOKEN": "tok-g"})):
+                run_sec = lambda: security_review.deliver_with_security_review(
+                    RuntimePaths(repo=repo, home=home), security_review.DeliverSecuritySpec(task_ref="900", time_limit_seconds=30, agy_bin=str(builder_agy), reviewer_agy_bin=str(rev_agy)))
                 with (unittest.mock.patch.object(security_review, "review_candidate_security", side_effect=_spy_rev),
-                      unittest.mock.patch.object(security_review, "evaluate_child_pr_with_security_gate",
-                                                 side_effect=deliver_checks.GitHubError("simulated PR update failure"))):
-                    try:
-                        res = security_review.deliver_with_security_review(
-                            RuntimePaths(repo=repo, home=home),
-                            security_review.DeliverSecuritySpec(task_ref="900", time_limit_seconds=30, agy_bin=str(builder_agy), reviewer_agy_bin=str(rev_agy)))
-                    except deliver_checks.GitHubError:
-                        res = None
+                      unittest.mock.patch.object(security_review, "evaluate_child_pr_with_security_gate", side_effect=deliver_checks.GitHubError("simulated PR update failure"))):
+                    res = run_sec()
                 parent_rec = json.loads((home / "deliveries/900/record.json").read_text(encoding="utf-8"))
                 attempt_rec = json.loads((home / "deliveries/900/attempt-1/record.json").read_text(encoding="utf-8"))
                 self.assertFalse(parent_rec["verified"], "persisted parent record must never remain verified=True on post-deliver failure")
                 self.assertFalse(attempt_rec["verified"], "persisted attempt record must never remain verified=True on post-deliver failure")
                 self.assertEqual((in_flight[0][0]["status"], in_flight[0][0]["verified"]), ("security-review-pending", False))
                 self.assertEqual((in_flight[0][1]["status"], in_flight[0][1]["verified"]), ("security-review-pending", False))
-                self.assertIsNotNone(res); self.assertEqual((res.status, res.verified), ("pr-failed", False))
-
-                with unittest.mock.patch.object(security_review, "review_candidate_security",
-                                                side_effect=deliver_checks.AttemptTimeoutError("review timed out")):
-                    res_to = security_review.deliver_with_security_review(
-                        RuntimePaths(repo=repo, home=home),
-                        security_review.DeliverSecuritySpec(task_ref="900", time_limit_seconds=30, agy_bin=str(builder_agy), reviewer_agy_bin=str(rev_agy)))
+                self.assertEqual((res.status, res.verified), ("pr-failed", False))
+                with unittest.mock.patch.object(security_review, "review_candidate_security", side_effect=deliver_checks.AttemptTimeoutError("review timed out")):
+                    res_to = run_sec()
                 self.assertEqual((res_to.status, res_to.verified), ("timed-out", False))
                 self.assertFalse(json.loads((home / "deliveries/900/record.json").read_text(encoding="utf-8"))["verified"])
                 self.assertEqual(res_to.child["ci_verification"]["status"], "verified", "must preserve initial ci_verification when round 1 fails")
                 gh_ev_txt = Path(res_to.evidence["github_evidence_path"]).read_text(encoding="utf-8")
                 self.assertEqual(res_to.evidence["github_evidence_sha256"], security_review.runner.digest_text(gh_ev_txt))
-
                 with unittest.mock.patch.object(security_review.delivery, "resolve_github_token", side_effect=UsageError("missing token after deliver")):
-                    res_cfg = security_review.deliver_with_security_review(
-                        RuntimePaths(repo=repo, home=home),
-                        security_review.DeliverSecuritySpec(task_ref="900", time_limit_seconds=30, agy_bin=str(builder_agy), reviewer_agy_bin=str(rev_agy)))
+                    res_cfg = run_sec()
                 self.assertFalse(res_cfg.verified)
                 self.assertFalse(json.loads((home / "deliveries/900/record.json").read_text(encoding="utf-8"))["verified"])
 
@@ -355,6 +338,40 @@ class ThermosRegressionsTest(unittest.TestCase):
                 {"usage": {"state": "reported"}, "cost": {"state": "reported", "usd": 0.05}},
                 [{"usage": {"state": "reported"}, "cost": {"state": "reported", "usd": 0.03}}], 100)
             self.assertEqual((rep_cost["cost"]["state"], rep_cost["cost"]["usd"]), ("reported", 0.08))
+
+    def test_11_no_premature_verified_record_persisted_before_security_review(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo, home, bare = _make_disposable_product_workspace(root)
+            builder_agy, rev_agy = _make_fake_agy(root, "agy-builder", _make_builder_script("fix-with-usage")), _make_fake_agy(root, "agy-rev", REVIEWER_SCRIPT)
+            pre_gate_writes, orig_atomic, orig_deliver = [], security_review.delivery.deliver_module.atomic_json, security_review.delivery.deliver_module.deliver_feature
+            def _spy_atomic(path: Path, payload: dict, root_dir: Path | None = None) -> None:
+                if path.name == "record.json" and not list(home.glob("deliveries/900/attempt-*/children/*/security-review.json")):
+                    pre_gate_writes.append((str(path), dict(payload)))
+                return orig_atomic(path, payload, root_dir)
+            def _interrupt_on_deliver_return(*args, **kwargs):
+                orig_deliver(*args, **kwargs)
+                raise KeyboardInterrupt("interrupted immediately as deliver_feature returned")
+            with (_DisposableAsanaServer(PARENT_TASK, [{"data": [READY_CHILD], "next_page": None}]) as asana, _SyncingGitHubServer(bare_repo=bare) as gh,
+                  unittest.mock.patch.dict(os.environ, {"TURBO_ASANA_API_URL": asana.base_url, "ASANA_ACCESS_TOKEN": "tok-a", "TURBO_GITHUB_API_URL": gh.base_url, "TURBO_GITHUB_TOKEN": "tok-g"})):
+                run_sec = lambda: security_review.deliver_with_security_review(
+                    RuntimePaths(repo=repo, home=home), security_review.DeliverSecuritySpec(task_ref="900", time_limit_seconds=30, agy_bin=str(builder_agy), reviewer_agy_bin=str(rev_agy)))
+                with unittest.mock.patch.object(security_review.delivery.deliver_module, "deliver_feature", side_effect=_interrupt_on_deliver_return):
+                    with self.assertRaises(KeyboardInterrupt):
+                        run_sec()
+                interrupted_parent = json.loads((home / "deliveries/900/record.json").read_text(encoding="utf-8"))
+                interrupted_attempt = json.loads((home / "deliveries/900/attempt-1/record.json").read_text(encoding="utf-8"))
+                self.assertEqual((interrupted_parent["status"], interrupted_parent["verified"]), ("security-review-pending", False))
+                self.assertEqual((interrupted_attempt["status"], interrupted_attempt["verified"]), ("security-review-pending", False))
+                self.assertFalse(interrupted_parent["child"]["verified"])
+                self.assertFalse(interrupted_parent["child"]["pr"]["verified"])
+                with unittest.mock.patch.object(security_review.delivery.deliver_module, "atomic_json", side_effect=_spy_atomic):
+                    res = run_sec()
+                self.assertTrue(res.verified); self.assertGreaterEqual(len(pre_gate_writes), 2)
+                for wpath, wpayload in pre_gate_writes:
+                    self.assertFalse(wpayload.get("verified"), f"premature verified=True written to {wpath} before security gate")
+                    self.assertEqual(wpayload.get("status"), "security-review-pending", f"premature status written to {wpath}")
+                    self.assertFalse((wpayload.get("child") or {}).get("verified"), f"premature child.verified=True written to {wpath}")
 
 
 if __name__ == "__main__":

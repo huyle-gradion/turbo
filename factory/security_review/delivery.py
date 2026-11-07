@@ -169,16 +169,12 @@ def _classify_repair_failure(rep_out: dict[str, Any], candidate_sha: str, limit_
 def deliver_with_security_review(paths: RuntimePaths, spec: DeliverSecuritySpec) -> deliver_module.DeliverResult:
     from factory import security_review as sr_mod
     started, limit_s = time.monotonic(), spec.time_limit_seconds
-    deadline = started + limit_s
-    reviewer_bin = spec.reviewer_agy_bin if spec.reviewer_agy_bin is not None else spec.agy_bin
+    deadline, reviewer_bin = started + limit_s, (spec.reviewer_agy_bin if spec.reviewer_agy_bin is not None else spec.agy_bin)
     if reviewer_bin and str(reviewer_bin).strip():
-        worker_module.validate_execution_options(
-            worker_module.platform_info(), time_limit_seconds=limit_s, agy_bin=str(reviewer_bin), rates=spec.rates,
-        )
+        worker_module.validate_execution_options(worker_module.platform_info(), time_limit_seconds=limit_s, agy_bin=str(reviewer_bin), rates=spec.rates)
     initial_res = deliver_module.deliver_feature(
-        paths, deliver_module.DeliverSpec(task_ref=spec.task_ref, time_limit_seconds=limit_s, agy_bin=spec.agy_bin, rates=spec.rates),
-    )
-    if initial_res.status != "verified" or initial_res.child is None:
+        paths, deliver_module.DeliverSpec(task_ref=spec.task_ref, time_limit_seconds=limit_s, agy_bin=spec.agy_bin, rates=spec.rates, verified_status="security-review-pending"))
+    if initial_res.status not in ("verified", "security-review-pending") or initial_res.child is None:
         return initial_res
 
     secrets = collect_redaction_secrets()
@@ -191,13 +187,6 @@ def deliver_with_security_review(paths: RuntimePaths, spec: DeliverSecuritySpec)
     cand_diff_path = str(initial_res.evidence.get("candidate_diff_path") or "")
     init_ci = dict(child_rec["ci_verification"]) if isinstance(child_rec.get("ci_verification"), dict) else None
     combined_gate: dict[str, Any] = dict(init_ci) if init_ci is not None else {}
-
-    pending_res = replace(
-        initial_res, status="security-review-pending", verified=False, verification_scope=VERIFICATION_SCOPE_SECURITY_NOTE,
-        child=redact_value({**child_rec, "status": "security-review-pending", "verified": False, "verification_scope": VERIFICATION_SCOPE_SECURITY_NOTE}, secrets),
-        recorded_at=now(),
-    )
-    atomic_json(attempt_dir / "record.json", pending_res.to_dict(), paths.home); atomic_json(parent_root / "record.json", pending_res.to_dict(), paths.home)
 
     rounds_history, repair_records, repair_meas_list, prior_findings = [], [], [], []
     repairs_used, final_status, final_blockers = 0, "security-review-pending", []
@@ -284,8 +273,7 @@ def deliver_with_security_review(paths: RuntimePaths, spec: DeliverSecuritySpec)
             rep_out = sr_mod._run_isolated_role_checkout(
                 repo=paths.repo, home=paths.home, role_dir=repair_dir, candidate_sha=candidate_sha, base_sha=base_sha,
                 agy_bin=spec.agy_bin, evidence_prefix="repair", secrets=secrets, deadline=deadline, limit_s=limit_s,
-                build_prompt_fn=lambda _wt, _pr: (repair_prompt, {}), after_fn=_after_repair,
-            )
+                build_prompt_fn=lambda _wt, _pr: (repair_prompt, {}), after_fn=_after_repair)
             rep_meas = worker_module.extract_measurements(rep_out["final_res"], rep_out["elapsed_ms"], spec.rates)
             if rep_out["executed"]:
                 repair_meas_list.append(rep_meas)
@@ -293,8 +281,7 @@ def deliver_with_security_review(paths: RuntimePaths, spec: DeliverSecuritySpec)
                 "repair_round": repairs_used, "from_sha": candidate_sha, "to_sha": rep_out["new_sha"], "exit_code": rep_out["exit_code"],
                 "elapsed_ms": rep_out["elapsed_ms"], "stdout_path": rep_out["stdout_path"], "stderr_path": rep_out["stderr_path"],
                 "diff_path": str(rep_out["diff_path"]), "measurements": rep_meas,
-                "routed_finding_ids": [f["finding_id"] for f in (sec_rev.get("blocking_findings") or [])], "safety": rep_out["safety"],
-            })
+                "routed_finding_ids": [f["finding_id"] for f in (sec_rev.get("blocking_findings") or [])], "safety": rep_out["safety"]})
             if (rep_fail := _classify_repair_failure(rep_out, candidate_sha, limit_s)) is not None:
                 final_status, final_blockers = rep_fail; break
             live_pr = github_request("GET", f"{gh_api_url}/repos/{repo_slug}/pulls/{pr_info['number']}", gh_token, gh_api_url, gh_trace, deadline, limit_s)
@@ -321,19 +308,15 @@ def deliver_with_security_review(paths: RuntimePaths, spec: DeliverSecuritySpec)
         "candidate_sha": candidate_sha, "tested_sha": combined_gate.get("tested_sha"), "diff": diff_info,
         "scope_check": scope_detail, "verification_checks": combined_gate.get("checks", []), "ci_verification": combined_gate,
         "security_review": sec_rev, "security_repair": {"repairs_used": repairs_used, "max_repair_rounds": spec.max_repair_rounds,
-                                                        "repair_attempts": repair_records, "rounds": rounds_history}, "pr": pr_info,
-    }
+                                                        "repair_attempts": repair_records, "rounds": rounds_history}, "pr": pr_info}
     updated_evidence = {
         **initial_res.evidence, "candidate_diff_path": cand_diff_path, "github_evidence_path": gh_evidence_path,
-        "github_evidence_sha256": runner.digest_text(gh_trace_text),
-        "security_review_path": str(child_dir / "security-review.json"), "security_rounds": len(rounds_history),
-        "security_repairs_used": repairs_used, "github_requests": gh_trace,
-    }
+        "github_evidence_sha256": runner.digest_text(gh_trace_text), "security_review_path": str(child_dir / "security-review.json"),
+        "security_rounds": len(rounds_history), "security_repairs_used": repairs_used, "github_requests": gh_trace}
     updated_meas = _merge_measurements(initial_res.measurements, repair_meas_list, int((time.monotonic() - started) * 1000), spec.rates)
     result = replace(
         initial_res, status=final_status, verified=is_verified, verification_scope=VERIFICATION_SCOPE_SECURITY_NOTE,
         child=redact_value(updated_child, secrets), blockers=redact_value(final_blockers, secrets),
-        measurements=updated_meas, evidence=redact_value(updated_evidence, secrets), recorded_at=now(),
-    )
+        measurements=updated_meas, evidence=redact_value(updated_evidence, secrets), recorded_at=now())
     atomic_json(attempt_dir / "record.json", result.to_dict(), paths.home); atomic_json(parent_root / "record.json", result.to_dict(), paths.home)
     return result
