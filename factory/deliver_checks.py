@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import io
-import json, math, os, re, shlex, subprocess, time
+import json, os, re, shlex, subprocess, time
 from pathlib import Path, PurePosixPath
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -11,10 +11,9 @@ from urllib.parse import quote, urlparse
 from urllib.request import Request, build_opener
 import zipfile
 
-from factory import config as config_module, gitio, runner, worker as worker_module
+from factory import config as config_module, gitio
 from factory.errors import UsageError
 from factory.intake import NoRedirectHandler, same_api_origin
-from factory.paths import safe_dir, write_evidence
 
 DEFAULT_GITHUB_API_URL = "https://api.github.com"
 REPO_SLUG_RE = re.compile(r"^(?:https://github\.com/|git@github\.com:)?([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+?)(?:\.git)?/?$")
@@ -251,28 +250,6 @@ def inspect_diff_categories(worktree: Path, base_sha: str, head_sha: str, deadli
         "has_implementation_changes": has_impl_changes, "has_test_changes": has_test_changes,
     }
 
-def prepare_verification_env(worker_env: dict[str, str], child_dir: Path, home: Path) -> dict[str, str]:
-    verify_home = safe_dir(child_dir / "verify-home", create=True, root=home)
-    tmp_dir = str(safe_dir(verify_home / ".tmp", create=True, root=home))
-    clean = {
-        key: val for key, val in worker_env.items()
-        if "TOKEN" not in key.upper()
-        and not (key.upper().startswith("TURBO_") and key.upper().endswith("_URL"))
-        and not key.upper().endswith("_PROXY")
-        and key.upper() not in ("TURBO_LIVE_AGY", "PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP", "PYTHONUSERBASE")
-    }
-    clean.update({
-        "HOME": str(verify_home), "TMPDIR": tmp_dir, "TMP": tmp_dir, "TEMP": tmp_dir,
-        "XDG_CONFIG_HOME": str(verify_home / ".config"), "XDG_CACHE_HOME": str(verify_home / ".cache"),
-        "GIT_CONFIG_GLOBAL": str(verify_home / "nonexistent-gitconfig"),
-        "GIT_CONFIG_SYSTEM": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1", "GIT_TERMINAL_PROMPT": "0",
-        "GIT_ASKPASS": "/bin/false", "SSH_ASKPASS": "/bin/false", "SSH_AUTH_SOCK": "",
-        "GIT_SSH_COMMAND": "false", "GIT_ALLOW_PROTOCOL": "none",
-        "HTTP_PROXY": "http://127.0.0.1:1", "HTTPS_PROXY": "http://127.0.0.1:1",
-        "ALL_PROXY": "http://127.0.0.1:1", "NO_PROXY": "", "PIP_NO_INDEX": "1",
-        "NPM_CONFIG_OFFLINE": "true",
-    })
-    return clean
 
 def _verification_argv(raw: str) -> tuple[str, ...] | None:
     try:
@@ -281,57 +258,6 @@ def _verification_argv(raw: str) -> tuple[str, ...] | None:
         return None
     return tokens if tokens and PurePosixPath(tokens[0]).name in EXECUTABLE_VERIFIERS else None
 
-def _exec_check(
-    check_id: str, kind: str, stem: str, argv: tuple[str, ...], worktree: Path,
-    child_dir: Path, home: Path, verify_env: dict[str, str], deadline: float, limit_s: int,
-) -> dict[str, Any]:
-    rem = remaining_seconds(deadline, f"verification {check_id}", limit_s)
-    try:
-        code, out_s, err_s, _, timed_out = worker_module.execute_stream(
-            worktree, argv, verify_env, max(1, int(math.ceil(rem))),
-            isolated_home=Path(verify_env["HOME"]), allow_network=False,
-        )
-    except OSError as exc:
-        out = f"[factory] verification executable failed to start ({argv[0]!r}): {exc}\n"
-        ev_path = write_evidence(child_dir, stem, out, home)
-        return {
-            "id": check_id, "kind": kind, "argv": list(argv), "executed": False, "exit": 127,
-            "ok": False, "error": str(exc), "output_path": str(ev_path), "output_sha256": runner.digest_text(out),
-        }
-    out = (out_s + err_s).strip() + "\n"
-    ev_path = write_evidence(child_dir, stem, out, home)
-    if timed_out or time.monotonic() >= deadline:
-        raise AttemptTimeoutError(f"attempt timed out during verification {check_id} after {limit_s}s")
-    return {
-        "id": check_id, "kind": kind, "argv": list(argv), "executed": True, "exit": code,
-        "ok": code == 0, "output_path": str(ev_path), "output_sha256": runner.digest_text(out),
-    }
-
-def run_child_verifications(
-    worktree: Path, child: dict[str, Any], conf: config_module.Config, child_dir: Path,
-    home: Path, worker_env: dict[str, str], deadline: float, limit_s: int,
-) -> tuple[bool, list[dict[str, Any]], list[str]]:
-    verify_env = prepare_verification_env(worker_env, child_dir, home)
-    checks, failures, seen_cmds = [], [], set()
-    for crit in child.get("criteria") or []:
-        cid, ver_str = str(crit.get("id") or "AC"), str(crit.get("verification") or "").strip()
-        argv = _verification_argv(ver_str)
-        if argv is None:
-            checks.append({"id": cid, "kind": "criterion-evaluation", "command": ver_str, "executed": False, "ok": False})
-            failures.append(f"criterion {cid} verification is not an executable check command: {ver_str!r}")
-            continue
-        seen_cmds.add(argv)
-        rec = _exec_check(cid, "criterion-verification", f"check-{cid.lower()}", argv, worktree, child_dir, home, verify_env, deadline, limit_s)
-        if not rec["ok"]:
-            failures.append(f"criterion {cid} verification failed (exit {rec['exit']}): {ver_str}")
-        checks.append(rec)
-    gate2 = conf.gates.get("2")
-    if gate2 is not None and gate2.kind == "command" and gate2.argv and gate2.argv not in seen_cmds:
-        rec = _exec_check("gate-2", "project-tests", "check-project-tests", gate2.argv, worktree, child_dir, home, verify_env, deadline, limit_s)
-        if not rec["ok"]:
-            failures.append(f"project test check failed (exit {rec['exit']}): {' '.join(gate2.argv)}")
-        checks.append(rec)
-    return len(failures) == 0, checks, failures
 
 def github_request(
     method: str, url: str, token: str, base_url: str, trace: list[dict[str, Any]],
@@ -429,7 +355,7 @@ def open_and_confirm_pr(
         "title": str(verified.get("title") or title), "body": str(verified.get("body") or body),
         "state": state, "merged": merged, "repository": obs_base_repo,
         "base_ref": obs_base_ref, "head_ref": obs_head_ref, "head_sha": obs_head_sha,
-        "pr_confirmed": True, "ci_verified": False, "verified": True,
+        "pr_confirmed": True, "ci_verified": False, "verified": False,
     }
 
 
