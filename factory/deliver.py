@@ -29,6 +29,7 @@ class DeliverSpec:
     time_limit_seconds: int
     agy_bin: str = "agy"
     rates: worker_module.RateCard | None = None
+    verified_status: str = "verified"
 
 
 @dataclass(frozen=True, slots=True)
@@ -364,7 +365,9 @@ def deliver_feature(paths: RuntimePaths, spec: DeliverSpec) -> DeliverResult:
                     artifact_retry_delay_s=0.0 if gh_is_loopback else 2.0,
                 )
                 pr_info = ci_verification.get("pr") or pr_info
-                final_status = str(ci_verification["status"])
+                final_status = spec.verified_status if str(ci_verification["status"]) == "verified" else str(ci_verification["status"])
+                if isinstance(pr_info, dict) and final_status != "verified":
+                    pr_info = {**pr_info, "verified": False}
                 blockers.extend(ci_verification.get("blockers") or [])
             except AttemptTimeoutError as exc:
                 if pr_info is not None:
