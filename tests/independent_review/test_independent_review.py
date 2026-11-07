@@ -487,15 +487,15 @@ class IndependentReviewTest(unittest.TestCase):
                 ("dismissed", {fid2: {"finding_id": fid2, "resolution": "dismissed", "evidence": "dismissed"}}, {}, "thread-closure-only"),
                 ("unsupported-fixed", {fid2: {"finding_id": fid2, "resolution": "fixed", "evidence": "looks good in prose only"}}, {"obs_ver": {**obs_ok, "finding_verifications": {}}}, "unsupported-assertion"),
                 ("unsupported-nla", {fid2: {"finding_id": fid2, "resolution": "no-longer-applicable", "evidence": "not needed anymore"}}, {"obs_ver": {**obs_ok, "finding_verifications": {}}}, "unsupported-assertion"),
-                ("unbound-check", {fid2: {"finding_id": fid2, "resolution": "fixed", "evidence": "wrong target check", "reproducer_verification": {**valid_chk, "finding_id": "REV-OTHER", "assesses": "OTHER-TARGET", "name": "finding/REV-OTHER"}}}, {"obs_ver": {**obs_ok, "finding_verifications": {}}}, "unsupported-assertion"),
+                ("unbound-check", {fid2: {"finding_id": fid2, "resolution": "fixed", "evidence": "wrong target check"}}, {"obs_ver": {**obs_ok, "finding_verifications": {fid2: {**valid_chk, "finding_id": "REV-OTHER", "assesses": "OTHER-TARGET", "name": "finding/REV-OTHER"}}}}, "unsupported-assertion"),
                 ("downgrade-sugg", {}, {"agent_findings": [{"finding_id": "REV-SUGG", "category": "non-blocking-suggestion", "blocking": False, "target": "src/chat_bridge/auth.py", "rule": "b2-rule", "title": "Downgraded", "evidence": "nit", "actionable_correction": "opt"}]}, "unsupported-assertion"),
                 ("missing-ev-text", {fid2: {"finding_id": fid2, "resolution": "fixed", "evidence": ""}}, {}, "missing-evidence"),
-                ("unexecuted-chk", {fid2: {"finding_id": fid2, "resolution": "fixed", "evidence": "unexecuted", "reproducer_verification": {**valid_chk, "executed": False, "ok": False}}}, {}, "missing-verification"),
-                ("missing-log", {fid2: {"finding_id": fid2, "resolution": "fixed", "evidence": "missing log", "reproducer_verification": {**valid_chk, "output_path": str(home / "nonexistent.log")}}}, {}, "missing-verification"),
-                ("tampered-digest", {fid2: {"finding_id": fid2, "resolution": "fixed", "evidence": "bad digest", "reproducer_verification": {**valid_chk, "output_sha256": "0" * 64}}}, {}, "missing-verification"),
+                ("unexecuted-chk", {fid2: {"finding_id": fid2, "resolution": "fixed", "evidence": "unexecuted"}}, {"obs_ver": {**obs_ok, "finding_verifications": {fid2: {**valid_chk, "executed": False, "ok": False}}}}, "missing-verification"),
+                ("missing-log", {fid2: {"finding_id": fid2, "resolution": "fixed", "evidence": "missing log"}}, {"obs_ver": {**obs_ok, "finding_verifications": {fid2: {**valid_chk, "output_path": str(home / "nonexistent.log")}}}}, "missing-verification"),
+                ("tampered-digest", {fid2: {"finding_id": fid2, "resolution": "fixed", "evidence": "bad digest"}}, {"obs_ver": {**obs_ok, "finding_verifications": {fid2: {**valid_chk, "output_sha256": "0" * 64}}}}, "missing-verification"),
                 ("stale-ev-sha", {fid2: {"finding_id": fid2, "resolution": "fixed", "evidence": "old sha", "evidence_sha": cand1}}, {}, "stale-evidence"),
                 ("stale-same-rev", {fid2: {"finding_id": fid2, "resolution": "fixed", "evidence": "same rev"}}, {"candidate_sha": cand2}, "stale-evidence"),
-                ("stale-chk-sha", {fid2: {"finding_id": fid2, "resolution": "fixed", "evidence": "old chk", "reproducer_verification": {**valid_chk, "head_sha": cand1}}}, {}, "stale-evidence"),
+                ("stale-chk-sha", {fid2: {"finding_id": fid2, "resolution": "fixed", "evidence": "old chk"}}, {"obs_ver": {**obs_ok, "finding_verifications": {fid2: {**valid_chk, "head_sha": cand1}}}}, "stale-evidence"),
                 ("stale-qa", {fid2: {"finding_id": fid2, "resolution": "fixed", "evidence": "stale qa"}}, {"qa_eval": {"status": "stale-qa-evidence", "verified": False}}, "stale-evidence"),
             ):
                 kw = {"round_num": 3, "candidate_sha": cand3, "base_sha": base_sha, "agent_findings": [], "det_findings": [], "prior_findings": prior_open, "reconciliations": rec_override, "obs_ver": obs_ok, "qa_eval": {"status": "qa-verified", "verified": True}, "sec_eval": {"status": "approved", "verified": True}, "home": home, **kw_extra}
@@ -525,6 +525,45 @@ class IndependentReviewTest(unittest.TestCase):
                 r3 = run_rev(round_num=3, candidate_sha=cand2, prior_findings=[], qa_record=_valid_qa_record(cand2, base_sha), security_record=_valid_security_record(cand2, base_sha, home), agy_bin=str(agy2))
                 self.assertEqual((r3["outcome"], r3["review_verified"], r3["delivery_approved"]), ("invalid-review", False, False))
                 self.assertTrue(r3["role_issues"] and fid in r3["open_finding_ids"] and any(f["finding_id"] == fid and f["status"] == "open" for f in r3["blocking_findings"]))
+
+    def test_reconcil_m2_reject_forged_or_relabelled_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo, home, base_sha, _, _, _, _, _, run_rev = self._setup_workspace(root)
+            vcmd = "python3 -c \"import pathlib, sys; sys.exit(0 if '# m2-fixed' in pathlib.Path('src/chat_bridge/auth.py').read_text() else 1)\""
+            fid_cmd = independent_review.compute_review_finding_id("bug", "src/chat_bridge/auth.py", "m2-cmd-bug")
+            fid_nocmd = independent_review.compute_review_finding_id("bug", "src/chat_bridge/auth.py", "m2-nocmd-bug")
+            r1_findings = [
+                {"category": "bug", "blocking": True, "target": "src/chat_bridge/auth.py", "rule": "m2-cmd-bug", "title": "M2 cmd", "evidence": "r1-cmd", "actionable_correction": "Add # m2-fixed", "verification_command": vcmd},
+                {"category": "bug", "blocking": True, "target": "src/chat_bridge/auth.py", "rule": "m2-nocmd-bug", "title": "M2 nocmd", "evidence": "r1-nocmd", "actionable_correction": "Fix nocmd"},
+            ]
+            agy1 = _make_fake_agy(root, "agy-m2-1", _make_staged_reviewer_script(session_id="rev-m2-1", outcome="changes-requested", assessment={**DEFAULT_ASSESSMENT, "edge_cases": {"status": "unsatisfied", "summary": "m2"}}, findings=r1_findings))
+            r1 = run_rev(round_num=1, agy_bin=str(agy1))
+            self.assertEqual(set(r1["open_finding_ids"]), {fid_cmd, fid_nocmd})
+            (repo / "src/chat_bridge/auth.py").write_text(CLEAN_AUTH_PY + "# m2-unfixed\n", encoding="utf-8"); git(repo, "add", "."); git(repo, "commit", "-q", "-m", "m2 r2 unfixed")
+            cand2 = git(repo, "rev-parse", "HEAD")
+            unrelated_log = Path(r1["observed_verification"]["checks"][0]["output_path"])
+            unrelated_sha = r1["observed_verification"]["checks"][0]["output_sha256"]
+            forged_ver = {"finding_id": fid_nocmd, "name": f"finding/{fid_nocmd}", "assesses": fid_nocmd, "kind": "finding-reproducer", "command": vcmd, "argv": ["python3"], "executed": True, "completed": True, "ok": True, "exit_code": 0, "timed_out": False, "head_sha": cand2, "output_path": str(unrelated_log), "output_sha256": unrelated_sha, "provenance": "observed-finding-reproducer"}
+            r2_reconcils = [
+                {"finding_id": fid_cmd, "resolution": "fixed", "evidence": "forged over failing check", "reproducer_verification": {**forged_ver, "finding_id": fid_cmd, "name": f"finding/{fid_cmd}", "assesses": fid_cmd}},
+                {"finding_id": fid_nocmd, "resolution": "fixed", "evidence": "reviewer-authored flags without execution", "reproducer_verification": forged_ver},
+            ]
+            agy2 = _make_fake_agy(root, "agy-m2-2", _make_staged_reviewer_script(session_id="rev-m2-2", outcome="review-passed", reconciliations=r2_reconcils))
+            r2 = run_rev(round_num=2, candidate_sha=cand2, qa_record=_valid_qa_record(cand2, base_sha), security_record=_valid_security_record(cand2, base_sha, home), agy_bin=str(agy2))
+            self.assertEqual((r2["outcome"], r2["review_verified"], set(r2["open_finding_ids"])), ("changes-requested", False, {fid_cmd, fid_nocmd}))
+            ac1_chk = r2["observed_verification"]["checks"][0]
+            relabelled_chk = {**ac1_chk, "finding_id": fid_cmd, "name": f"finding/{fid_cmd}", "assesses": fid_cmd, "kind": "finding-reproducer", "command": vcmd, "provenance": "observed-finding-reproducer"}
+            flipped_fail_chk = {**r2["observed_verification"]["finding_verifications"][fid_cmd], "ok": True, "exit_code": 0}
+            for bad_chk in (relabelled_chk, flipped_fail_chk, forged_ver):
+                _, blk_m2, _, _ = independent_review.reconcile_review_findings(round_num=2, candidate_sha=cand2, base_sha=base_sha, agent_findings=[], det_findings=[], prior_findings=r1["blocking_findings"], reconciliations={fid_cmd: {"finding_id": fid_cmd, "resolution": "fixed", "evidence": "claim"}}, obs_ver={**r2["observed_verification"], "finding_verifications": {fid_cmd: bad_chk}}, qa_eval={"status": "qa-verified", "verified": True}, sec_eval={"status": "approved", "verified": True}, home=home)
+                self.assertIn(fid_cmd, [f["finding_id"] for f in blk_m2])
+            (repo / "src/chat_bridge/auth.py").write_text(CLEAN_AUTH_PY + "# m2-fixed\n", encoding="utf-8"); git(repo, "add", "."); git(repo, "commit", "-q", "-m", "m2 r3 fixed")
+            cand3 = git(repo, "rev-parse", "HEAD")
+            r3_reconcils = [{"finding_id": fid_cmd, "resolution": "fixed", "evidence": "genuinely fixed"}, {"finding_id": fid_nocmd, "resolution": "fixed", "evidence": "genuinely fixed with cmd", "verification_command": vcmd}]
+            agy3 = _make_fake_agy(root, "agy-m2-3", _make_staged_reviewer_script(session_id="rev-m2-3", outcome="review-passed", reconciliations=r3_reconcils))
+            r3 = run_rev(round_num=3, candidate_sha=cand3, qa_record=_valid_qa_record(cand3, base_sha), security_record=_valid_security_record(cand3, base_sha, home), agy_bin=str(agy3))
+            self.assertEqual((r3["outcome"], r3["review_verified"], r3["open_finding_ids"]), ("review-passed", True, []))
 
 def run_disposable_demo(tmp: Path) -> dict:
     repo, home, _ = _make_disposable_product_workspace(tmp)

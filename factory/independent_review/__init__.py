@@ -243,7 +243,7 @@ def _parse_phase2_response_full(response_text: str, *, has_prior_blockers: bool 
             fid = compute_review_finding_id(cat, target, rule) if (tgt_slug and rule_slug) else str(raw.get("finding_id") or "").strip()
             if fid:
                 norm_r = "fixed" if raw_res == "resolved" else raw_res.replace("_", "-")
-                reconcils[fid] = {"finding_id": fid, "target": target, "rule": rule, "resolution": norm_r, "evidence": evidence, "verification_command": vcmd, "reproducer_verification": raw.get("reproducer_verification"), "evidence_sha": str(raw.get("evidence_sha") or raw.get("candidate_sha") or raw.get("verified_on_revision") or "").strip()}
+                reconcils[fid] = {"finding_id": fid, "target": target, "rule": rule, "resolution": norm_r, "evidence": evidence, "verification_command": vcmd, "evidence_sha": str(raw.get("evidence_sha") or raw.get("candidate_sha") or raw.get("verified_on_revision") or "").strip()}
             continue
         if blocking and (not tgt_slug or not rule_slug or not evidence or not correction):
             issues.append(f"blocker finding[{idx}] requires alphanumeric target and rule slugs, concrete evidence, and actionable_correction"); continue
@@ -262,7 +262,6 @@ def _parse_phase2_response_full(response_text: str, *, has_prior_blockers: bool 
             "finding_id": rfid or raw_fid, "target": target, "rule": rule, "resolution": "fixed" if raw_res == "resolved" else raw_res,
             "evidence": str(r_item.get("evidence") or r_item.get("resolution_evidence") or "").strip(),
             "verification_command": str(r_item.get("verification_command") or "").strip(),
-            "reproducer_verification": r_item.get("reproducer_verification") or r_item.get("observed_evidence"),
             "evidence_sha": str(r_item.get("evidence_sha") or r_item.get("candidate_sha") or r_item.get("verified_on_revision") or "").strip(),
         }
         if rfid: reconcils[rfid] = entry_r
@@ -301,12 +300,24 @@ def _run_observed_verification(worktree: Path, verify_dir: Path, home: Path, chi
     if not specs: gaps.append(_gap_finding("verification-plan", "no-executable-checks", "No executable verification checks configured", f"0 checks on {candidate_sha}", "Configure required criterion and regression checks before independent review.", "observed-verification"))
     all_ok = bool(criteria_list) and bool(specs) and not bool(plan.get("deleted_tests"))
 
+    manifest_p = verify_dir / ".factory-check-manifest.json"
+    manifest: dict[str, dict[str, Any]] = {}
+    if manifest_p.is_file():
+        try:
+            loaded_m = read_json(manifest_p, home)
+            if isinstance(loaded_m, dict): manifest.update(loaded_m)
+        except errors_module.FactoryError:
+            pass
+
     def _exec_check(name: str, kind: str, concern_id: str, argv: tuple[str, ...] | None, raw_cmd: str, stem_prefix: str = "ind-verify") -> dict[str, Any]:
         stem = f"{stem_prefix}-{SLUG_RE.sub('-', name.lower()).strip('-')[:56]}"
+        prov = "observed-finding-reproducer" if kind == "finding-reproducer" else "observed-independent-verification"
         if not argv:
             msg = redact_value(f"unexecutable or missing verification command for {concern_id}: {raw_cmd!r}\n", secrets)
             ev_path = write_evidence(verify_dir, stem, msg, home)
-            return {"name": name, "kind": kind, "assesses": concern_id, "command": redact_value(raw_cmd, secrets), "argv": [], "executed": False, "completed": False, "exit_code": None, "ok": False, "timed_out": False, "duration_ms": 0, "head_sha": candidate_sha, "output_path": str(ev_path), "output_sha256": runner.digest_text(msg), "output_excerpt": msg.strip()[:400], "provenance": "observed-independent-verification"}
+            rec_chk = {"name": name, "kind": kind, "assesses": concern_id, "command": redact_value(raw_cmd, secrets), "argv": [], "executed": False, "completed": False, "exit_code": None, "ok": False, "timed_out": False, "duration_ms": 0, "head_sha": candidate_sha, "output_path": str(ev_path), "output_sha256": runner.digest_text(msg), "output_excerpt": msg.strip()[:400], "provenance": prov}
+            manifest[str(ev_path.resolve())] = {k: rec_chk[k] for k in ("head_sha", "name", "kind", "assesses", "command", "argv", "executed", "completed", "exit_code", "ok", "timed_out", "output_sha256", "provenance")}
+            return rec_chk
         executed, completed, launched = False, False, False
         try:
             timeout_s = max(1, int(math.ceil(remaining_seconds(deadline, f"independent verification {name}", limit_s))))
@@ -320,7 +331,9 @@ def _run_observed_verification(worktree: Path, verify_dir: Path, home: Path, chi
         combined = redact_value((out_s + err_s).strip() + "\n", secrets)
         ev_path = write_evidence(verify_dir, stem, combined, home)
         ok = executed and completed and code == 0 and not timed_out
-        return {"name": name, "kind": kind, "assesses": concern_id, "command": redact_value(raw_cmd, secrets), "argv": list(redact_value(list(argv), secrets)), "executed": executed, "completed": completed, "exit_code": code, "ok": ok, "timed_out": timed_out, "duration_ms": elapsed_ms, "head_sha": candidate_sha, "output_path": str(ev_path), "output_sha256": runner.digest_text(combined), "output_excerpt": combined.strip()[:400], "provenance": "observed-independent-verification"}
+        rec_chk = {"name": name, "kind": kind, "assesses": concern_id, "command": redact_value(raw_cmd, secrets), "argv": list(redact_value(list(argv), secrets)), "executed": executed, "completed": completed, "exit_code": code, "ok": ok, "timed_out": timed_out, "duration_ms": elapsed_ms, "head_sha": candidate_sha, "output_path": str(ev_path), "output_sha256": runner.digest_text(combined), "output_excerpt": combined.strip()[:400], "provenance": prov}
+        manifest[str(ev_path.resolve())] = {k: rec_chk[k] for k in ("head_sha", "name", "kind", "assesses", "command", "argv", "executed", "completed", "exit_code", "ok", "timed_out", "output_sha256", "provenance")}
+        return rec_chk
 
     for name, kind, concern_id, argv, raw_cmd in specs:
         chk = _exec_check(name, kind, concern_id, argv, raw_cmd)
@@ -340,16 +353,16 @@ def _run_observed_verification(worktree: Path, verify_dir: Path, home: Path, chi
         argv = None if ci_selection.WEAKENED_CMD_RE.search(vcmd) else deliver_checks._verification_argv(vcmd)
         f_chk = _exec_check(f"finding/{fid}", "finding-reproducer", fid, argv, vcmd, stem_prefix="ind-repro")
         finding_vers[fid] = {**f_chk, "finding_id": fid, "reproduced": not f_chk["ok"], "provenance": "observed-finding-reproducer"}
+    atomic_json(manifest_p, manifest, home)
     return {"executed": any(c["executed"] for c in checks), "ok": all_ok and len(gaps) == 0, "head_sha": candidate_sha, "selection_plan": plan, "checks": checks, "finding_verifications": finding_vers, "verification_gaps": gaps, "provenance": "observed-independent-verification"}
 
-def _verify_stored_check(chk: Any, candidate_sha: str, home: Path | None, *, finding_id: str | None = None, target: str | None = None) -> str | None:
+def _verify_stored_check(chk: Any, candidate_sha: str, home: Path | None, *, finding_id: str | None = None, target: str | None = None, expected_command: str | None = None) -> str | None:
     if not isinstance(chk, dict): return "missing observed verification check record"
     if chk.get("head_sha") != candidate_sha: return f"stale check evidence: head_sha={chk.get('head_sha')!r} != candidate={candidate_sha!r}"
-    if finding_id or target:
-        valid_binds = {x for x in (finding_id, target, f"criterion/{target}" if target else None, f"finding/{finding_id}" if finding_id else None) if x}
-        if not ({chk.get("finding_id"), chk.get("assesses"), chk.get("name")} & valid_binds):
-            return f"unbound check evidence: check {chk.get('name') or chk.get('command')!r} is not bound to finding {finding_id!r} or target {target!r}"
-    if not bool(chk.get("executed")) or not bool(chk.get("ok")) or bool(chk.get("timed_out")) or type(chk.get("exit_code")) is not int or chk.get("exit_code") != 0:
+    valid_binds = {x for x in (finding_id, target, f"criterion/{target}" if target else None, f"finding/{finding_id}" if finding_id else None) if x}
+    if valid_binds and not ({chk.get("finding_id"), chk.get("assesses"), chk.get("name")} & valid_binds):
+        return f"unbound check evidence: check {chk.get('name') or chk.get('command')!r} is not bound to finding {finding_id!r} or target {target!r}"
+    if not (chk.get("executed") is True and chk.get("completed", True) is True and chk.get("ok") is True and not bool(chk.get("timed_out")) and type(chk.get("exit_code")) is int and chk.get("exit_code") == 0):
         return f"check {chk.get('name') or chk.get('command')!r} did not pass on {candidate_sha}"
     out_p = Path(str(chk.get("output_path") or ""))
     try:
@@ -357,7 +370,20 @@ def _verify_stored_check(chk: Any, candidate_sha: str, home: Path | None, *, fin
             return f"check {chk.get('name') or chk.get('command')!r} is missing stored log evidence inside runtime home"
         if runner.digest_text(out_p.read_text(encoding="utf-8", errors="replace")) != chk.get("output_sha256"):
             return f"check {chk.get('name') or chk.get('command')!r} stored log digest mismatch"
-    except OSError:
+        manifest_p = out_p.resolve().parent / ".factory-check-manifest.json"
+        manifest = read_json(manifest_p, home) if manifest_p.is_file() else None
+        m_entry = manifest.get(str(out_p.resolve())) if isinstance(manifest, dict) else None
+        if not isinstance(m_entry, dict):
+            return f"missing factory execution manifest for check log {out_p}"
+        if m_entry.get("head_sha") != candidate_sha:
+            return f"stale check evidence: manifest head_sha={m_entry.get('head_sha')!r} != candidate={candidate_sha!r}"
+        if not (m_entry.get("executed") is True and m_entry.get("completed") is True and m_entry.get("ok") is True and not bool(m_entry.get("timed_out")) and type(m_entry.get("exit_code")) is int and m_entry.get("exit_code") == 0):
+            return f"check {chk.get('name') or chk.get('command')!r} did not pass in factory execution manifest"
+        if any(m_entry.get(k) != chk.get(k) for k in ("name", "kind", "assesses", "command", "output_sha256")) or (valid_binds and not ({m_entry.get("assesses"), m_entry.get("name")} & valid_binds)):
+            return f"unbound or relabelled check evidence: log {out_p} was recorded for {m_entry.get('name')!r}, not {chk.get('name')!r}"
+        if expected_command and str(m_entry.get("command") or "").strip() != expected_command.strip():
+            return f"unbound check command: {m_entry.get('command')!r} != {expected_command!r}"
+    except (OSError, errors_module.FactoryError):
         return f"check {chk.get('name') or chk.get('command')!r} stored log is unreadable"
     return None
 
@@ -425,8 +451,6 @@ def reconcile_review_findings(
         rec_claim = reconcil_map.get(stable_fid) or reconcil_map.get(fid)
         vcmd = str((rec_claim or {}).get("verification_command") or (cur_f or {}).get("verification_command") or (old_f or {}).get("verification_command") or "").strip()
         f_ver = f_vers.get(stable_fid) or f_vers.get(fid)
-        claim_ver = rec_claim.get("reproducer_verification") if isinstance(rec_claim, dict) and isinstance(rec_claim.get("reproducer_verification"), dict) else None
-        if claim_ver is not None and (f_ver is None or _verify_stored_check(claim_ver, candidate_sha, home, finding_id=stable_fid, target=target) is not None): f_ver = claim_ver
 
         claim_res = str((rec_claim or {}).get("resolution") or "").strip().lower()
         if old_f is None: status, blocker, res_kind, res_ev = "open", "active-finding", None, None
@@ -466,7 +490,7 @@ def reconcile_review_findings(
                 status, blocker, res_kind, res_ev = "open", "stale-evidence", None, None
             elif not claim_ev: status, blocker, res_kind, res_ev = "open", "missing-evidence", None, None
             else:
-                ver_err = _verify_stored_check(f_ver, candidate_sha, home, finding_id=stable_fid, target=target) if f_ver is not None else None
+                ver_err = _verify_stored_check(f_ver, candidate_sha, home, finding_id=stable_fid, target=target, expected_command=vcmd or None) if f_ver is not None else None
                 if f_ver is not None and ver_err is not None:
                     b_code = "stale-evidence" if "stale" in ver_err else ("unsupported-assertion" if "unbound" in ver_err else ("missing-verification" if (not bool(f_ver.get("executed")) or "missing" in ver_err or "digest" in ver_err or "unreadable" in ver_err) else "check-failed"))
                     status, blocker, res_kind, res_ev = "open", b_code, None, None
