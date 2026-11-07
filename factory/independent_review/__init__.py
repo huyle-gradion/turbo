@@ -359,8 +359,8 @@ def _run_observed_verification(worktree: Path, verify_dir: Path, home: Path, chi
 def _verify_stored_check(chk: Any, candidate_sha: str, home: Path | None, *, finding_id: str | None = None, target: str | None = None, expected_command: str | None = None) -> str | None:
     if not isinstance(chk, dict): return "missing observed verification check record"
     if chk.get("head_sha") != candidate_sha: return f"stale check evidence: head_sha={chk.get('head_sha')!r} != candidate={candidate_sha!r}"
-    valid_binds = {x for x in (finding_id, target, f"criterion/{target}" if target else None, f"finding/{finding_id}" if finding_id else None) if x}
-    if valid_binds and not ({chk.get("finding_id"), chk.get("assesses"), chk.get("name")} & valid_binds):
+    valid_binds = {x for x in (finding_id, f"finding/{finding_id}" if finding_id else None, target, f"criterion/{target}" if target else None) if x}
+    if (valid_binds and not ({chk.get("finding_id"), chk.get("assesses"), chk.get("name")} & valid_binds)) or (finding_id and not target and chk.get("kind") != "finding-reproducer"):
         return f"unbound check evidence: check {chk.get('name') or chk.get('command')!r} is not bound to finding {finding_id!r} or target {target!r}"
     if not (chk.get("executed") is True and chk.get("completed", True) is True and chk.get("ok") is True and not bool(chk.get("timed_out")) and type(chk.get("exit_code")) is int and chk.get("exit_code") == 0):
         return f"check {chk.get('name') or chk.get('command')!r} did not pass on {candidate_sha}"
@@ -457,7 +457,7 @@ def reconcile_review_findings(
         elif cur_f is not None and cur_f.get("blocking") and (cur_f.get("source") != "reviewer-agent" or claim_res in ("", "open", "unresolved")):
             status, blocker, res_kind, res_ev = "open", ("check-failed" if (cur_f.get("source") != "reviewer-agent" or (f_ver is not None and not f_ver.get("ok"))) else "re-reported-by-reviewer"), None, None
         elif not role_sep_ok: status, blocker, res_kind, res_ev = "open", "invalid-review", None, None
-        elif prev_status == "resolved" and rec_claim is None and stable_fid not in downgrade_ids and (f_ver is None or _verify_stored_check(f_ver, candidate_sha, home, finding_id=stable_fid, target=target) is None) and obs_ok and qa_ok and sec_ok and scope_ok:
+        elif prev_status == "resolved" and rec_claim is None and stable_fid not in downgrade_ids and (f_ver is None or _verify_stored_check(f_ver, candidate_sha, home, finding_id=stable_fid, target=None if str((old_f or {}).get("source") or "reviewer-agent") == "reviewer-agent" else target) is None) and obs_ok and qa_ok and sec_ok and scope_ok:
             status, blocker, res_kind, res_ev = "resolved", None, str(old_f.get("resolution") or "fixed"), str(old_f.get("resolution_evidence") or "")
         else:
             source, claim_ev, claim_sha = str(old_f.get("source") or "reviewer-agent"), str((rec_claim or {}).get("evidence") or "").strip(), str((rec_claim or {}).get("evidence_sha") or "").strip()
@@ -490,7 +490,7 @@ def reconcile_review_findings(
                 status, blocker, res_kind, res_ev = "open", "stale-evidence", None, None
             elif not claim_ev: status, blocker, res_kind, res_ev = "open", "missing-evidence", None, None
             else:
-                ver_err = _verify_stored_check(f_ver, candidate_sha, home, finding_id=stable_fid, target=target, expected_command=vcmd or None) if f_ver is not None else None
+                ver_err = _verify_stored_check(f_ver, candidate_sha, home, finding_id=stable_fid, target=None if source == "reviewer-agent" else target, expected_command=vcmd or None) if f_ver is not None else None
                 if f_ver is not None and ver_err is not None:
                     b_code = "stale-evidence" if "stale" in ver_err else ("unsupported-assertion" if "unbound" in ver_err else ("missing-verification" if (not bool(f_ver.get("executed")) or "missing" in ver_err or "digest" in ver_err or "unreadable" in ver_err) else "check-failed"))
                     status, blocker, res_kind, res_ev = "open", b_code, None, None
@@ -500,12 +500,7 @@ def reconcile_review_findings(
                 elif f_ver is not None and ver_err is None:
                     status, blocker, res_kind, res_ev = "resolved", None, claim_res, f"{claim_ev} [verified by {f_ver.get('command')!r} on {candidate_sha}: {f_ver.get('output_path')}]"
                 else:
-                    bound_chk = next((c for c in obs_checks if _verify_stored_check(c, candidate_sha, home, finding_id=stable_fid, target=target) is None), None)
-                    if bound_chk is None and claim_res == "no-longer-applicable" and target in deleted_paths and obs_checks and all(_verify_stored_check(c, candidate_sha, home) is None for c in obs_checks):
-                        bound_chk = obs_checks[0]
-                    if bound_chk is not None:
-                        f_ver, status, blocker, res_kind, res_ev = bound_chk, "resolved", None, claim_res, f"{claim_ev} [verified by observed check {bound_chk['name']!r} on {candidate_sha}: {bound_chk['output_path']}]"
-                    else: status, blocker, res_kind, res_ev = "open", "unsupported-assertion", None, None
+                    status, blocker, res_kind, res_ev = "open", "unsupported-assertion", None, None
 
         if rec_claim is not None and rec_claim.get("evidence"):
             rec_ev_entry = {"round": round_num, "candidate_sha": candidate_sha, "evidence": str(rec_claim["evidence"]), "claimed_resolution": claim_res or None, "status": status, "resolution_blocker": blocker, "source": "reconciliation-claim"}

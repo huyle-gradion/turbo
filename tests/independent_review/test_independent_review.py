@@ -590,6 +590,46 @@ class IndependentReviewTest(unittest.TestCase):
             r3 = run_rev(round_num=3, candidate_sha=cand3, qa_record=_valid_qa_record(cand3, base_sha), security_record=_valid_security_record(cand3, base_sha, home), agy_bin=str(agy3))
             self.assertEqual((r3["outcome"], r3["review_verified"], r3["open_finding_ids"]), ("review-passed", True, []))
 
+    def test_reconcil_m4_reject_generic_criterion_and_historical_deletion_shortcuts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo, home, _, _, _, _, _, _, run_rev = self._setup_workspace(root)
+            git(repo, "checkout", "-q", "main")
+            (repo / "src/chat_bridge/needed.py").write_text("NEEDED = 1\n", encoding="utf-8")
+            git(repo, "add", "."); git(repo, "commit", "-q", "-m", "base with needed.py")
+            base_m4 = git(repo, "rev-parse", "HEAD")
+            git(repo, "checkout", "-q", "-b", "task/101-m4-reconcil", base_m4)
+            (repo / "src/chat_bridge/auth.py").write_text(CLEAN_AUTH_PY, encoding="utf-8")
+            (repo / "tests/test_auth.py").write_text((repo / "tests/test_auth.py").read_text(encoding="utf-8") + EXPIRED_TEST_APPEND, encoding="utf-8")
+            (repo / "src/chat_bridge/needed.py").unlink()
+            git(repo, "add", "-A"); git(repo, "commit", "-q", "-m", "m4 r1 delete needed.py")
+            cand1 = git(repo, "rev-parse", "HEAD")
+            child_m4 = {**PARSED_CHILD, "scope": {**PARSED_CHILD["scope"], "in_scope": "src/chat_bridge/auth.py, src/chat_bridge/needed.py, tests/test_auth.py"}}
+            fid_ac1 = independent_review.compute_review_finding_id("missing-behavior", "AC-1", "m4-ac1-edge-case")
+            fid_del = independent_review.compute_review_finding_id("bug", "src/chat_bridge/needed.py", "m4-accidental-deletion")
+            r1_findings = [
+                {"category": "missing-behavior", "blocking": True, "target": "AC-1", "rule": "m4-ac1-edge-case", "title": "AC-1 edge case", "evidence": "r1-ac1", "actionable_correction": "Add # m4-ac1-fixed"},
+                {"category": "bug", "blocking": True, "target": "src/chat_bridge/needed.py", "rule": "m4-accidental-deletion", "title": "Deleted needed.py", "evidence": "r1-del", "actionable_correction": "Restore or replace needed.py"},
+            ]
+            agy1 = _make_fake_agy(root, "agy-m4-r1", _make_staged_reviewer_script(session_id="rev-m4-r1", outcome="changes-requested", assessment={**DEFAULT_ASSESSMENT, "criterion_coverage": {"status": "unsatisfied", "summary": "m4"}}, findings=r1_findings))
+            r1 = run_rev(round_num=1, base_sha=base_m4, candidate_sha=cand1, child=child_m4, qa_record=_valid_qa_record(cand1, base_m4), security_record=_valid_security_record(cand1, base_m4, home), agy_bin=str(agy1))
+            self.assertEqual(set(r1["open_finding_ids"]), {fid_ac1, fid_del})
+            (repo / "src/chat_bridge/auth.py").write_text(CLEAN_AUTH_PY + "# m4-noop\n", encoding="utf-8"); git(repo, "add", "."); git(repo, "commit", "-q", "-m", "m4 r2 noop")
+            cand2 = git(repo, "rev-parse", "HEAD")
+            r2_reconcils = [{"finding_id": fid_ac1, "resolution": "fixed", "evidence": "generic AC-1 passed"}, {"finding_id": fid_del, "resolution": "no-longer-applicable", "evidence": "needed.py still deleted"}]
+            agy2 = _make_fake_agy(root, "agy-m4-r2", _make_staged_reviewer_script(session_id="rev-m4-r2", outcome="review-passed", reconciliations=r2_reconcils))
+            r2 = run_rev(round_num=2, base_sha=base_m4, candidate_sha=cand2, child=child_m4, qa_record=_valid_qa_record(cand2, base_m4), security_record=_valid_security_record(cand2, base_m4, home), agy_bin=str(agy2))
+            self.assertEqual((r2["outcome"], r2["review_verified"], set(r2["open_finding_ids"])), ("changes-requested", False, {fid_ac1, fid_del}))
+            for f2 in r2["blocking_findings"]: self.assertEqual(f2["resolution_blocker"], "unsupported-assertion")
+            (repo / "src/chat_bridge/auth.py").write_text(CLEAN_AUTH_PY + "# m4-ac1-fixed\nNEEDED = 1\n", encoding="utf-8"); git(repo, "add", "."); git(repo, "commit", "-q", "-m", "m4 r3 genuine fix")
+            cand3 = git(repo, "rev-parse", "HEAD")
+            vcmd_ac1 = "python3 -c \"import pathlib, sys; sys.exit(0 if '# m4-ac1-fixed' in pathlib.Path('src/chat_bridge/auth.py').read_text() else 1)\""
+            vcmd_del = "python3 -c \"import pathlib, sys; sys.exit(0 if 'NEEDED = 1' in pathlib.Path('src/chat_bridge/auth.py').read_text() else 1)\""
+            r3_reconcils = [{"finding_id": fid_ac1, "resolution": "fixed", "evidence": "edge case verified", "verification_command": vcmd_ac1}, {"finding_id": fid_del, "resolution": "no-longer-applicable", "evidence": "NEEDED moved to auth.py", "verification_command": vcmd_del}]
+            agy3 = _make_fake_agy(root, "agy-m4-r3", _make_staged_reviewer_script(session_id="rev-m4-r3", outcome="review-passed", reconciliations=r3_reconcils))
+            r3 = run_rev(round_num=3, base_sha=base_m4, candidate_sha=cand3, child=child_m4, qa_record=_valid_qa_record(cand3, base_m4), security_record=_valid_security_record(cand3, base_m4, home), agy_bin=str(agy3))
+            self.assertEqual((r3["outcome"], r3["review_verified"], r3["open_finding_ids"]), ("review-passed", True, []))
+
 def run_disposable_demo(tmp: Path) -> dict:
     repo, home, _ = _make_disposable_product_workspace(tmp)
     base_sha = git(repo, "rev-parse", "refs/heads/main")
