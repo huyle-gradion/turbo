@@ -53,7 +53,7 @@ def load_project_standards(repo: Path, base_sha: str, child: dict[str, Any], con
     return standards
 
 
-def build_phase1_prompt(child: dict[str, Any], base_sha: str, candidate_sha: str, diff_text: str, standards: list[dict[str, Any]]) -> str:
+def _render_phase1_prompt(child: dict[str, Any], base_sha: str, candidate_sha: str, diff_text: str, standards: list[dict[str, Any]]) -> str:
     scope = child.get("scope") or {}
     crit_lines = "\n".join(f"- {c.get('id')}: {c.get('description')} (verification: `{c.get('verification')}`)"
                            for c in (child.get("criteria") or []) if isinstance(c, dict)) or "- None"
@@ -65,6 +65,10 @@ def build_phase1_prompt(child: dict[str, Any], base_sha: str, candidate_sha: str
             f"Requirements & Acceptance Criteria:\n{crit_lines}\nApplicable Project Standards:\n{std_lines}\n"
             f"Exact Base-to-Candidate Diff:\n{diff_text}\n"
             'Respond with raw JSON only: {"hypotheses": ["<independent failure hypothesis 1>", ...]}\n')
+
+
+def build_phase1_prompt(child: dict[str, Any], base_sha: str, candidate_sha: str, diff_text: str, standards: list[dict[str, Any]]) -> str:
+    return _render_phase1_prompt(child, base_sha, candidate_sha, diff_text, standards)
 
 
 def build_phase2_prompt(
@@ -411,14 +415,11 @@ def review_candidate_independently(
         if not (agy_bin and str(agy_bin).strip()):
             role_issues.append("independent reviewer executable is required; missing reviewer execution fails closed")
 
-        p1_prompt = build_phase1_prompt(child, base_sha, resolved_sha, diff_text, standards)
-        p1_prompt_red = redact_value(p1_prompt, secrets)
+        expected_p1_red = redact_value(_render_phase1_prompt(child, base_sha, resolved_sha, diff_text, standards), secrets)
+        p1_prompt_red = redact_value(build_phase1_prompt(child, base_sha, resolved_sha, diff_text, standards), secrets)
         p1_prompt_path = write_evidence(round_dir, "phase1-prompt", p1_prompt_red, home)
         summary_norm = (builder_summary or "").strip()
-        p1_header = p1_prompt.split("Exact Base-to-Candidate Diff:", 1)[0]
-        p1_omitted_summary = "builder summary" not in p1_prompt.lower() and (
-            not summary_norm or (len(summary_norm) >= 8 and summary_norm not in p1_header) or len(summary_norm) < 8
-        )
+        p1_omitted_summary = p1_prompt_red.split("Exact Base-to-Candidate Diff:", 1)[0] == expected_p1_red.split("Exact Base-to-Candidate Diff:", 1)[0]
         p1_has_exact_diff = bool(diff_res.output.strip()) and diff_text.strip() in p1_prompt_red
         if not p1_omitted_summary:
             role_issues.append("protocol violation: phase-1 prompt exposed builder summary before hypotheses were recorded")
@@ -436,7 +437,7 @@ def review_candidate_independently(
 
         if probes_ok and diff_ok and bool(b_sid) and bool(agy_bin and str(agy_bin).strip()) and p1_omitted_summary and p1_has_exact_diff:
             try:
-                p1_res = _run_phase_exec(worktree, round_dir, home, isolated_home, worker_env, str(agy_bin), p1_prompt, "phase1", resolved_sha, secrets, deadline, limit_s)
+                p1_res = _run_phase_exec(worktree, round_dir, home, isolated_home, worker_env, str(agy_bin), p1_prompt_red, "phase1", resolved_sha, secrets, deadline, limit_s)
                 p2_res["mut"] = p1_res["mut"]
                 if p1_res["mut"]["candidate_modified_by_reviewer"]:
                     role_issues.append("independent reviewer mutated the candidate worktree during phase 1")
@@ -458,10 +459,10 @@ def review_candidate_independently(
                 role_issues.append(f"sandbox unavailable during phase 1: {exc}")
 
         if hypotheses_path is not None and not role_issues:
-            p2_prompt = build_phase2_prompt(child, base_sha, resolved_sha, diff_text, standards, hypotheses, builder_summary, qa_eval, sec_eval)
-            p2_prompt_path = str(write_evidence(round_dir, "phase2-prompt", redact_value(p2_prompt, secrets), home))
+            p2_prompt_red = redact_value(build_phase2_prompt(child, base_sha, resolved_sha, diff_text, standards, hypotheses, builder_summary, qa_eval, sec_eval), secrets)
+            p2_prompt_path = str(write_evidence(round_dir, "phase2-prompt", p2_prompt_red, home))
             try:
-                p2_res = _run_phase_exec(worktree, round_dir, home, isolated_home, worker_env, str(agy_bin), p2_prompt, "phase2", resolved_sha, secrets, deadline, limit_s)
+                p2_res = _run_phase_exec(worktree, round_dir, home, isolated_home, worker_env, str(agy_bin), p2_prompt_red, "phase2", resolved_sha, secrets, deadline, limit_s)
                 if p2_res["mut"]["candidate_modified_by_reviewer"]:
                     role_issues.append("independent reviewer mutated the candidate worktree during phase 2")
                 if not p2_res["ok"]:

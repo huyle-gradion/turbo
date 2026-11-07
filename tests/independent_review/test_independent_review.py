@@ -311,6 +311,38 @@ class IndependentReviewTest(unittest.TestCase):
                 self.assertFalse(qa_ev["verified"], f"expected M1 rejection for {label}, got {qa_ev}")
                 self.assertTrue(gaps, f"expected M1 gap finding for {label}")
 
+    def test_m2_structural_summary_omission_and_execution_input_redaction(self) -> None:
+        sentinel = "ghp_M2_SECRET_TOKEN_99"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo, home, base_sha, _, _, _, _, _, run_rev = self._setup_workspace(root)
+            (repo / "src/chat_bridge/auth.py").write_text(CLEAN_AUTH_PY + "# builder summary note\n", encoding="utf-8")
+            git(repo, "add", "src/chat_bridge/auth.py"); git(repo, "commit", "-q", "-m", "diff with builder summary phrase")
+            cand2 = git(repo, "rev-parse", "HEAD")
+            qa2, sec2 = _valid_qa_record(cand2, base_sha), _valid_security_record(cand2, base_sha, home)
+            cap_script = (
+                "import pathlib, sys\np = sys.argv[sys.argv.index('--print') + 1] if '--print' in sys.argv else ''\n"
+                "pathlib.Path.home().joinpath('cap1.txt' if 'PHASE: 1' in p else 'cap2.txt').write_text(p, encoding='utf-8')\n"
+            ) + _make_staged_reviewer_script(session_id="rev-m2")
+            cap_agy = _make_fake_agy(root, "agy-cap-m2", cap_script)
+            crit_desc = PARSED_CHILD["criteria"][0]["description"]
+            with unittest.mock.patch.dict("os.environ", {"TURBO_GITHUB_TOKEN": sentinel}):
+                r_overlap = run_rev(round_num=1, candidate_sha=cand2, qa_record=qa2, security_record=sec2,
+                                    agy_bin=str(cap_agy), builder_summary=crit_desc)
+                self.assertEqual((r_overlap["outcome"], r_overlap["review_verified"]), ("review-passed", True))
+                r_sec = run_rev(round_num=2, candidate_sha=cand2, qa_record=qa2, security_record=sec2, agy_bin=str(cap_agy),
+                                child={**PARSED_CHILD, "name": f"Auth {sentinel}"},
+                                builder_summary=f"{crit_desc} SUMMARY_ONLY_M2 {sentinel}")
+            self.assertEqual((r_sec["outcome"], r_sec["review_verified"]), ("review-passed", True))
+            iso_home = Path(r_sec["safety"]["isolated_home"])
+            p1_in, p2_in = (iso_home / "cap1.txt").read_text(encoding="utf-8"), (iso_home / "cap2.txt").read_text(encoding="utf-8")
+            self.assertIn("# builder summary note", p1_in)
+            self.assertIn(crit_desc, p1_in)
+            self.assertNotIn("SUMMARY_ONLY_M2", p1_in)
+            self.assertIn("SUMMARY_ONLY_M2", p2_in)
+            self.assertNotIn(sentinel, p1_in)
+            self.assertNotIn(sentinel, p2_in)
+
 
 def run_disposable_demo(tmp: Path) -> dict:
     repo, home, _ = _make_disposable_product_workspace(tmp)
