@@ -10,11 +10,13 @@ for _p in (str(ROOT), str(ROOT / "tests")):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from factory import config as config_module, security_review, worker as worker_module
+from factory import config as config_module, intake_eval, security_review, worker as worker_module
 from factory.errors import UsageError
 from factory.paths import RuntimePaths
 from support import git
-from test_deliver import READY_CHILD, _make_disposable_product_workspace, _make_fake_agy
+from test_deliver import PARENT_TASK, READY_CHILD, _make_disposable_product_workspace, _make_fake_agy
+
+PARSED_CHILD = intake_eval._evaluate("900", PARENT_TASK, [READY_CHILD])[1][0]
 
 CLEAN_AUTH_PY = (
     "class TokenExpiredError(Exception): pass\ndef validate_token(token: str) -> dict[str, str]:\n"
@@ -25,7 +27,9 @@ EXPIRED_TEST_APPEND = (
     "        with self.assertRaises(TokenExpiredError): validate_token('expired:1')\n"
 )
 REVIEWER_SCRIPT = (
-    "import json, pathlib, sys\nprompt = sys.argv[sys.argv.index('--print') + 1] if '--print' in sys.argv else ''\n"
+    "import json, pathlib, sys, tempfile\n"
+    "with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8') as tf: tf.write('ok')\n"
+    "prompt = sys.argv[sys.argv.index('--print') + 1] if '--print' in sys.argv else ''\n"
     "for req in ('Role: security-reviewer', 'Applicable security policies:', 'SEC-POL-01', 'Sub-task constraints:', 'Required JSON response schema:'):\n"
     "    assert req in prompt, f'missing {req} in reviewer prompt'\n"
     "af = pathlib.Path('src/chat_bridge/auth.py'); txt = af.read_text(encoding='utf-8') if af.is_file() else ''\n"
@@ -52,8 +56,8 @@ class SecurityReviewerTest(unittest.TestCase):
             git(repo, "add", "."); git(repo, "commit", "-q", "-m", "clean")
             clean_sha = git(repo, "rev-parse", "HEAD")
 
-            rev_call = lambda sha, rnum, agy, prior=None, b_id="builder-conv-1": security_review.review_candidate_security(
-                repo=repo, home=home, child_dir=child_dir, child=READY_CHILD, conf=conf, base_sha=base_sha,
+            rev_call = lambda sha, rnum, agy, prior=None, b_id="builder-conv-1", b_sha=base_sha: security_review.review_candidate_security(
+                repo=repo, home=home, child_dir=child_dir, child=PARSED_CHILD, conf=conf, base_sha=b_sha,
                 candidate_sha=sha, round_num=rnum, agy_bin=agy, prior_findings=prior, builder_session_id=b_id,
                 deadline=time.monotonic() + 30.0, limit_s=30)
 
@@ -65,12 +69,15 @@ class SecurityReviewerTest(unittest.TestCase):
             clean_rev = rev_call(clean_sha, 1, str(rev_agy))
             self.assertEqual((clean_rev["reviewer_executed"], clean_rev["outcome"], clean_rev["role_separation_verified"]), (True, "approved", True))
             self.assertIn("SEC-POL-01", clean_rev["reviewer_prompt_policies"])
+            self.assertIn("SEC-SUBTASK-CONSTRAINTS", clean_rev["reviewer_prompt_policies"])
+            self.assertIn("criterion/AC-1", [c["name"] for c in clean_rev["independent_verification"]["checks"]])
 
             custom_r1_agy = _make_fake_agy(
                 root, "agy-custom-r1",
                 "import json\np={'outcome':'changes-requested','findings':[{'policy_id':'SEC-POL-04','rule':'unnormalized-sub',"
                 "'severity':'high','blocking':True,'title':'Unnormalized sub','file_path':'src/chat_bridge/auth.py','line':3,"
-                "'evidence':\"return {'sub': token}\",'actionable_correction':'Cast token with str(token)'}]}\n"
+                "'evidence':\"src/chat_bridge/auth.py:3: return {'sub': token}\\nextra context line\",'actionable_correction':'Cast token with str(token)',"
+                "'verification_command':'python3 -m factory.security_review --verify-file src/chat_bridge/auth.py --rule unnormalized-sub'}]}\n"
                 "print(json.dumps({'event':'result','result':{'conversation_id':'rev-r1','status':'SUCCESS','response':json.dumps(p)}}))\n")
             silent_r2_agy = _make_fake_agy(
                 root, "agy-silent-r2",
@@ -79,6 +86,16 @@ class SecurityReviewerTest(unittest.TestCase):
             r1_custom = rev_call(clean_sha, 1, str(custom_r1_agy))
             custom_fid = r1_custom["blocking_findings"][0]["finding_id"]
             self.assertTrue(r1_custom["blocking_findings"][0]["reproducer_verification"]["reproduced"])
+            self.assertEqual(r1_custom["blocking_findings"][0]["reproducer_verification"]["argv"][0], sys.executable)
+
+            tamper_r2_agy = _make_fake_agy(
+                root, "agy-tamper-r2",
+                f"import json\np={{'outcome':'changes-requested','findings':[{{'finding_id':{custom_fid!r},'policy_id':'SEC-POL-99','rule':'weak',"
+                f"'severity':'low','blocking':True,'file_path':'src/chat_bridge/auth.py','verification_command':'python3 -c \"import sys; sys.exit(0)\"'}}]}}\n"
+                "print(json.dumps({'event':'result','result':{'conversation_id':'rev-tamper','status':'SUCCESS','response':json.dumps(p)}}))\n")
+            r2_tamper = rev_call(clean_sha, 2, str(tamper_r2_agy), prior=r1_custom["findings"], b_id="builder-conv-2")
+            self.assertEqual(r2_tamper["blocking_findings"][0]["severity"], "high")
+            self.assertFalse(r2_tamper["blocking_findings"][0]["reproducer_verification"]["ok"])
 
             r2_unfixed = rev_call(clean_sha, 2, str(silent_r2_agy), prior=r1_custom["findings"], b_id="builder-conv-2")
             self.assertEqual((r2_unfixed["outcome"], r2_unfixed["previous_findings_resolution"][0]["status"]), ("changes-requested", "open"))
@@ -93,13 +110,20 @@ class SecurityReviewerTest(unittest.TestCase):
                              ("approved", custom_fid, "resolved"))
             self.assertTrue(r3_fixed["previous_findings_resolution"][0]["reproducer_verification"]["ok"])
             self.assertEqual(security_review.evaluate_security_review_gate(fixed_sha, base_sha, r3_fixed, home=home)["status"], "verified")
+            self.assertFalse(security_review.evaluate_security_review_gate(
+                fixed_sha, base_sha, {**r3_fixed, "previous_findings_resolution": []}, home=home)["verified"])
 
             mut_reviewer = _make_fake_agy(
                 root, "agy-reviewer-mutate",
                 "import json, pathlib\npathlib.Path('src/chat_bridge/auth.py').write_text('# mut\\n', encoding='utf-8')\n"
                 "print(json.dumps({'event':'result','result':{'conversation_id':'sec-rev-mut','status':'SUCCESS','response':'{}'}}))\n")
             mut_rev = rev_call(clean_sha, 1, str(mut_reviewer))
-            self.assertEqual((mut_rev["outcome"], mut_rev["role_separation_verified"]), ("invalid-review", False))
+            self.assertEqual((mut_rev["outcome"], mut_rev["role_separation_verified"], mut_rev["independent_verification"]["executed"]),
+                             ("invalid-review", False, False))
+
+            bad_base = rev_call(clean_sha, 4, str(rev_agy), b_sha="0" * 40)
+            self.assertEqual((bad_base["outcome"], bad_base["inspected_scope"]["deterministic_ok"], bad_base["independent_verification"]["executed"]),
+                             ("invalid-review", False, False))
 
     def test_reviewer_thermos_sandbox_probes_strict_json_scanning_and_containment(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -125,13 +149,46 @@ class SecurityReviewerTest(unittest.TestCase):
             self.assertIn("s2", by_file["src/chat_bridge/auth.py"]["evidence"])
             with unittest.mock.patch.object(worker_module, "run_safety_probes", return_value=[{"name": "forbidden_credential_access", "attempted": True, "denied": False, "exit": 0}]):
                 rec_bad = security_review.review_candidate_security(
-                    repo=repo, home=home, child_dir=child_dir, child=READY_CHILD, conf=conf,
+                    repo=repo, home=home, child_dir=child_dir, child=PARSED_CHILD, conf=conf,
                     base_sha=base_sha, candidate_sha=cand_sha, round_num=2, agy_bin=str(rev_agy), deadline=time.monotonic() + 30.0, limit_s=30)
             self.assertEqual((rec_bad["reviewer_executed"], rec_bad["independent_verification"]["executed"], rec_bad["outcome"]), (False, False, "invalid-review"))
+            with unittest.mock.patch.object(worker_module, "run_safety_probes", side_effect=worker_module.SandboxUnavailableError("bwrap unavailable")):
+                rec_sbx = security_review.review_candidate_security(
+                    repo=repo, home=home, child_dir=child_dir, child=PARSED_CHILD, conf=conf,
+                    base_sha=base_sha, candidate_sha=cand_sha, round_num=3, agy_bin=str(rev_agy),
+                    prior_findings=rec["findings"], deadline=time.monotonic() + 30.0, limit_s=30)
+            self.assertEqual((rec_sbx["outcome"], len(rec_sbx["blocking_findings"]) >= 2, len(rec_sbx["previous_findings_resolution"]) >= 2),
+                             ("invalid-review", True, True))
+            self.assertIn("diff_path", rec_sbx["inspected_scope"])
+            self.assertIn("isolated_home", rec_sbx["safety"])
+
+            sqli_file = repo / "src/chat_bridge/sqli.py"
+            sqli_file.write_text("q = f'select * from users where id = {uid}'\n", encoding="utf-8")
+            repro_argv = security_review._resolve_repro_argv(("python3", "-m", "factory.security_review", "--verify-file", "src/chat_bridge/sqli.py", "--rule", "sql-injection-interpolation"))
+            self.assertNotEqual(worker_module.execute_stream(repo, repro_argv, {}, 5)[0], 0)
+            for bad_args in (
+                ["--repo", str(repo), "--verify-file", "src/chat_bridge/auth.py", "--rule", "unknown-custom-rule"],
+                ["--repo", str(repo), "--verify-file", "src/chat_bridge/auth.py", "--forbidden-pattern", "["],
+            ):
+                self.assertEqual(security_review.main(bad_args), 1)
+            for bad_repro in (
+                ("python3", "-m", "factory.security_review", "--verify-file"),
+                ("python3", "-m", "factory.security_review", "--verify-file", "src/chat_bridge/auth.py", "--rule", "unknown-custom-rule"),
+                ("python3", "-m", "factory.security_review", "--verify-file", "src/chat_bridge/auth.py", "--forbidden-pattern", "["),
+            ):
+                self.assertNotEqual(worker_module.execute_stream(repo, security_review._resolve_repro_argv(bad_repro), {}, 5)[0], 0)
+
+            ev_file = home / "ev.log"; ev_file.write_text("ok\n", encoding="utf-8")
+            sym_ev = home / "sym-ev.log"; sym_ev.symlink_to(ev_file)
+            valid_chk = {"name": "c", "ok": True, "exit_code": 0, "timed_out": False, "head_sha": cand_sha, "output_path": str(ev_file), "output_sha256": security_review.runner.digest_text("ok\n")}
+            self.assertIsNone(security_review._verify_log_record(valid_chk, cand_sha, home))
+            for bad_chk in ({**valid_chk, "exit_code": False}, {**valid_chk, "exit_code": None}, {**valid_chk, "timed_out": True}, {**valid_chk, "output_path": str(sym_ev)}):
+                self.assertIsNotNone(security_review._verify_log_record(bad_chk, cand_sha, home))
+
             (child_dir / "security-round-9").symlink_to(root)
             with self.assertRaises(UsageError):
                 security_review.review_candidate_security(
-                    repo=repo, home=home, child_dir=child_dir, child=READY_CHILD, conf=conf,
+                    repo=repo, home=home, child_dir=child_dir, child=PARSED_CHILD, conf=conf,
                     base_sha=base_sha, candidate_sha=cand_sha, round_num=9, agy_bin=str(rev_agy), deadline=time.monotonic() + 30.0, limit_s=30)
             self.assertEqual(security_review.main(["--repo", str(repo), "--home", str(repo), "--task", "900"]), 2)
 
