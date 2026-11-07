@@ -346,8 +346,10 @@ def _check_worktree_mutation(worktree: Path, expected_sha: str, round_dir: Path,
 def _run_phase_exec(
     worktree: Path, round_dir: Path, home: Path, isolated_home: Path, worker_env: dict[str, str], agy_bin: str,
     prompt: str, phase_tag: str, expected_sha: str, secrets: tuple[str, ...], deadline: float, limit_s: int,
+    *, continue_session_id: str | None = None,
 ) -> dict[str, Any]:
-    argv = (str(agy_bin), "--print", prompt, "--output-format", "stream-json", "--sandbox", "--mode", "auto")
+    cont = ("--conversation", str(continue_session_id)) if continue_session_id else ()
+    argv = (str(agy_bin), *cont, "--print", prompt, "--output-format", "stream-json", "--sandbox", "--mode", "auto")
     t_out = max(1, int(math.ceil(remaining_seconds(deadline, f"independent review {phase_tag}", limit_s))))
     code, out_s, err_s, _, timed_out = worker_module.execute_stream(worktree, argv, worker_env, t_out, isolated_home=isolated_home)
     stdout_p = str(write_evidence(round_dir, f"{phase_tag}-stdout", redact_value(out_s, secrets), home))
@@ -462,7 +464,10 @@ def review_candidate_independently(
             p2_prompt_red = redact_value(build_phase2_prompt(child, base_sha, resolved_sha, diff_text, standards, hypotheses, builder_summary, qa_eval, sec_eval), secrets)
             p2_prompt_path = str(write_evidence(round_dir, "phase2-prompt", p2_prompt_red, home))
             try:
-                p2_res = _run_phase_exec(worktree, round_dir, home, isolated_home, worker_env, str(agy_bin), p2_prompt_red, "phase2", resolved_sha, secrets, deadline, limit_s)
+                p2_res = _run_phase_exec(
+                    worktree, round_dir, home, isolated_home, worker_env, str(agy_bin), p2_prompt_red, "phase2", resolved_sha, secrets, deadline, limit_s,
+                    continue_session_id=p1_res["session_id"],
+                )
                 if p2_res["mut"]["candidate_modified_by_reviewer"]:
                     role_issues.append("independent reviewer mutated the candidate worktree during phase 2")
                 if not p2_res["ok"]:
@@ -512,6 +517,7 @@ def review_candidate_independently(
             "phase_1_stdout_path": p1_res["stdout_path"], "phase_1_stderr_path": p1_res["stderr_path"],
             "hypotheses_persisted_before_summary": hypotheses_path is not None, "hypotheses_path": hypotheses_path,
             "hypotheses_sha256": hypotheses_sha256, "phase_2_executed": p2_res["executed"],
+            "phase_2_continued_session_id": p1_res["session_id"] if p2_res["executed"] else None,
             "phase_2_prompt_path": p2_prompt_path, "phase_2_stdout_path": p2_res["stdout_path"], "phase_2_stderr_path": p2_res["stderr_path"],
         }
         role_sep_ok = (p1_res["executed"] and p2_res["executed"] and bool(p1_res["session_id"]) and bool(b_sid)

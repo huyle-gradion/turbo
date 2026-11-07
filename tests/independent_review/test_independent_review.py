@@ -29,14 +29,16 @@ def _make_staged_reviewer_script(
         "Token validation might not strip whitespace or reject expired tokens",
         "Tests might only cover happy path without expired token assertion",
     ]
-    f_list, assess, p2_sid = findings or [], assessment or DEFAULT_ASSESSMENT, (phase2_session_id if phase2_session_id is not None else session_id)
+    f_list, assess = findings or [], assessment or DEFAULT_ASSESSMENT
     return (
         "import json, pathlib, subprocess, sys\n"
         "prompt = sys.argv[sys.argv.index('--print') + 1] if '--print' in sys.argv else ''\n"
-        f"p1_sid, p2_sid = {session_id!r}, {p2_sid!r}\n"
+        f"p1_sid, p2_override = {session_id!r}, {phase2_session_id!r}\n"
         "if 'PHASE: 1 (pre-summary' in prompt:\n"
+        "    assert '--conversation' not in sys.argv and '--continue' not in sys.argv and '-c' not in sys.argv\n"
         "    for forbidden in ('Builder summary:', 'Builder Summary'): assert forbidden not in prompt\n"
         "    for req in ('@@ ', 'diff --git', 'Requirements & Acceptance Criteria:', 'Applicable Project Standards:'): assert req in prompt\n"
+        "    pathlib.Path.home().joinpath('.phase1_sid').write_text(p1_sid, encoding='utf-8')\n"
         f"    if {mutate_in_phase!r} == 1:\n"
         f"        if {mutate_kind!r} == 'untracked': pathlib.Path('reviewer_note.txt').write_text('x', encoding='utf-8')\n"
         f"        elif {mutate_kind!r} == 'staged': pathlib.Path('src/chat_bridge/auth.py').write_text('# stg\\n', encoding='utf-8'); subprocess.run(['git', 'add', 'src/chat_bridge/auth.py'], check=True)\n"
@@ -44,12 +46,16 @@ def _make_staged_reviewer_script(
         "        else: pathlib.Path('src/chat_bridge/auth.py').write_text('# mut\\n', encoding='utf-8')\n"
         f"    print(json.dumps({{'event': 'result', 'result': {{'conversation_id': p1_sid, 'status': 'SUCCESS', 'response': json.dumps({{'hypotheses': {hyps!r}}})}}}}))\n"
         "else:\n"
+        "    assert '--conversation' in sys.argv, 'missing --conversation continuation flag in phase 2'\n"
+        "    resumed_sid = sys.argv[sys.argv.index('--conversation') + 1]\n"
+        "    assert resumed_sid == pathlib.Path.home().joinpath('.phase1_sid').read_text(encoding='utf-8').strip()\n"
         "    for req in ('PHASE: 2 (substantive-assessment', 'Persisted Phase-1 Hypotheses:', 'Builder Summary (untrusted claim):'): assert req in prompt\n"
         f"    if {mutate_in_phase!r} == 2:\n"
         f"        if {mutate_kind!r} == 'untracked': pathlib.Path('reviewer_note.txt').write_text('x', encoding='utf-8')\n"
         "        else: pathlib.Path('src/chat_bridge/auth.py').write_text('# mut2\\n', encoding='utf-8')\n"
+        "    out_sid = p2_override if p2_override is not None else resumed_sid\n"
         f"    resp = json.dumps({{'outcome': {outcome!r}, 'assessment': {assess!r}, 'findings': {f_list!r}}})\n"
-        "    print(json.dumps({'event': 'result', 'result': {'conversation_id': p2_sid, 'status': 'SUCCESS', 'response': resp}}))\n"
+        "    print(json.dumps({'event': 'result', 'result': {'conversation_id': out_sid, 'status': 'SUCCESS', 'response': resp}}))\n"
     )
 
 
@@ -342,6 +348,20 @@ class IndependentReviewTest(unittest.TestCase):
             self.assertIn("SUMMARY_ONLY_M2", p2_in)
             self.assertNotIn(sentinel, p1_in)
             self.assertNotIn(sentinel, p2_in)
+
+    def test_m3_two_phase_reviewer_session_continuation_lifecycle(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _, _, _, _, _, _, _, _, run_rev = self._setup_workspace(root)
+            valid = run_rev(round_num=1)
+            self.assertEqual((valid["outcome"], valid["review_verified"], valid["protocol_ordering"].get("phase_2_continued_session_id")),
+                             ("review-passed", True, "fresh-reviewer-99"))
+            drifted_agy = _make_fake_agy(root, "agy-drifted", _make_staged_reviewer_script(session_id="fresh-1", phase2_session_id="drifted-2"))
+            drifted = run_rev(round_num=2, agy_bin=str(drifted_agy))
+            self.assertEqual((drifted["outcome"], drifted["review_verified"], drifted["role_separation_verified"]), ("invalid-review", False, False))
+            p2_builder_agy = _make_fake_agy(root, "agy-p2-builder", _make_staged_reviewer_script(session_id="fresh-1", phase2_session_id="builder-session-1"))
+            p2_builder = run_rev(round_num=3, agy_bin=str(p2_builder_agy))
+            self.assertEqual((p2_builder["outcome"], p2_builder["review_verified"], p2_builder["role_separation_verified"]), ("invalid-review", False, False))
 
 
 def run_disposable_demo(tmp: Path) -> dict:
