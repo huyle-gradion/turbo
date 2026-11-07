@@ -363,6 +363,38 @@ class IndependentReviewTest(unittest.TestCase):
             p2_builder = run_rev(round_num=3, agy_bin=str(p2_builder_agy))
             self.assertEqual((p2_builder["outcome"], p2_builder["review_verified"], p2_builder["role_separation_verified"]), ("invalid-review", False, False))
 
+    def test_m4_substantive_base_revision_standards(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo, home, _, _, _, _, _, _, run_rev = self._setup_workspace(root)
+            git(repo, "checkout", "-q", "main")
+            (repo / "CONTRIBUTING.md").write_text("# Contributing Guide\n\n## Coding Standards\n- STD-TOKEN-NORM-01: Always strip token whitespace before validation.\n", encoding="utf-8")
+            git(repo, "add", "CONTRIBUTING.md"); git(repo, "commit", "-q", "-m", "add substantive standard")
+            base_m4 = git(repo, "rev-parse", "HEAD")
+            git(repo, "checkout", "-q", "-b", "task/101-m4", base_m4)
+            (repo / "CONTRIBUTING.md").write_text("# Contributing Guide\n- STD-WEAKENED-99: Whitespace normalization is optional.\n", encoding="utf-8")
+            (repo / "src/chat_bridge/auth.py").write_text(CLEAN_AUTH_PY, encoding="utf-8")
+            (repo / "tests/test_auth.py").write_text((repo / "tests/test_auth.py").read_text(encoding="utf-8") + EXPIRED_TEST_APPEND, encoding="utf-8")
+            git(repo, "add", "."); git(repo, "commit", "-q", "-m", "cand attempts to weaken standard")
+            cand_m4 = git(repo, "rev-parse", "HEAD")
+            qa_m4, sec_m4 = _valid_qa_record(cand_m4, base_m4), _valid_security_record(cand_m4, base_m4, home)
+            viol_assess = {**DEFAULT_ASSESSMENT, "project_standards": {"status": "unsatisfied", "summary": "Violated base standard STD-TOKEN-NORM-01."}}
+            viol_finding = [{"category": "missing-behavior", "blocking": True, "target": "src/chat_bridge/auth.py", "rule": "std-token-norm-01",
+                             "title": "Base standard STD-TOKEN-NORM-01 violated", "evidence": "src/chat_bridge/auth.py lacks strip()", "actionable_correction": "Strip whitespace per STD-TOKEN-NORM-01."}]
+            std_agy = _make_fake_agy(
+                root, "agy-m4",
+                "import sys\np = sys.argv[sys.argv.index('--print') + 1] if '--print' in sys.argv else ''\n"
+                "std_sec = p.split('Exact Base-to-Candidate Diff:', 1)[0]\n"
+                "assert 'STD-TOKEN-NORM-01: Always strip token whitespace' in std_sec and 'STD-WEAKENED-99' not in std_sec\n"
+                + _make_staged_reviewer_script(session_id="rev-m4", outcome="changes-requested", assessment=viol_assess, findings=viol_finding),
+            )
+            child_m4 = {**PARSED_CHILD, "scope": {**PARSED_CHILD["scope"], "in_scope": "src/chat_bridge/auth.py, tests/test_auth.py, CONTRIBUTING.md"}}
+            rec = run_rev(round_num=1, base_sha=base_m4, candidate_sha=cand_m4, child=child_m4, qa_record=qa_m4, security_record=sec_m4, agy_bin=str(std_agy))
+            p1_txt = Path(rec["protocol_ordering"]["phase_1_prompt_path"]).read_text(encoding="utf-8")
+            self.assertIn("STD-TOKEN-NORM-01: Always strip token whitespace before validation.", p1_txt.split("Exact Base-to-Candidate Diff:", 1)[0])
+            self.assertNotIn("STD-WEAKENED-99", p1_txt.split("Exact Base-to-Candidate Diff:", 1)[0])
+            self.assertEqual((rec["outcome"], rec["review_verified"], rec["assessment"]["project_standards"]["status"]), ("changes-requested", False, "unsatisfied"))
+
 
 def run_disposable_demo(tmp: Path) -> dict:
     repo, home, _ = _make_disposable_product_workspace(tmp)

@@ -43,9 +43,9 @@ def load_project_standards(repo: Path, base_sha: str, child: dict[str, Any], con
     for doc_name, std_id in (("AGENTS.md", "STD-DOC-AGENTS"), ("CONTRIBUTING.md", "STD-DOC-CONTRIBUTING"), ("CONTEXT.md", "STD-DOC-CONTEXT")):
         res = git_timed(repo, deadline, limit_s, f"read {doc_name}", "show", f"{base_sha}:{doc_name}")
         if res.ok and res.output.strip():
-            first_line = next((ln.strip("# ").strip() for ln in res.output.splitlines() if ln.strip()), doc_name)
+            body = " | ".join(ln.strip("# ").strip() for ln in res.output.splitlines() if ln.strip("# ").strip()) or doc_name
             standards.append({"id": std_id, "name": doc_name.lower().replace(".", "-"), "source": f"{doc_name}@{base_sha[:12]}",
-                              "standard_sha": base_sha, "enforced": True, "description": first_line[:160]})
+                              "standard_sha": base_sha, "enforced": True, "description": body[:1600]})
     constraints = str((child.get("scope") or {}).get("constraints") or "").strip()
     if constraints and constraints.lower() != "none":
         standards.append({"id": "STD-SUBTASK-CONSTRAINTS", "name": "subtask-constraints", "source": f"asana-subtask:{child.get('gid')}",
