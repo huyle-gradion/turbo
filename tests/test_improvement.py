@@ -12,7 +12,8 @@ import unittest
 from factory.errors import UsageError
 from factory.improvement import (
     AUTHORITY_NOTE, canonicalize_draft_references, create_proposal, evaluate_proposal,
-    main as improvement_main, proposal_digest, validate_proposal, validate_report_for_review,
+    main as improvement_main, proposal_digest, validate_proposal, validate_proposal_structure,
+    validate_report_for_review,
 )
 from factory.worker import RateCard
 
@@ -585,6 +586,73 @@ class ImprovementWorkflowTest(unittest.TestCase):
                     issues = validate_report_for_review(mutated, proposal_json=ext_json)
                     self.assertIsInstance(issues, list)
                     self.assertGreater(len(issues), 0, f"Mutation {label!r} was unexpectedly accepted")
+
+    def test_group_a_malformed_structures_and_shared_validation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            obs, cand, imp, reg = _sample_fixtures(root)
+            prop = create_proposal(
+                proposal_id="prop-ga", failure_description="f", failure_artifacts=[{"path": str(obs)}],
+                kind="check", target_path="target.py", content_path=cand, baseline_identity="b1",
+                candidate_identity="c1", expected_improvement_description="exp",
+                improvement_cases=[imp], regression_cases=[reg],
+            )
+            report = evaluate_proposal(prop, root / "ev_ga")
+
+            # 1. Non-dict baseline/candidate mutations
+            for bad_obj in ("string", None, 123, []):
+                for key in ("baseline", "candidate"):
+                    with self.subTest(key=key, bad_obj=bad_obj):
+                        clone = json.loads(json.dumps(report))
+                        clone["proposal"][key] = bad_obj
+                        clone["proposal_digest"] = proposal_digest(clone["proposal"])
+                        issues = validate_report_for_review(clone)
+                        self.assertIsInstance(issues, list)
+                        self.assertGreater(len(issues), 0)
+
+            # 2. List/dict unhashable case_ids in results and proposal
+            for unhashable_id in (["IMP-01"], {"id": "IMP-01"}):
+                with self.subTest(unhashable_result_id=unhashable_id):
+                    clone = json.loads(json.dumps(report))
+                    clone["candidate_results"]["improvement_cases"][0]["case_id"] = unhashable_id
+                    issues = validate_report_for_review(clone)
+                    self.assertIsInstance(issues, list)
+                    self.assertGreater(len(issues), 0)
+                with self.subTest(unhashable_proposal_id=unhashable_id):
+                    clone = json.loads(json.dumps(report))
+                    clone["proposal"]["improvement_cases"][0]["case_id"] = unhashable_id
+                    clone["proposal_digest"] = proposal_digest(clone["proposal"])
+                    issues = validate_report_for_review(clone)
+                    self.assertIsInstance(issues, list)
+                    self.assertGreater(len(issues), 0)
+
+            # 3. Missing/non-list rubric_failures
+            for bad_rf in (True, 1, 0, False, None, "str", {"err": 1}):
+                with self.subTest(bad_rubric_failures=bad_rf):
+                    clone = json.loads(json.dumps(report))
+                    clone["candidate_results"]["improvement_cases"][0]["rubric_failures"] = bad_rf
+                    issues = validate_report_for_review(clone)
+                    self.assertIsInstance(issues, list)
+                    self.assertGreater(len(issues), 0)
+
+            # 4. Rebound embedded proposals with weakened/unexecutable commands, boolean exit code, non-string tokens
+            rebound_mutations = [
+                ("weakened_cmd", lambda p: p["improvement_cases"][0].update({"command": "python3 -m unittest -k 'not slow'"})),
+                ("unexecutable_cmd", lambda p: p["improvement_cases"][0].update({"command": "echo 'unclosed quote"})),
+                ("bool_exit_code", lambda p: p["improvement_cases"][0]["rubric"].update({"expected_exit_code": True})),
+                ("non_str_tokens", lambda p: p["improvement_cases"][0]["rubric"].update({"required_output_tokens": [123]})),
+            ]
+            for label, mut_fn in rebound_mutations:
+                with self.subTest(rebound_label=label):
+                    clone = json.loads(json.dumps(report))
+                    mut_fn(clone["proposal"])
+                    clone["proposal_digest"] = proposal_digest(clone["proposal"])
+                    # Keep results rubric aligned if rubric was modified
+                    clone["candidate_results"]["improvement_cases"][0]["rubric"] = dict(clone["proposal"]["improvement_cases"][0]["rubric"])
+                    clone["baseline_results"]["improvement_cases"][0]["rubric"] = dict(clone["proposal"]["improvement_cases"][0]["rubric"])
+                    issues = validate_report_for_review(clone)
+                    self.assertIsInstance(issues, list)
+                    self.assertGreater(len(issues), 0, f"Expected {label!r} to be rejected")
 
 
 

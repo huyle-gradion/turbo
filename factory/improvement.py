@@ -87,33 +87,99 @@ def _write_confined_file(worktree: Path, rel_path: str, content: bytes) -> Path:
     return target
 
 
-def _validate_case(case: dict[str, Any], seen_ids: set[str], label: str, *, base_dir: Path | None = None) -> list[str]:
+def _validate_case_structure(case: Any, seen_ids: set[str], label: str) -> list[str]:
     if not isinstance(case, dict):
         return [f"{label} case must be a JSON object"]
-    cid, issues = str(case.get("case_id") or "").strip(), []
-    if not cid or not VALID_ID_RE.fullmatch(cid): issues.append(f"{label} case has invalid case_id {cid!r}")
-    elif cid in seen_ids: issues.append(f"duplicate case_id {cid!r} in {label} cases")
+    raw_id = case.get("case_id")
+    if not isinstance(raw_id, str):
+        return [f"{label} case has invalid case_id {raw_id!r}"]
+    cid, issues = raw_id.strip(), []
+    if not cid or not VALID_ID_RE.fullmatch(cid):
+        issues.append(f"{label} case has invalid case_id {cid!r}")
+    elif cid in seen_ids:
+        issues.append(f"duplicate case_id {cid!r} in {label} cases")
     seen_ids.add(cid)
     cmd = str(case.get("command") or "").strip()
     argv = deliver_checks._verification_argv(cmd)
-    if argv is None: issues.append(f"case {cid!r} command is unexecutable: {cmd!r}")
-    elif ci_selection.WEAKENED_CMD_RE.search(cmd): issues.append(f"case {cid!r} command weakens verification: {cmd!r}")
+    if argv is None:
+        issues.append(f"case {cid!r} command is unexecutable: {cmd!r}")
+    elif ci_selection.WEAKENED_CMD_RE.search(cmd):
+        issues.append(f"case {cid!r} command weakens verification: {cmd!r}")
     rub = case.get("rubric")
     if not isinstance(rub, dict):
         issues.append(f"case {cid!r} requires rubric dictionary")
     else:
         rid, raw_code = str(rub.get("rubric_id") or "").strip(), rub.get("expected_exit_code", 0)
-        if not rid or not VALID_ID_RE.fullmatch(rid): issues.append(f"case {cid!r} invalid rubric_id: {rid!r}")
-        if isinstance(raw_code, bool) or not isinstance(raw_code, int): issues.append(f"case {cid!r} expected_exit_code must be int")
+        if not rid or not VALID_ID_RE.fullmatch(rid):
+            issues.append(f"case {cid!r} invalid rubric_id: {rid!r}")
+        if isinstance(raw_code, bool) or not isinstance(raw_code, int):
+            issues.append(f"case {cid!r} expected_exit_code must be int")
         for k in ("required_output_tokens", "forbidden_output_tokens"):
             v = rub.get(k, [])
             if not isinstance(v, (list, tuple)) or any(not isinstance(t, str) for t in v):
                 issues.append(f"case {cid!r} rubric {k} must be list of strings")
-    for inp in case.get("inputs") or ():
-        p = Path(str(inp.get("path") or "")) if isinstance(inp, dict) else Path()
-        if base_dir and not p.is_absolute(): p = base_dir / p
-        if not p.is_file(): issues.append(f"case {cid!r} input not found: {p}")
-        elif _sha256_file(p) != str(inp.get("sha256") or ""): issues.append(f"case {cid!r} input sha mismatch: {p}")
+    return issues
+
+
+def validate_proposal_structure(proposal: Any) -> list[str]:
+    if not isinstance(proposal, dict):
+        return ["proposal must be a JSON object"]
+    issues: list[str] = []
+    if proposal.get("schema_version") != PROPOSAL_SCHEMA_VERSION:
+        issues.append(f"unsupported schema_version: {proposal.get('schema_version')!r}")
+    pid = str(proposal.get("proposal_id") or "").strip()
+    if not pid or not VALID_ID_RE.fullmatch(pid):
+        issues.append(f"invalid proposal_id: {pid!r}")
+    obs = proposal.get("observed_failure")
+    if not isinstance(obs, dict) or not str(obs.get("description") or "").strip():
+        issues.append("observed_failure requires non-empty description")
+    elif not isinstance(obs.get("artifacts"), list) or not obs.get("artifacts"):
+        issues.append("observed_failure requires non-empty artifacts list")
+    prop = proposal.get("proposed_change")
+    if not isinstance(prop, dict) or prop.get("kind") not in ("skill", "tool", "check"):
+        issues.append(f"proposed_change requires kind skill, tool, or check: {(prop or {}).get('kind')!r}")
+    else:
+        tgt = str(prop.get("target_path") or "").strip()
+        if not _is_safe_relative_path(tgt):
+            issues.append(f"invalid target_path: {tgt!r}")
+        if not str(prop.get("content_sha256") or "").strip():
+            issues.append("proposed_change content_sha256 required")
+    base = proposal.get("baseline")
+    if not isinstance(base, dict) or not str(base.get("identity") or "").strip():
+        issues.append("baseline identity required")
+    cand = proposal.get("candidate")
+    if not isinstance(cand, dict) or not str(cand.get("identity") or "").strip():
+        issues.append("candidate identity required")
+    elif isinstance(prop, dict) and str(cand.get("content_sha256") or "") != str(prop.get("content_sha256") or ""):
+        issues.append("candidate content_sha256 must match proposed_change content_sha256")
+    exp_imp = proposal.get("expected_improvement")
+    if not isinstance(exp_imp, dict) or not str(exp_imp.get("description") or "").strip():
+        issues.append("expected_improvement requires description")
+    elif exp_imp.get("rule") not in SUPPORTED_RULES:
+        issues.append(f"unsupported rule: {exp_imp.get('rule')!r}")
+    imp_cases, reg_cases = proposal.get("improvement_cases"), proposal.get("regression_cases")
+    if not isinstance(imp_cases, list) or not imp_cases:
+        issues.append("improvement_cases must be non-empty list")
+    if not isinstance(reg_cases, list) or not reg_cases:
+        issues.append("regression_cases must be non-empty list")
+    seen_ids: set[str] = set()
+    for cases, label in (((imp_cases if isinstance(imp_cases, list) else ()), "improvement"), ((reg_cases if isinstance(reg_cases, list) else ()), "regression")):
+        for c in cases:
+            issues.extend(_validate_case_structure(c, seen_ids, label))
+    conds = proposal.get("execution_conditions")
+    if not isinstance(conds, dict):
+        issues.append("execution_conditions must be a JSON object")
+    else:
+        if not isinstance(conds.get("time_limit_seconds"), int) or conds.get("time_limit_seconds", 0) <= 0:
+            issues.append("execution_conditions time_limit_seconds must be positive int")
+        if conds.get("allow_network") is not False:
+            issues.append("execution_conditions allow_network must be False")
+        if conds.get("env_sanitized") is not True:
+            issues.append("execution_conditions env_sanitized must be True")
+        ps = conds.get("permitted_substitution")
+        exp_c_sha = (prop or {}).get("content_sha256") if isinstance(prop, dict) else ""
+        if not isinstance(ps, dict) or ps.get("target_path") != (prop or {}).get("target_path") or ps.get("content_sha256") != exp_c_sha:
+            issues.append("execution_conditions permitted_substitution must match proposed_change")
     return issues
 
 
@@ -142,60 +208,45 @@ def canonicalize_draft_references(proposal: dict[str, Any], base_dir: Path) -> d
 
 
 def validate_proposal(proposal: dict[str, Any], *, base_dir: Path | None = None) -> list[str]:
-    if not isinstance(proposal, dict): return ["proposal must be a JSON object"]
-    issues: list[str] = []
-    if proposal.get("schema_version") != PROPOSAL_SCHEMA_VERSION:
-        issues.append(f"unsupported schema_version: {proposal.get('schema_version')!r}")
-    pid = str(proposal.get("proposal_id") or "").strip()
-    if not pid or not VALID_ID_RE.fullmatch(pid): issues.append(f"invalid proposal_id: {pid!r}")
+    issues = validate_proposal_structure(proposal)
+    if not isinstance(proposal, dict):
+        return issues
     obs = proposal.get("observed_failure")
-    if not isinstance(obs, dict) or not str(obs.get("description") or "").strip():
-        issues.append("observed_failure requires non-empty description")
-    elif not isinstance(obs.get("artifacts"), list) or not obs.get("artifacts"):
-        issues.append("observed_failure requires non-empty artifacts list")
-    else:
+    if isinstance(obs, dict) and isinstance(obs.get("artifacts"), list):
         for art in obs["artifacts"]:
-            p = Path(str(art.get("path") or ""))
-            if base_dir and not p.is_absolute(): p = base_dir / p
-            if not p.is_file(): issues.append(f"observed_failure artifact not found: {p}")
-            elif _sha256_file(p) != str(art.get("sha256") or ""): issues.append(f"observed_failure artifact sha mismatch: {p}")
-    prop, exp_c_sha = proposal.get("proposed_change"), ""
-    if not isinstance(prop, dict) or prop.get("kind") not in ("skill", "tool", "check"):
-        issues.append(f"proposed_change requires kind skill, tool, or check: {(prop or {}).get('kind')!r}")
-    else:
-        tgt = str(prop.get("target_path") or "").strip()
-        if not _is_safe_relative_path(tgt):
-            issues.append(f"invalid target_path: {tgt!r}")
+            if isinstance(art, dict):
+                p = Path(str(art.get("path") or ""))
+                if base_dir and not p.is_absolute():
+                    p = base_dir / p
+                if not p.is_file():
+                    issues.append(f"observed_failure artifact not found: {p}")
+                elif _sha256_file(p) != str(art.get("sha256") or ""):
+                    issues.append(f"observed_failure artifact sha mismatch: {p}")
+    prop = proposal.get("proposed_change")
+    if isinstance(prop, dict):
         cp = Path(str(prop.get("content_path") or ""))
-        if base_dir and not cp.is_absolute(): cp = base_dir / cp
-        if not cp.is_file(): issues.append(f"proposed_change content_path not found: {cp}")
+        if base_dir and not cp.is_absolute():
+            cp = base_dir / cp
+        if not cp.is_file():
+            issues.append(f"proposed_change content_path not found: {cp}")
         else:
             exp_c_sha = _sha256_file(cp)
-            if exp_c_sha != str(prop.get("content_sha256") or ""): issues.append("proposed_change content_sha256 mismatch")
-    if not str(proposal.get("baseline", {}).get("identity") or "").strip(): issues.append("baseline identity required")
-    if not str(proposal.get("candidate", {}).get("identity") or "").strip(): issues.append("candidate identity required")
-    if str(proposal.get("candidate", {}).get("content_sha256") or "") != exp_c_sha:
-        issues.append("candidate content_sha256 must match proposed_change content_sha256")
-    exp_imp = proposal.get("expected_improvement")
-    if not isinstance(exp_imp, dict) or not str(exp_imp.get("description") or "").strip():
-        issues.append("expected_improvement requires description")
-    elif exp_imp.get("rule") not in SUPPORTED_RULES: issues.append(f"unsupported rule: {exp_imp.get('rule')!r}")
-    imp_cases, reg_cases = proposal.get("improvement_cases"), proposal.get("regression_cases")
-    if not isinstance(imp_cases, list) or not imp_cases: issues.append("improvement_cases must be non-empty list")
-    if not isinstance(reg_cases, list) or not reg_cases: issues.append("regression_cases must be non-empty list")
-    seen_ids: set[str] = set()
-    for c in (imp_cases or ()): issues.extend(_validate_case(c, seen_ids, "improvement", base_dir=base_dir))
-    for c in (reg_cases or ()): issues.extend(_validate_case(c, seen_ids, "regression", base_dir=base_dir))
-    conds = proposal.get("execution_conditions")
-    if not isinstance(conds, dict): issues.append("execution_conditions must be a JSON object")
-    else:
-        if not isinstance(conds.get("time_limit_seconds"), int) or conds.get("time_limit_seconds", 0) <= 0:
-            issues.append("execution_conditions time_limit_seconds must be positive int")
-        if conds.get("allow_network") is not False: issues.append("execution_conditions allow_network must be False")
-        if conds.get("env_sanitized") is not True: issues.append("execution_conditions env_sanitized must be True")
-        ps = conds.get("permitted_substitution")
-        if not isinstance(ps, dict) or ps.get("target_path") != (prop or {}).get("target_path") or ps.get("content_sha256") != exp_c_sha:
-            issues.append("execution_conditions permitted_substitution must match proposed_change")
+            if exp_c_sha != str(prop.get("content_sha256") or ""):
+                issues.append("proposed_change content_sha256 mismatch")
+    for cases_key in ("improvement_cases", "regression_cases"):
+        cases = proposal.get(cases_key)
+        if isinstance(cases, list):
+            for c in cases:
+                if isinstance(c, dict):
+                    cid = c.get("case_id")
+                    for inp in c.get("inputs") or ():
+                        p = Path(str(inp.get("path") or "")) if isinstance(inp, dict) else Path()
+                        if base_dir and not p.is_absolute():
+                            p = base_dir / p
+                        if not p.is_file():
+                            issues.append(f"case {cid!r} input not found: {p}")
+                        elif _sha256_file(p) != str(inp.get("sha256") or ""):
+                            issues.append(f"case {cid!r} input sha mismatch: {p}")
     return issues
 
 
@@ -360,59 +411,6 @@ def evaluate_proposal(
     return report
 
 
-def _validate_embedded_proposal_structure(proposal: Any) -> list[str]:
-    if not isinstance(proposal, dict):
-        return ["embedded proposal must be a JSON object"]
-    issues: list[str] = []
-    if proposal.get("schema_version") != PROPOSAL_SCHEMA_VERSION:
-        issues.append(f"unsupported embedded proposal schema_version: {proposal.get('schema_version')!r}")
-    pid = str(proposal.get("proposal_id") or "").strip()
-    if not pid or not VALID_ID_RE.fullmatch(pid):
-        issues.append(f"invalid embedded proposal proposal_id: {pid!r}")
-    prop = proposal.get("proposed_change")
-    if not isinstance(prop, dict) or prop.get("kind") not in ("skill", "tool", "check"):
-        issues.append("embedded proposal proposed_change requires kind skill, tool, or check")
-    else:
-        tgt = str(prop.get("target_path") or "").strip()
-        if not _is_safe_relative_path(tgt):
-            issues.append(f"invalid embedded proposal target_path: {tgt!r}")
-        if not str(prop.get("content_sha256") or "").strip():
-            issues.append("embedded proposal proposed_change content_sha256 required")
-    if not str(proposal.get("baseline", {}).get("identity") or "").strip():
-        issues.append("embedded proposal baseline identity required")
-    if not str(proposal.get("candidate", {}).get("identity") or "").strip():
-        issues.append("embedded proposal candidate identity required")
-    exp_imp = proposal.get("expected_improvement")
-    if not isinstance(exp_imp, dict) or not str(exp_imp.get("description") or "").strip():
-        issues.append("embedded proposal expected_improvement requires description")
-    elif exp_imp.get("rule") not in SUPPORTED_RULES:
-        issues.append(f"embedded proposal unsupported rule: {exp_imp.get('rule')!r}")
-    imp_cases, reg_cases = proposal.get("improvement_cases"), proposal.get("regression_cases")
-    if not isinstance(imp_cases, list) or not imp_cases:
-        issues.append("embedded proposal improvement_cases must be non-empty list")
-    if not isinstance(reg_cases, list) or not reg_cases:
-        issues.append("embedded proposal regression_cases must be non-empty list")
-    seen_ids: set[str] = set()
-    for cases, label in ((imp_cases, "improvement"), (reg_cases, "regression")):
-        if isinstance(cases, list):
-            for c in cases:
-                if not isinstance(c, dict):
-                    issues.append(f"embedded proposal {label} case must be object")
-                    continue
-                cid = str(c.get("case_id") or "").strip()
-                if not cid or not VALID_ID_RE.fullmatch(cid):
-                    issues.append(f"embedded proposal {label} case has invalid case_id: {cid!r}")
-                elif cid in seen_ids:
-                    issues.append(f"duplicate case_id {cid!r} in embedded proposal")
-                seen_ids.add(cid)
-                rub = c.get("rubric")
-                if not isinstance(rub, dict):
-                    issues.append(f"embedded proposal case {cid!r} requires rubric dictionary")
-                elif not str(rub.get("rubric_id") or "").strip() or not VALID_ID_RE.fullmatch(str(rub.get("rubric_id") or "").strip()):
-                    issues.append(f"embedded proposal case {cid!r} invalid rubric_id: {rub.get('rubric_id')!r}")
-    return issues
-
-
 def validate_report_for_review(report: dict[str, Any], *, proposal_json: str | None = None) -> list[str]:
     issues: list[str] = []
     if not isinstance(report, dict):
@@ -426,14 +424,14 @@ def validate_report_for_review(report: dict[str, Any], *, proposal_json: str | N
         issues.append(f"invalid report eligibility: {eligibility!r}")
 
     emb_prop = report.get("proposal")
-    prop_issues = _validate_embedded_proposal_structure(emb_prop)
+    prop_issues = validate_proposal_structure(emb_prop)
     if prop_issues:
         issues.extend(prop_issues)
-    else:
+    elif isinstance(emb_prop, dict):
         if report.get("proposal_digest") != proposal_digest(emb_prop):
             issues.append("report proposal_digest mismatch with embedded proposal")
-        prop_c_sha = (emb_prop.get("proposed_change") or {}).get("content_sha256")
-        cand_c_sha = (emb_prop.get("candidate") or {}).get("content_sha256")
+        prop_c_sha = (emb_prop.get("proposed_change") if isinstance(emb_prop.get("proposed_change"), dict) else {}).get("content_sha256")
+        cand_c_sha = (emb_prop.get("candidate") if isinstance(emb_prop.get("candidate"), dict) else {}).get("content_sha256")
         if report.get("candidate_content_digest") != prop_c_sha:
             issues.append("report candidate_content_digest mismatch with embedded proposal")
         if cand_c_sha != prop_c_sha:
@@ -477,25 +475,37 @@ def validate_report_for_review(report: dict[str, Any], *, proposal_json: str | N
                     continue
                 actual_by_id = {}
                 for r in actual_list:
-                    if isinstance(r, dict):
-                        actual_by_id[r.get("case_id")] = r
-                    else:
+                    if not isinstance(r, dict):
                         issues.append(f"malformed case result in {side_name} {kind_name}")
+                        continue
+                    rcid = r.get("case_id")
+                    if not isinstance(rcid, str) or not rcid or not VALID_ID_RE.fullmatch(rcid):
+                        issues.append(f"malformed case_id in {side_name} {kind_name}: {rcid!r}")
+                        continue
+                    actual_by_id[rcid] = r
+                    rf = r.get("rubric_failures")
+                    if not isinstance(rf, list) or any(not isinstance(f, str) for f in rf):
+                        issues.append(f"{side_name} case {rcid!r} missing or non-list rubric_failures")
                 for pc in prop_cases:
                     if not isinstance(pc, dict):
                         continue
-                    cid = pc.get("case_id")
-                    if cid not in actual_by_id:
-                        issues.append(f"missing {side_name} result for case {cid!r}")
+                    pcid = pc.get("case_id")
+                    if not isinstance(pcid, str) or not pcid or not VALID_ID_RE.fullmatch(pcid):
+                        continue
+                    if pcid not in actual_by_id:
+                        issues.append(f"missing {side_name} result for case {pcid!r}")
                     else:
-                        cr = actual_by_id[cid]
+                        cr = actual_by_id[pcid]
                         if cr.get("rubric") != pc.get("rubric"):
-                            issues.append(f"{side_name} case {cid!r} rubric does not match proposal")
+                            issues.append(f"{side_name} case {pcid!r} rubric does not match proposal")
 
     def _is_behavioral_failure(r: Any) -> bool:
         if not isinstance(r, dict):
             return False
         exec_err = r.get("execution_error")
+        rf = r.get("rubric_failures")
+        if not isinstance(rf, list):
+            return False
         is_launch = (not r.get("executed")) or r.get("timed_out") or bool(exec_err) or (r.get("exit_code") in (124, 126, 127))
         return (not is_launch) and (not r.get("rubric_passed", False)) and bool(r.get("is_behavioral_failure"))
 
@@ -503,7 +513,10 @@ def validate_report_for_review(report: dict[str, Any], *, proposal_json: str | N
         if not isinstance(r, dict):
             return False
         exec_err = r.get("execution_error")
-        return bool(r.get("executed")) and (not r.get("timed_out")) and (not exec_err) and bool(r.get("rubric_passed")) and len(r.get("rubric_failures") or []) == 0
+        rf = r.get("rubric_failures")
+        if not isinstance(rf, list) or len(rf) != 0:
+            return False
+        return bool(r.get("executed")) and (not r.get("timed_out")) and (not exec_err) and bool(r.get("rubric_passed"))
 
     raw_base_fail = bool(b_imp) and all(_is_behavioral_failure(r) for r in b_imp)
     raw_cand_succ = bool(c_imp) and all(_passed_rubric(r) for r in c_imp)
