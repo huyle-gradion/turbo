@@ -48,11 +48,14 @@ python3 -m factory.improvement evaluate \
 ### Validation Rules for #69
 
 1. Reject reports where `schema_version != 1` or `authority_note` differs from the literal value.
-2. Re-hash the proposal JSON and ensure it matches `proposal_digest`.
-3. Verify `candidate_content_digest` matches the SHA-256 of candidate content.
-4. Verify `eligibility == "improvement-eligible"` and `comparison.rule_satisfied is true`.
-5. Require non-empty regressions and confirm all candidate regressions passed.
-6. Confirm baseline exhibited actual behavioral failure under the rubric (not launch failure, timeout, or missing executable).
+2. Require a structurally valid embedded proposal and verify `proposal_digest` matches its canonical SHA-256 digest (and matches external `proposal_json` if supplied).
+3. Verify `candidate_content_digest` matches the bound proposal's candidate content hash (`proposed_change.content_sha256` and `candidate.content_sha256`).
+4. Accept only documented eligibility states: `"improvement-eligible"` and `"ineligible"`. Valid ineligible reports remain accepted reviewable records, not approvals.
+5. For both sides (`baseline_results` and `candidate_results`), verify complete, matching named-case and rubric evidence corresponding to the bound proposal cases.
+6. Require non-empty regressions and verify that all candidate regressions executed and passed without launch failure or timeout.
+7. For eligible reports, verify that baseline exhibited actual behavioral failure under the rubric (not launch failure, timeout, execution error, or unexecutable command) on all improvement cases, and candidate demonstrated rubric success on all improvement cases.
+8. Verify summary comparison flags match raw case outcomes; reject truthy flags that contradict recorded results.
+9. Retained reports validate without requiring the original external draft or candidate files on disk.
 
 ### Authority and Trust Boundary
 

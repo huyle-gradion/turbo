@@ -360,19 +360,186 @@ def evaluate_proposal(
     return report
 
 
+def _validate_embedded_proposal_structure(proposal: Any) -> list[str]:
+    if not isinstance(proposal, dict):
+        return ["embedded proposal must be a JSON object"]
+    issues: list[str] = []
+    if proposal.get("schema_version") != PROPOSAL_SCHEMA_VERSION:
+        issues.append(f"unsupported embedded proposal schema_version: {proposal.get('schema_version')!r}")
+    pid = str(proposal.get("proposal_id") or "").strip()
+    if not pid or not VALID_ID_RE.fullmatch(pid):
+        issues.append(f"invalid embedded proposal proposal_id: {pid!r}")
+    prop = proposal.get("proposed_change")
+    if not isinstance(prop, dict) or prop.get("kind") not in ("skill", "tool", "check"):
+        issues.append("embedded proposal proposed_change requires kind skill, tool, or check")
+    else:
+        tgt = str(prop.get("target_path") or "").strip()
+        if not _is_safe_relative_path(tgt):
+            issues.append(f"invalid embedded proposal target_path: {tgt!r}")
+        if not str(prop.get("content_sha256") or "").strip():
+            issues.append("embedded proposal proposed_change content_sha256 required")
+    if not str(proposal.get("baseline", {}).get("identity") or "").strip():
+        issues.append("embedded proposal baseline identity required")
+    if not str(proposal.get("candidate", {}).get("identity") or "").strip():
+        issues.append("embedded proposal candidate identity required")
+    exp_imp = proposal.get("expected_improvement")
+    if not isinstance(exp_imp, dict) or not str(exp_imp.get("description") or "").strip():
+        issues.append("embedded proposal expected_improvement requires description")
+    elif exp_imp.get("rule") not in SUPPORTED_RULES:
+        issues.append(f"embedded proposal unsupported rule: {exp_imp.get('rule')!r}")
+    imp_cases, reg_cases = proposal.get("improvement_cases"), proposal.get("regression_cases")
+    if not isinstance(imp_cases, list) or not imp_cases:
+        issues.append("embedded proposal improvement_cases must be non-empty list")
+    if not isinstance(reg_cases, list) or not reg_cases:
+        issues.append("embedded proposal regression_cases must be non-empty list")
+    seen_ids: set[str] = set()
+    for cases, label in ((imp_cases, "improvement"), (reg_cases, "regression")):
+        if isinstance(cases, list):
+            for c in cases:
+                if not isinstance(c, dict):
+                    issues.append(f"embedded proposal {label} case must be object")
+                    continue
+                cid = str(c.get("case_id") or "").strip()
+                if not cid or not VALID_ID_RE.fullmatch(cid):
+                    issues.append(f"embedded proposal {label} case has invalid case_id: {cid!r}")
+                elif cid in seen_ids:
+                    issues.append(f"duplicate case_id {cid!r} in embedded proposal")
+                seen_ids.add(cid)
+                rub = c.get("rubric")
+                if not isinstance(rub, dict):
+                    issues.append(f"embedded proposal case {cid!r} requires rubric dictionary")
+                elif not str(rub.get("rubric_id") or "").strip() or not VALID_ID_RE.fullmatch(str(rub.get("rubric_id") or "").strip()):
+                    issues.append(f"embedded proposal case {cid!r} invalid rubric_id: {rub.get('rubric_id')!r}")
+    return issues
+
+
 def validate_report_for_review(report: dict[str, Any], *, proposal_json: str | None = None) -> list[str]:
     issues: list[str] = []
-    if not isinstance(report, dict): return ["report must be a JSON object"]
-    if report.get("schema_version") != REPORT_SCHEMA_VERSION: issues.append(f"unsupported schema_version: {report.get('schema_version')!r}")
-    if report.get("authority_note") != AUTHORITY_NOTE: issues.append("invalid authority note on report")
+    if not isinstance(report, dict):
+        return ["report must be a JSON object"]
+    if report.get("schema_version") != REPORT_SCHEMA_VERSION:
+        issues.append(f"unsupported schema_version: {report.get('schema_version')!r}")
+    if report.get("authority_note") != AUTHORITY_NOTE:
+        issues.append("invalid authority note on report")
+    eligibility = report.get("eligibility")
+    if eligibility not in ("improvement-eligible", "ineligible"):
+        issues.append(f"invalid report eligibility: {eligibility!r}")
+
+    emb_prop = report.get("proposal")
+    prop_issues = _validate_embedded_proposal_structure(emb_prop)
+    if prop_issues:
+        issues.extend(prop_issues)
+    else:
+        if report.get("proposal_digest") != proposal_digest(emb_prop):
+            issues.append("report proposal_digest mismatch with embedded proposal")
+        prop_c_sha = (emb_prop.get("proposed_change") or {}).get("content_sha256")
+        cand_c_sha = (emb_prop.get("candidate") or {}).get("content_sha256")
+        if report.get("candidate_content_digest") != prop_c_sha:
+            issues.append("report candidate_content_digest mismatch with embedded proposal")
+        if cand_c_sha != prop_c_sha:
+            issues.append("embedded proposal candidate content_sha256 mismatch with proposed_change")
+
     if proposal_json is not None:
         expected_digest = hashlib.sha256(proposal_json.encode("utf-8")).hexdigest()
-        if report.get("proposal_digest") != expected_digest: issues.append(f"report proposal_digest mismatch")
-    if report.get("eligibility") == "improvement-eligible":
-        comp = report.get("comparison") or {}
-        if not comp.get("rule_satisfied") or not comp.get("baseline_demonstrated_failure") or not comp.get("candidate_demonstrated_success") or not comp.get("candidate_regressions_passed"):
-            issues.append("eligible report has unsatisfied comparison conditions")
-        if report.get("eligibility_reasons"): issues.append("eligible report has non-empty eligibility_reasons")
+        if report.get("proposal_digest") != expected_digest:
+            issues.append("report proposal_digest mismatch with external proposal_json")
+
+    base_res = report.get("baseline_results")
+    cand_res = report.get("candidate_results")
+    if not isinstance(base_res, dict) or not isinstance(cand_res, dict):
+        issues.append("report requires baseline_results and candidate_results dictionaries")
+        return issues
+
+    b_imp = base_res.get("improvement_cases")
+    b_reg = base_res.get("regression_cases")
+    c_imp = cand_res.get("improvement_cases")
+    c_reg = cand_res.get("regression_cases")
+    if not isinstance(b_imp, list) or not isinstance(b_reg, list) or not isinstance(c_imp, list) or not isinstance(c_reg, list):
+        issues.append("case results in baseline_results and candidate_results must be lists")
+        return issues
+
+    p_imp = emb_prop.get("improvement_cases") if isinstance(emb_prop, dict) else None
+    p_reg = emb_prop.get("regression_cases") if isinstance(emb_prop, dict) else None
+
+    if isinstance(p_imp, list) and isinstance(p_reg, list):
+        if len(p_reg) == 0:
+            issues.append("report requires non-empty regression_cases")
+        if len(p_imp) == 0:
+            issues.append("report requires non-empty improvement_cases")
+
+        for side_name, side_dict in (("baseline", base_res), ("candidate", cand_res)):
+            for kind_name, prop_cases in (("improvement_cases", p_imp), ("regression_cases", p_reg)):
+                actual_list = side_dict.get(kind_name)
+                if not isinstance(actual_list, list):
+                    continue
+                if len(actual_list) != len(prop_cases):
+                    issues.append(f"{side_name} {kind_name} count does not match proposal")
+                    continue
+                actual_by_id = {}
+                for r in actual_list:
+                    if isinstance(r, dict):
+                        actual_by_id[r.get("case_id")] = r
+                    else:
+                        issues.append(f"malformed case result in {side_name} {kind_name}")
+                for pc in prop_cases:
+                    if not isinstance(pc, dict):
+                        continue
+                    cid = pc.get("case_id")
+                    if cid not in actual_by_id:
+                        issues.append(f"missing {side_name} result for case {cid!r}")
+                    else:
+                        cr = actual_by_id[cid]
+                        if cr.get("rubric") != pc.get("rubric"):
+                            issues.append(f"{side_name} case {cid!r} rubric does not match proposal")
+
+    def _is_behavioral_failure(r: Any) -> bool:
+        if not isinstance(r, dict):
+            return False
+        exec_err = r.get("execution_error")
+        is_launch = (not r.get("executed")) or r.get("timed_out") or bool(exec_err) or (r.get("exit_code") in (124, 126, 127))
+        return (not is_launch) and (not r.get("rubric_passed", False)) and bool(r.get("is_behavioral_failure"))
+
+    def _passed_rubric(r: Any) -> bool:
+        if not isinstance(r, dict):
+            return False
+        exec_err = r.get("execution_error")
+        return bool(r.get("executed")) and (not r.get("timed_out")) and (not exec_err) and bool(r.get("rubric_passed")) and len(r.get("rubric_failures") or []) == 0
+
+    raw_base_fail = bool(b_imp) and all(_is_behavioral_failure(r) for r in b_imp)
+    raw_cand_succ = bool(c_imp) and all(_passed_rubric(r) for r in c_imp)
+    raw_cand_reg_pass = bool(c_reg) and all(_passed_rubric(r) for r in c_reg)
+    raw_rule_satisfied = raw_base_fail and raw_cand_succ and raw_cand_reg_pass
+
+    comp = report.get("comparison")
+    if not isinstance(comp, dict):
+        issues.append("report missing comparison dictionary")
+    else:
+        if comp.get("rule") != "baseline-failed-candidate-passed":
+            issues.append(f"unsupported comparison rule: {comp.get('rule')!r}")
+        if bool(comp.get("baseline_demonstrated_failure")) != raw_base_fail:
+            issues.append("comparison baseline_demonstrated_failure inconsistent with recorded outcomes")
+        if bool(comp.get("candidate_demonstrated_success")) != raw_cand_succ:
+            issues.append("comparison candidate_demonstrated_success inconsistent with recorded outcomes")
+        if bool(comp.get("candidate_regressions_passed")) != raw_cand_reg_pass:
+            issues.append("comparison candidate_regressions_passed inconsistent with recorded outcomes")
+        if bool(comp.get("rule_satisfied")) != raw_rule_satisfied:
+            issues.append("comparison rule_satisfied inconsistent with recorded outcomes")
+
+    if eligibility == "improvement-eligible":
+        if not raw_rule_satisfied:
+            issues.append("eligible report contradicts recorded outcomes (rule not satisfied)")
+        if isinstance(comp, dict):
+            if not comp.get("rule_satisfied") or not comp.get("baseline_demonstrated_failure") or not comp.get("candidate_demonstrated_success") or not comp.get("candidate_regressions_passed"):
+                issues.append("eligible report has unsatisfied comparison summary conditions")
+        if report.get("eligibility_reasons"):
+            issues.append("eligible report has non-empty eligibility_reasons")
+    elif eligibility == "ineligible":
+        if raw_rule_satisfied:
+            issues.append("ineligible report contradicts recorded outcomes (rule was satisfied)")
+        reasons = report.get("eligibility_reasons")
+        if not isinstance(reasons, list) or not reasons:
+            issues.append("ineligible report requires non-empty eligibility_reasons")
+
     return issues
 
 

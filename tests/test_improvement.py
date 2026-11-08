@@ -478,6 +478,114 @@ class ImprovementWorkflowTest(unittest.TestCase):
                     self.assertEqual(res.returncode, 1)
                     self.assertFalse(out_p.exists())
 
+    def test_group3_report_validation_acceptance_and_mutations(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            obs, cand, imp, reg = _sample_fixtures(root)
+            prop = create_proposal(
+                proposal_id="prop-g3", failure_description="f", failure_artifacts=[{"path": str(obs)}],
+                kind="check", target_path="target.py", content_path=cand, baseline_identity="b1",
+                candidate_identity="c1", expected_improvement_description="exp",
+                improvement_cases=[imp], regression_cases=[reg],
+            )
+            report = evaluate_proposal(prop, root / "ev_g3")
+
+            # 1. Genuine eligible report accepted
+            self.assertEqual(validate_report_for_review(report), [])
+            prop_str = json.dumps(prop, indent=2, sort_keys=True) + "\n"
+            self.assertEqual(validate_report_for_review(report, proposal_json=prop_str), [])
+
+            # 2. Retained-report validation passes without external files
+            obs.unlink()
+            cand.unlink()
+            self.assertFalse(obs.exists())
+            self.assertFalse(cand.exists())
+            self.assertEqual(validate_report_for_review(report), [])
+
+            # 3. Genuine ineligible record accepted as valid record
+            cand_inel = _write_file(root / "cand_inel.py", "def check(): return 'improved'\n")
+            obs_inel = _write_file(root / "obs_inel.txt", "err\n")
+            failing_reg = {
+                "case_id": "REG-FAIL", "description": "Fails", "command": "python3 -c \"import sys; sys.exit(1)\"",
+                "rubric": {"rubric_id": "R-FAIL", "expected_exit_code": 0, "required_output_tokens": [], "forbidden_output_tokens": []},
+            }
+            prop_inel = create_proposal(
+                proposal_id="prop-inel", failure_description="f", failure_artifacts=[{"path": str(obs_inel)}],
+                kind="check", target_path="target.py", content_path=cand_inel, baseline_identity="b1",
+                candidate_identity="c1", expected_improvement_description="exp",
+                improvement_cases=[imp], regression_cases=[failing_reg],
+            )
+            rep_inel = evaluate_proposal(prop_inel, root / "ev_inel")
+            self.assertEqual(rep_inel["eligibility"], "ineligible")
+            self.assertEqual(validate_report_for_review(rep_inel), [])
+
+            # 4. Table-driven mutations rejected
+            def mut_cand_digest(r: dict) -> tuple[dict, str | None]:
+                r["candidate_content_digest"] = "bad" * 8
+                return r, None
+
+            def mut_embedded_prop(r: dict) -> tuple[dict, str | None]:
+                r["proposal"]["proposal_id"] = "tampered"
+                return r, None
+
+            def mut_ext_binding(r: dict) -> tuple[dict, str | None]:
+                return r, json.dumps({"schema_version": 1, "proposal_id": "different"}, indent=2) + "\n"
+
+            def mut_unknown_eligibility(r: dict) -> tuple[dict, str | None]:
+                r["eligibility"] = "approved"
+                return r, None
+
+            def mut_empty_regressions(r: dict) -> tuple[dict, str | None]:
+                r["candidate_results"]["regression_cases"] = []
+                return r, None
+
+            def mut_mismatched_case_id(r: dict) -> tuple[dict, str | None]:
+                r["candidate_results"]["improvement_cases"][0]["case_id"] = "OTHER-01"
+                return r, None
+
+            def mut_mismatched_rubric(r: dict) -> tuple[dict, str | None]:
+                r["candidate_results"]["improvement_cases"][0]["rubric"]["expected_exit_code"] = 99
+                return r, None
+
+            def mut_contradicting_outcomes(r: dict) -> tuple[dict, str | None]:
+                r["candidate_results"]["improvement_cases"][0]["rubric_passed"] = False
+                r["candidate_results"]["improvement_cases"][0]["rubric_failures"] = ["failed"]
+                return r, None
+
+            def mut_malformed_comp(r: dict) -> tuple[dict, str | None]:
+                r["comparison"] = "not_a_dict"
+                return r, None
+
+            def mut_malformed_results(r: dict) -> tuple[dict, str | None]:
+                r["baseline_results"] = None
+                return r, None
+
+            def mut_malformed_prop(r: dict) -> tuple[dict, str | None]:
+                r["proposal"] = 123
+                return r, None
+
+            mutations = [
+                ("candidate_digest", mut_cand_digest),
+                ("embedded_prop_without_digest", mut_embedded_prop),
+                ("ext_proposal_binding", mut_ext_binding),
+                ("unknown_eligibility", mut_unknown_eligibility),
+                ("empty_regressions", mut_empty_regressions),
+                ("mismatched_case_id", mut_mismatched_case_id),
+                ("mismatched_rubric", mut_mismatched_rubric),
+                ("contradicting_raw_outcomes", mut_contradicting_outcomes),
+                ("malformed_comparison", mut_malformed_comp),
+                ("malformed_results", mut_malformed_results),
+                ("malformed_proposal", mut_malformed_prop),
+            ]
+
+            for label, mutator in mutations:
+                with self.subTest(mutation=label):
+                    clone = json.loads(json.dumps(report))
+                    mutated, ext_json = mutator(clone)
+                    issues = validate_report_for_review(mutated, proposal_json=ext_json)
+                    self.assertIsInstance(issues, list)
+                    self.assertGreater(len(issues), 0, f"Mutation {label!r} was unexpectedly accepted")
+
 
 
 
