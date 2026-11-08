@@ -308,11 +308,16 @@ def deliver_with_security_review(paths: RuntimePaths, spec: DeliverSecuritySpec)
     approval_rec: dict[str, Any] | None = None
     is_verified = False
     if sec_verified and ci_ok:
-        approval_rec = deliver_module.enforce_delivery_approval(
-            candidate_sha=candidate_sha, base_sha=base_sha, repo=paths.repo, home=paths.home,
-            child_dir=child_dir, child=child_spec, conf=conf, security_record=sec_rev,
-            builder_session_id=builder_session_id, deadline=deadline, limit_s=limit_s,
-        )
+        try:
+            approval_rec = deliver_module.enforce_delivery_approval(
+                candidate_sha=candidate_sha, base_sha=base_sha, repo=paths.repo, home=paths.home,
+                child_dir=child_dir, child=child_spec, conf=conf, security_record=sec_rev,
+                builder_session_id=builder_session_id, deadline=deadline, limit_s=limit_s,
+            )
+        except (AttemptTimeoutError, TimeoutError) as exc:
+            t_msg = f"delivery approval timed out: {exc}"
+            approval_rec = {"schema": 1, "role": "delivery-approval-gate", "status": "timed-out", "outcome": "rejected", "delivery_approved": False, "approved_revision": None, "candidate_sha": candidate_sha, "base_sha": base_sha, "blockers": [t_msg]}
+            if child_dir.exists(): atomic_json(child_dir / "approval-gate.json", approval_rec, paths.home)
         is_verified = bool(
             approval_rec.get("delivery_approved") is True
             and approval_rec.get("status") == "approved"
@@ -324,7 +329,7 @@ def deliver_with_security_review(paths: RuntimePaths, spec: DeliverSecuritySpec)
         else:
             final_status = (
                 str(approval_rec["status"])
-                if (approval_rec.get("status") in ("stale-candidate-revision", "authority-violation", "prerequisite-unverified", "approval-missing", "invalid-candidate-revision") or approval_rec.get("prior_approval_rejected"))
+                if (approval_rec.get("status") in ("timed-out", "stale-candidate-revision", "authority-violation", "prerequisite-unverified", "approval-missing", "invalid-candidate-revision") or approval_rec.get("prior_approval_rejected"))
                 else "security-verified"
             )
             final_blockers = list(dict.fromkeys([*final_blockers, *(approval_rec.get("blockers") or [])]))

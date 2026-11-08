@@ -499,15 +499,20 @@ def run_automated_qa_delivery(paths: RuntimePaths, spec: QADeliverySpec) -> QADe
     delivery_approved = False
     top_level_status = final_status
     if ci_verified and qa_verified:
-        approval_rec = deliver.enforce_delivery_approval(
-            candidate_sha=cand_sha, base_sha=base_sha, repo=paths.repo, home=paths.home, child_dir=child_dir,
-            child=child_contract, conf=conf, ci_record=child_rec.get("ci_verification"), qa_record=current_qa,
-            deadline=deadline, limit_s=limit_s,
-        )
+        try:
+            approval_rec = deliver.enforce_delivery_approval(
+                candidate_sha=cand_sha, base_sha=base_sha, repo=paths.repo, home=paths.home, child_dir=child_dir,
+                child=child_contract, conf=conf, ci_record=child_rec.get("ci_verification"), qa_record=current_qa,
+                deadline=deadline, limit_s=limit_s,
+            )
+        except (deliver_checks.AttemptTimeoutError, TimeoutError) as exc:
+            t_msg = f"delivery approval timed out: {exc}"
+            approval_rec = {"schema": 1, "role": "delivery-approval-gate", "status": "timed-out", "outcome": "rejected", "delivery_approved": False, "approved_revision": None, "candidate_sha": cand_sha, "base_sha": base_sha, "blockers": [t_msg]}
+            if child_dir.exists(): atomic_json(child_dir / "approval-gate.json", approval_rec, paths.home)
         delivery_approved = bool(approval_rec.get("delivery_approved") is True and approval_rec.get("status") == "approved" and approval_rec.get("outcome") == "approved" and approval_rec.get("approved_revision") == cand_sha)
         if delivery_approved:
             top_level_status = "verified"
-        elif approval_rec.get("status") in ("stale-candidate-revision", "authority-violation", "prerequisite-unverified", "approval-missing", "invalid-candidate-revision") or approval_rec.get("prior_approval_rejected"):
+        elif approval_rec.get("status") in ("timed-out", "stale-candidate-revision", "authority-violation", "prerequisite-unverified", "approval-missing", "invalid-candidate-revision") or approval_rec.get("prior_approval_rejected"):
             top_level_status = str(approval_rec["status"])
         final_blockers = list(dict.fromkeys([*final_blockers, *(approval_rec.get("blockers") or [])]))
     app_out, app_rev = ("approved" if delivery_approved else "rejected"), (cand_sha if delivery_approved else None)

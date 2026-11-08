@@ -345,16 +345,21 @@ def _execute_delivery(paths: RuntimePaths, spec: DeliverSpec, *, require_final_a
                     rem_cand = gitio.remote_ref(paths.repo, head_branch) if head_branch else None
                     loc_cand = gitio.commit_sha(paths.repo, f"refs/heads/{head_branch}") if (head_branch and gitio.branch_exists(paths.repo, head_branch)) else None
                     cand_sha = rem_cand or loc_cand or prev_cand
-                    app_rec = enforce_delivery_approval(
-                        candidate_sha=cand_sha, base_sha=base_sha, repo=paths.repo, home=paths.home,
-                        child_dir=prev_cdir, child=child0, conf=conf, deadline=deadline, limit_s=limit_s,
-                    )
+                    try:
+                        app_rec = enforce_delivery_approval(
+                            candidate_sha=cand_sha, base_sha=base_sha, repo=paths.repo, home=paths.home,
+                            child_dir=prev_cdir, child=child0, conf=conf, deadline=deadline, limit_s=limit_s,
+                        )
+                    except (AttemptTimeoutError, TimeoutError) as exc:
+                        t_msg = f"delivery approval timed out: {exc}"
+                        app_rec = {"schema": 1, "role": "delivery-approval-gate", "status": "timed-out", "outcome": "rejected", "delivery_approved": False, "approved_revision": None, "candidate_sha": cand_sha, "base_sha": base_sha, "blockers": [t_msg]}
+                        if prev_cdir.exists(): atomic_json(gate_p, app_rec, paths.home)
                     approved = bool(app_rec.get("delivery_approved") is True and app_rec.get("status") == "approved" and app_rec.get("outcome") == "approved" and app_rec.get("approved_revision") == cand_sha)
                     st = "verified" if approved else str(app_rec.get("status") or "approval-rejected")
                     v_scope = approval_mod.APPROVAL_GATE_SCOPE_NOTE if approved else ci_gate.VERIFICATION_SCOPE_NOTE
                     blks = [] if approved else list(dict.fromkeys(app_rec.get("blockers") or []))
                     ci_eval = (app_rec.get("prerequisites") or {}).get("ci") or {}
-                    ci_ok = bool(ci_eval.get("verified") is True)
+                    ci_ok = bool(ci_eval.get("verified") is True) if ci_eval else bool(prev_child.get("ci_verified"))
                     t_sha = app_rec.get("tested_sha") or (ci_eval.get("tested_sha") if ci_ok else None)
                     r_kind = app_rec.get("revision_kind") or (ci_eval.get("revision_kind") if ci_ok else None)
                     app_rev, app_out = (app_rec.get("approved_revision") if approved else None), ("approved" if approved else "rejected")
@@ -611,20 +616,27 @@ def _execute_delivery(paths: RuntimePaths, spec: DeliverSpec, *, require_final_a
                 pr_info = dict(ci_verification.get("pr") or pr_info or {})
                 blockers.extend(ci_verification.get("blockers") or [])
                 if ci_ok and require_final_approval:
-                    approval_rec = enforce_delivery_approval(
-                        candidate_sha=candidate_sha, base_sha=base_sha, repo=paths.repo, home=paths.home,
-                        child_dir=child_dir, child=child, conf=conf, ci_record=ci_verification,
-                        deadline=deadline, limit_s=limit_s,
-                    )
-                    delivery_approved = bool(
-                        approval_rec.get("delivery_approved") is True
-                        and approval_rec.get("status") == "approved"
-                        and approval_rec.get("outcome") == "approved"
-                        and approval_rec.get("approved_revision") == candidate_sha
-                    )
-                    final_status = "verified" if delivery_approved else str(approval_rec.get("status") or "approval-rejected")
-                    if not delivery_approved:
-                        blockers.extend(b for b in (approval_rec.get("blockers") or []) if b not in blockers)
+                    try:
+                        approval_rec = enforce_delivery_approval(
+                            candidate_sha=candidate_sha, base_sha=base_sha, repo=paths.repo, home=paths.home,
+                            child_dir=child_dir, child=child, conf=conf, ci_record=ci_verification,
+                            deadline=deadline, limit_s=limit_s,
+                        )
+                        delivery_approved = bool(
+                            approval_rec.get("delivery_approved") is True
+                            and approval_rec.get("status") == "approved"
+                            and approval_rec.get("outcome") == "approved"
+                            and approval_rec.get("approved_revision") == candidate_sha
+                        )
+                        final_status = "verified" if delivery_approved else str(approval_rec.get("status") or "approval-rejected")
+                        if not delivery_approved:
+                            blockers.extend(b for b in (approval_rec.get("blockers") or []) if b not in blockers)
+                    except (AttemptTimeoutError, TimeoutError) as exc:
+                        delivery_approved, final_status = False, "timed-out"
+                        t_msg = f"delivery approval timed out: {exc}"
+                        blockers.append(t_msg)
+                        approval_rec = {"schema": 1, "role": "delivery-approval-gate", "status": "timed-out", "outcome": "rejected", "delivery_approved": False, "approved_revision": None, "candidate_sha": candidate_sha, "base_sha": base_sha, "blockers": [t_msg]}
+                        if child_dir.exists(): atomic_json(child_dir / "approval-gate.json", approval_rec, paths.home)
                 elif ci_ok:
                     final_status = pending_status
                 else:
