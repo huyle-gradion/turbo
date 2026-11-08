@@ -58,6 +58,21 @@ The script demonstrates, in order:
 4. **Unsupported protection**: Feature branch lacking strict status checks or admin enforcement fails closed (`unsupported-protection`).
 5. **Uncertain outcome**: Provider server error or timeout during merge is classified as `uncertain` without blind retries.
 
+## Four-Stage Final Delivery Integration and Completion Demonstration (`#78`)
+
+Final delivery wires exact-candidate approval to confirmed child integration and authoritative completion evidence:
+
+```sh
+DEMO_KEEP_EVIDENCE_DIR="$(mktemp -d /tmp/turbo-issue-78.XXXXXX)" \
+  bash scripts/demo-delivery-integration.sh
+```
+
+The script demonstrates, in order:
+1. **Confirmed success**: Final delivery invokes protected integration and records completion once approved, landing the change onto the target feature branch without touching main.
+2. **Stale-base rejection**: Advancing the remote target feature branch invalidates authorization and prevents new merge mutation.
+3. **Permission denial**: Merge mutation rejected by provider with HTTP 403 preserves approval status while rejecting completion (`denied-permissions`).
+4. **Uncertain outcome**: Merge mutation transport error yields `uncertain` status without issuing duplicate mutation, preserving evidence for recovery.
+
 ## Truth Boundaries and Provenance
 
 Fixture-based success in disposable demonstration environments establishes helper contract compliance, but **does not establish live Antigravity or hosted-provider support, merge approval (#24), or parent acceptance**.

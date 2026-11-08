@@ -40,9 +40,10 @@ class DeliveryApprovalLifecycleTest(unittest.TestCase):
             s2_deliv = json.loads((evidence_dir / "stages" / "stage-2-ineffective" / "delivery-result.json").read_text(encoding="utf-8"))
             self.assertTrue(s2_deliv.get("ci_verified"))
 
-            # 3. Verified correction: actual correction passes reproducer and checks; delivery APPROVES
+            # 3. Verified correction: actual correction passes reproducer and checks; delivery APPROVES and COMPLETES
             self.assertTrue(s3.get("delivery_approved"))
-            self.assertEqual(s3.get("status"), "verified")
+            self.assertEqual(s3.get("status"), "completed")
+            self.assertTrue(s3.get("merged"))
             self.assertEqual(s3.get("approved_revision"), s3.get("candidate_sha"))
             self.assertTrue(s3.get("reproducer_ok"))
             self.assertEqual(s3.get("finding_status"), "resolved")

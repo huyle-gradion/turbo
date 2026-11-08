@@ -250,6 +250,14 @@ def integrate_approved_child(
         try: prior_rec = read_json(rec_file, home)
         except Exception: prior_rec = {}
         if isinstance(prior_rec, dict) and prior_rec.get("status") == "confirmed" and prior_rec.get("outcome") == "confirmed":
+            if repo_slug and str(prior_rec.get("repo_slug") or "").lower() != repo_slug.lower():
+                return _fail("repo-slug-mismatch", f"repo_slug {repo_slug!r} does not match confirmed landing repo {prior_rec.get('repo_slug')!r}", persist_result=False)
+            if prior_rec.get("pr_number") is not None and prior_rec.get("pr_number") != pr_number:
+                return _fail("branch-ref-mismatch", f"PR #{pr_number} does not match confirmed landing PR #{prior_rec.get('pr_number')}", persist_result=False)
+            if prior_rec.get("base_branch") and prior_rec.get("base_branch") != base_branch:
+                return _fail("branch-ref-mismatch", f"target branch {base_branch!r} does not match confirmed landing target branch {prior_rec.get('base_branch')!r}", persist_result=False)
+            if prior_rec.get("head_branch") and prior_rec.get("head_branch") != head_branch:
+                return _fail("branch-ref-mismatch", f"head branch {head_branch!r} does not match confirmed landing head branch {prior_rec.get('head_branch')!r}", persist_result=False)
             if prior_rec.get("candidate_sha") != candidate_sha:
                 return _fail("stale-candidate-revision", f"candidate {candidate_sha} does not match confirmed landing candidate {prior_rec.get('candidate_sha')}", persist_result=False)
             if prior_rec.get("base_sha") != base_sha:
@@ -271,6 +279,14 @@ def integrate_approved_child(
         try: prior_req = read_json(req_file, home)
         except Exception: prior_req = {}
         if isinstance(prior_req, dict) and prior_req.get("role") == "child-integration-request":
+            if repo_slug and str(prior_req.get("repo_slug") or "").lower() != repo_slug.lower():
+                return _fail("repo-slug-mismatch", f"repo_slug {repo_slug!r} does not match initiated integration request repo {prior_req.get('repo_slug')!r}", req_p=str(req_file))
+            if prior_req.get("pr_number") is not None and prior_req.get("pr_number") != pr_number:
+                return _fail("branch-ref-mismatch", f"PR #{pr_number} does not match initiated integration request PR #{prior_req.get('pr_number')}", req_p=str(req_file))
+            if prior_req.get("base_branch") and prior_req.get("base_branch") != base_branch:
+                return _fail("branch-ref-mismatch", f"target branch {base_branch!r} does not match initiated integration request target branch {prior_req.get('base_branch')!r}", req_p=str(req_file))
+            if prior_req.get("head_branch") and prior_req.get("head_branch") != head_branch:
+                return _fail("branch-ref-mismatch", f"head branch {head_branch!r} does not match initiated integration request head branch {prior_req.get('head_branch')!r}", req_p=str(req_file))
             if prior_req.get("candidate_sha") != candidate_sha:
                 return _fail("stale-candidate-revision", f"candidate {candidate_sha} does not match initiated integration request candidate {prior_req.get('candidate_sha')}", req_p=str(req_file))
             if prior_req.get("base_sha") != base_sha:

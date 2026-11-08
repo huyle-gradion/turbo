@@ -21,12 +21,16 @@ class DeliveryRejectionMatrixTest(unittest.TestCase):
                 r_ok = deliver_module.deliver_feature(ctx.paths, ctx.spec)
                 self.assertEqual(
                     (r_ok.status, r_ok.verified, r_ok.delivery_approved, r_ok.approval_outcome, r_ok.approved_revision, r_ok.candidate_sha, r_ok.base_sha, r_ok.blockers),
-                    ("verified", True, True, "approved", ctx.cand_sha, ctx.cand_sha, ctx.base_sha, []),
+                    ("completed", True, True, "approved", ctx.cand_sha, ctx.cand_sha, ctx.base_sha, []),
                 )
+                self.assertTrue(r_ok.merged)
+                self.assertIsNotNone(r_ok.landed_sha)
                 self.assertEqual(
                     (r_ok.child["verified"], r_ok.child["delivery_approved"], r_ok.child["approval_outcome"], r_ok.child["approved_revision"], r_ok.child["candidate_sha"], r_ok.child["base_sha"]),
                     (True, True, "approved", ctx.cand_sha, ctx.cand_sha, ctx.base_sha),
                 )
+                self.assertTrue(r_ok.child.get("merged"))
+                self.assertEqual(r_ok.child.get("status"), "completed")
                 self.assertEqual(
                     (r_ok.child["pr"]["verified"], r_ok.child["pr"]["delivery_approved"], r_ok.child["pr"]["approved_revision"], r_ok.child["pr"]["head_sha"], r_ok.child["pr"]["base_sha"]),
                     (True, True, ctx.cand_sha, ctx.cand_sha, ctx.base_sha),
@@ -37,8 +41,9 @@ class DeliveryRejectionMatrixTest(unittest.TestCase):
                 self.assertEqual(cli_res.returncode, 0, cli_res.stdout + cli_res.stderr)
                 self.assertEqual(
                     (cli_payload["status"], cli_payload["verified"], cli_payload["delivery_approved"], cli_payload["approved_revision"]),
-                    ("verified", True, True, ctx.cand_sha),
+                    ("completed", True, True, ctx.cand_sha),
                 )
+                self.assertTrue(cli_payload.get("merged"))
 
                 # 2. 12 combinations: 4 prerequisites x 3 rejection modes (missing, failing, stale)
                 stale_sha = "0" * 40
@@ -124,6 +129,11 @@ class DeliveryRejectionMatrixTest(unittest.TestCase):
                         self.assertFalse(res.delivery_approved, f"delivery_approved should be False for {label}")
                         self.assertIsNone(res.approved_revision, f"approved_revision should be None for {label}")
                         self.assertFalse(res.verified, f"verified should be False for {label}")
+                        self.assertFalse(res.merged, f"merged should be False for {label}")
+                        self.assertIsNone(getattr(res, "landed_sha", None), f"landed_sha should be None for {label}")
+                        self.assertFalse(ctx.gh.pulls[1]["merged"], f"PR should not be merged for {label}")
+                        self.assertFalse((ctx.child_dir / "integration-record.json").exists(), f"integration-record.json must not exist for {label}")
+                        self.assertFalse((ctx.child_dir / "integration-request.json").exists(), f"integration-request.json must not exist for {label}")
                         self.assertEqual(res.approval_outcome, "rejected", f"approval_outcome mismatch for {label}")
                         self.assertTrue(len(res.blockers) > 0, f"expected blockers for {label}")
                         self.assertTrue(
@@ -156,6 +166,9 @@ class DeliveryRejectionMatrixTest(unittest.TestCase):
                             r_recheck = deliver_module.deliver_feature(ctx.paths, ctx.spec)
                             self.assertTrue(r_recheck.delivery_approved)
                             self.assertEqual(r_recheck.approved_revision, ctx.cand_sha)
+                            self.assertEqual(r_recheck.status, "completed")
+                            self.assertTrue(r_recheck.merged)
+                            self.assertIsNotNone(r_recheck.landed_sha)
 
 
 
