@@ -769,7 +769,7 @@ class DeliverChildTest(unittest.TestCase):
     def test_delivery_enforcement_requires_exact_candidate_approval_and_rejects_missing_forged_or_stale(self) -> None:
         import time
         from automated_qa.test_automated_qa_eval import _case
-        from factory import automated_qa, config as config_module, deliver as deliver_module, independent_review, security_review
+        from factory import automated_qa, config as config_module, deliver as deliver_module, independent_review, runner, security_review
         from factory.paths import RuntimePaths, atomic_json
         from tests.independent_review.test_independent_review import _make_staged_reviewer_script
         from tests.security_review.test_reviewer import REVIEWER_SCRIPT as SEC_REVIEWER_SCRIPT
@@ -850,6 +850,48 @@ class DeliverChildTest(unittest.TestCase):
                 r_stale_cand = deliver_module.deliver_feature(paths, spec)
                 self.assertEqual((r_stale_cand.status, r_stale_cand.verified, r_stale_cand.delivery_approved, r_stale_cand.approved_revision), ("stale-candidate-revision", False, False, None))
                 self.assertTrue(any(cand_a in b and cand_b in b for b in r_stale_cand.blockers), r_stale_cand.blockers)
+                gate_stale = json.loads((child_dir / "approval-gate.json").read_text(encoding="utf-8"))
+                for rec_map in (json.loads((att_dir / "record.json").read_text(encoding="utf-8")), json.loads((home / "deliveries" / "900" / "record.json").read_text(encoding="utf-8"))):
+                    self.assertEqual((rec_map["status"], rec_map["verified"], rec_map["delivery_approved"], rec_map["approved_revision"]), ("stale-candidate-revision", False, False, None))
+                self.assertEqual((gate_stale["status"], gate_stale["delivery_approved"], gate_stale["approved_revision"], gate_stale.get("superseded_approved_revision")), ("stale-candidate-revision", False, None, cand_a))
+
+                b_child_contract = {**child_contract, "candidate_sha": cand_b}
+                gh.pulls[1]["head"]["sha"] = cand_b
+                ci_b = json.loads((child_dir / "ci-verification.json").read_text(encoding="utf-8"))
+                b_checks = []
+                for idx, c in enumerate(ci_b.get("checks", [])):
+                    txt = f"candidate_sha={cand_b}\nbase_sha={base_1}\ntested_sha={cand_b}\nrevision_kind=fast-forward-head\ncheck ok\n"
+                    lp = child_dir / f"ci-b-{idx}.log"
+                    lp.write_text(txt, encoding="utf-8")
+                    b_checks.append({**c, "candidate_sha": cand_b, "tested_sha": cand_b, "revision_kind": "fast-forward-head", "output_path": str(lp), "output_sha256": runner.digest_text(txt)})
+                ci_b_upd = {**ci_b, "candidate_sha": cand_b, "tested_sha": cand_b, "revision_kind": "fast-forward-head", "checks": b_checks, "pr": {**ci_b["pr"], "head_sha": cand_b}}
+                atomic_json(child_dir / "ci-verification.json", ci_b_upd, home)
+
+                child_rec_b = {**r_ci.child, "status": "verified", "verified": True, "candidate_sha": cand_b, "tested_sha": cand_b, "revision_kind": "fast-forward-head", "ci_verification": ci_b_upd, "pr": {**r_ci.child["pr"], "head_sha": cand_b}}
+                qa_rec_b = automated_qa.evaluate_child_qa(
+                    repo=repo, home=home, child_dir=child_dir, base_url=gh.base_url, token="disposable-gh-token",
+                    repo_slug="example/chat-bridge", parent=intake_rec["parent"], child=b_child_contract,
+                    child_record=child_rec_b, conf=conf,
+                    qa_cases=(_case("QA-AC-1"),), round_number=2, deadline=time.monotonic() + 30.0, limit_s=30,
+                )
+                atomic_json(child_dir / "automated-qa" / "record.json", {"status": "qa-verified", "qa_verified": True, "rounds": 2, "open_finding_ids": [], "findings": []}, home)
+                sec_rec_b = security_review.review_candidate_security(
+                    repo=repo, home=home, child_dir=child_dir, child=b_child_contract, conf=conf,
+                    base_sha=base_1, candidate_sha=cand_b, round_num=2, agy_bin=str(sec_agy),
+                    builder_session_id="c-101", deadline=time.monotonic() + 30.0, limit_s=30,
+                )
+                independent_review.review_candidate_independently(
+                    repo=repo, home=home, child_dir=child_dir, child=b_child_contract,
+                    conf=conf, base_sha=base_1, candidate_sha=cand_b, round_num=2, agy_bin=str(ir_agy),
+                    builder_session_id="c-101", builder_summary="Implemented expired token check and test on candidate B.",
+                    qa_record=qa_rec_b, security_record=sec_rec_b, deadline=time.monotonic() + 30.0, limit_s=30,
+                )
+                r_b = deliver_module.deliver_feature(paths, spec)
+                self.assertEqual((r_b.status, r_b.verified, r_b.delivery_approved, r_b.approved_revision), ("verified", True, True, cand_b))
+                gate_b = json.loads((child_dir / "approval-gate.json").read_text(encoding="utf-8"))
+                for rec_map in (json.loads((att_dir / "record.json").read_text(encoding="utf-8")), json.loads((home / "deliveries" / "900" / "record.json").read_text(encoding="utf-8"))):
+                    self.assertEqual((rec_map["status"], rec_map["verified"], rec_map["delivery_approved"], rec_map["approved_revision"]), ("verified", True, True, cand_b))
+                self.assertEqual((gate_b["status"], gate_b["delivery_approved"], gate_b["approved_revision"], gate_b.get("superseded_approved_revision")), ("approved", True, cand_b, None))
 
                 git(repo, "branch", "-f", head_branch, cand_a)
                 git(repo, "push", "-q", "-f", "origin", f"{cand_a}:refs/heads/{head_branch}")
@@ -868,7 +910,7 @@ class DeliverChildTest(unittest.TestCase):
     def test_qa_and_security_callers_execute_prerequisites_without_bypass_and_invalidate_on_repair(self) -> None:
         import time
         from automated_qa.test_automated_qa_eval import WHITESPACE_QA_CASE, _case
-        from factory import automated_qa, config as config_module, deliver as deliver_module, independent_review, security_review
+        from factory import automated_qa, config as config_module, deliver as deliver_module, independent_review, runner, security_review
         from factory.automated_qa.delivery import QADeliverySpec, run_automated_qa_delivery
         from factory.paths import RuntimePaths, atomic_json
         from tests.automated_qa.test_automated_qa import DEMO_REPAIR_BUILDER_SCRIPT

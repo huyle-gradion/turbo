@@ -177,36 +177,35 @@ def enforce_delivery_approval(
             disk_gate = approval_mod.read_json(gate_p, home)
         except Exception:
             disk_gate, corrupt_gate = {}, True
-    must_consume = (
-        corrupt_gate or (disk_gate is not None and not isinstance(disk_gate, dict))
-        or (isinstance(disk_gate, dict) and (
-            approval_record is not None or disk_gate.get("delivery_approved") is True
-            or disk_gate.get("outcome") == "approved" or disk_gate.get("status") == "approved"
-            or disk_gate.get("approved_revision") is not None or disk_gate.get("role") != "delivery-approval-gate"
-            or disk_gate.get("verification_scope") != approval_mod.APPROVAL_GATE_SCOPE_NOTE
-        ))
+    if approval_record is not None or corrupt_gate or (disk_gate is not None and not isinstance(disk_gate, dict)):
+        ver_res = approval_mod.verify_candidate_approval(
+            candidate_sha, base_sha, disk_gate if disk_gate is not None else approval_record,
+            repo=repo, home=home, child_dir=child_dir, child=child, conf=conf,
+            ci_record=eff_ci or {}, qa_record=eff_qa or {}, security_record=eff_sec or {}, review_record=eff_rev or {},
+            deadline=deadline, limit_s=limit_s,
+        )
+        if gate_p.parent.exists():
+            atomic_json(gate_p, ver_res, home)
+        return ver_res
+
+    is_same_cand_approval = (
+        isinstance(disk_gate, dict)
+        and disk_gate.get("delivery_approved") is True
+        and disk_gate.get("candidate_sha") == candidate_sha
+        and disk_gate.get("base_sha") == base_sha
     )
-    if must_consume:
+    if is_same_cand_approval:
         ver_res = approval_mod.verify_candidate_approval(
             candidate_sha, base_sha, disk_gate, repo=repo, home=home, child_dir=child_dir, child=child, conf=conf,
             ci_record=eff_ci or {}, qa_record=eff_qa or {}, security_record=eff_sec or {}, review_record=eff_rev or {},
             deadline=deadline, limit_s=limit_s,
         )
         if ver_res.get("delivery_approved") is True:
-            atomic_json(gate_p, ver_res, home)
             return ver_res
-        eval_res = approval_mod.evaluate_approval_gate(
-            candidate_sha=candidate_sha, base_sha=base_sha, repo=repo, home=home, child_dir=child_dir, child=child, conf=conf,
-            ci_record=eff_ci, qa_record=eff_qa, security_record=eff_sec, review_record=eff_rev,
-            prior_approval=disk_gate if isinstance(disk_gate, dict) else None, builder_session_id=b_sid,
-            builder_summary=builder_summary, deadline=deadline, limit_s=limit_s, load_from_child_dir=False, _persist=False,
-        )
-        merged_blk = list(dict.fromkeys([*(ver_res.get("blockers") or []), *(eval_res.get("blockers") or [])]))
-        return {
-            **eval_res, **ver_res, "status": ver_res["status"], "outcome": "rejected",
-            "delivery_approved": False, "approved_revision": None, "blockers": merged_blk,
-            "historical_blockers": eval_res.get("historical_blockers"), "prerequisites": eval_res.get("prerequisites") or {},
-        }
+        if gate_p.parent.exists():
+            atomic_json(gate_p, ver_res, home)
+        return ver_res
+
     eval_res = approval_mod.evaluate_approval_gate(
         candidate_sha=candidate_sha, base_sha=base_sha, repo=repo, home=home, child_dir=child_dir, child=child, conf=conf,
         ci_record=eff_ci, qa_record=eff_qa, security_record=eff_sec, review_record=eff_rev,
@@ -215,11 +214,14 @@ def enforce_delivery_approval(
     )
     if eval_res.get("delivery_approved") is not True:
         return eval_res
-    return approval_mod.verify_candidate_approval(
+    ver_res = approval_mod.verify_candidate_approval(
         candidate_sha, base_sha, eval_res, repo=repo, home=home, child_dir=child_dir, child=child, conf=conf,
         ci_record=eff_ci or {}, qa_record=eff_qa or {}, security_record=eff_sec or {}, review_record=eff_rev or {},
         deadline=deadline, limit_s=limit_s,
     )
+    if ver_res.get("delivery_approved") is not True and gate_p.parent.exists():
+        atomic_json(gate_p, ver_res, home)
+    return ver_res
 
 
 def deliver_ci_prerequisite(paths: RuntimePaths, spec: DeliverSpec, *, pending_status: str = "ci-verified") -> DeliverResult:

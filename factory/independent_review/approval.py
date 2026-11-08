@@ -353,7 +353,13 @@ def evaluate_approval_gate(*, candidate_sha: str, base_sha: str, ci_record: Any 
         rev_eval = _fail("invalid-review", f"invalid or mismatched round_num {round_num!r}", historical_blockers=[])
     else:
         rev_eval = evaluate_independent_review_prerequisite(candidate_sha, base_sha, review_record, child_dir=child_dir, home=home, repo=repo, child=child, conf=conf, builder_session_id=builder_session_id, prior_findings=prior_findings, qa_eval=qa_eval, sec_eval=sec_eval, deadline=deadline, limit_s=limit_s)
-    prior_ap_rev = str(prior_approval.get("approved_revision") or prior_approval.get("candidate_sha") or "").strip() if isinstance(prior_approval, dict) else ""
+    prior_is_approved = bool(
+        isinstance(prior_approval, dict)
+        and prior_approval.get("delivery_approved") is True
+        and prior_approval.get("status") == "approved"
+        and prior_approval.get("approved_revision")
+    )
+    prior_ap_rev = str(prior_approval["approved_revision"]).strip() if prior_is_approved else ""
     prior_ap_stale = bool(prior_ap_rev and prior_ap_rev != candidate_sha)
     all_verified = ci_eval["verified"] and qa_eval["verified"] and sec_eval["verified"] and rev_eval["verified"]
     blockers = ([f"previous approval for {prior_ap_rev} is rejected for subsequent candidate {candidate_sha}"] if (prior_ap_stale and not all_verified) else [])
@@ -362,7 +368,7 @@ def evaluate_approval_gate(*, candidate_sha: str, base_sha: str, ci_record: Any 
     if all_verified: gate_status = "approved"
     elif any(p["status"] == "authority-violation" for p in (ci_eval, qa_eval, sec_eval, rev_eval)): gate_status = "authority-violation"
     elif not rev_eval["verified"] and rev_eval["status"] in ("corrupt-prior-history", "reviewer-modified-worktree", "reused-builder-identity", "invalid-review-protocol", "unsupported-success-claim", "unresolved-historical-blockers"): gate_status = rev_eval["status"]
-    elif prior_ap_stale and (all(x is None for x in (ci_record, qa_record, security_record, review_record)) or all(not p["verified"] and "stale" in p["status"] for p in (ci_eval, qa_eval, sec_eval, rev_eval))): gate_status = "stale-candidate-revision"
+    elif prior_ap_stale: gate_status = "stale-candidate-revision"
     else: gate_status = next((p["status"] for p in (ci_eval, qa_eval, sec_eval, rev_eval) if not p["verified"]), "rejected")
     hist_list, res_list = rev_eval.get("historical_blockers") or [], rev_eval.get("resolutions") or []
     res_ids = [str(r.get("finding_id")) for r in res_list if isinstance(r, dict) and r.get("status") == "resolved"]
