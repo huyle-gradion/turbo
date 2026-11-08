@@ -87,7 +87,7 @@ def _write_confined_file(worktree: Path, rel_path: str, content: bytes) -> Path:
     return target
 
 
-def _validate_case(case: dict[str, Any], seen_ids: set[str], label: str) -> list[str]:
+def _validate_case(case: dict[str, Any], seen_ids: set[str], label: str, *, base_dir: Path | None = None) -> list[str]:
     if not isinstance(case, dict):
         return [f"{label} case must be a JSON object"]
     cid, issues = str(case.get("case_id") or "").strip(), []
@@ -111,9 +111,34 @@ def _validate_case(case: dict[str, Any], seen_ids: set[str], label: str) -> list
                 issues.append(f"case {cid!r} rubric {k} must be list of strings")
     for inp in case.get("inputs") or ():
         p = Path(str(inp.get("path") or "")) if isinstance(inp, dict) else Path()
+        if base_dir and not p.is_absolute(): p = base_dir / p
         if not p.is_file(): issues.append(f"case {cid!r} input not found: {p}")
         elif _sha256_file(p) != str(inp.get("sha256") or ""): issues.append(f"case {cid!r} input sha mismatch: {p}")
     return issues
+
+
+def canonicalize_draft_references(proposal: dict[str, Any], base_dir: Path) -> dict[str, Any]:
+    base = base_dir.resolve()
+    obs = proposal.get("observed_failure")
+    if isinstance(obs, dict) and isinstance(obs.get("artifacts"), list):
+        for art in obs["artifacts"]:
+            if isinstance(art, dict) and "path" in art and isinstance(art["path"], str):
+                p = Path(art["path"])
+                art["path"] = str((base / p).resolve() if not p.is_absolute() else p.resolve())
+    prop = proposal.get("proposed_change")
+    if isinstance(prop, dict) and "content_path" in prop and isinstance(prop["content_path"], str):
+        cp = Path(prop["content_path"])
+        prop["content_path"] = str((base / cp).resolve() if not cp.is_absolute() else cp.resolve())
+    for cases_key in ("improvement_cases", "regression_cases"):
+        cases = proposal.get(cases_key)
+        if isinstance(cases, list):
+            for case in cases:
+                if isinstance(case, dict) and isinstance(case.get("inputs"), (list, tuple)):
+                    for inp in case["inputs"]:
+                        if isinstance(inp, dict) and "path" in inp and isinstance(inp["path"], str):
+                            ip = Path(inp["path"])
+                            inp["path"] = str((base / ip).resolve() if not ip.is_absolute() else ip.resolve())
+    return proposal
 
 
 def validate_proposal(proposal: dict[str, Any], *, base_dir: Path | None = None) -> list[str]:
@@ -159,8 +184,8 @@ def validate_proposal(proposal: dict[str, Any], *, base_dir: Path | None = None)
     if not isinstance(imp_cases, list) or not imp_cases: issues.append("improvement_cases must be non-empty list")
     if not isinstance(reg_cases, list) or not reg_cases: issues.append("regression_cases must be non-empty list")
     seen_ids: set[str] = set()
-    for c in (imp_cases or ()): issues.extend(_validate_case(c, seen_ids, "improvement"))
-    for c in (reg_cases or ()): issues.extend(_validate_case(c, seen_ids, "regression"))
+    for c in (imp_cases or ()): issues.extend(_validate_case(c, seen_ids, "improvement", base_dir=base_dir))
+    for c in (reg_cases or ()): issues.extend(_validate_case(c, seen_ids, "regression", base_dir=base_dir))
     conds = proposal.get("execution_conditions")
     if not isinstance(conds, dict): issues.append("execution_conditions must be a JSON object")
     else:
@@ -186,13 +211,24 @@ def create_proposal(
     for art in failure_artifacts:
         ap = Path(art["path"]).resolve()
         arts.append({"path": str(ap), "sha256": art.get("sha256") or _sha256_file(ap)})
+    resolved_imp = json.loads(json.dumps(improvement_cases))
+    resolved_reg = json.loads(json.dumps(regression_cases))
+    canonicalize_draft_references({"improvement_cases": resolved_imp, "regression_cases": resolved_reg}, Path.cwd())
+    for cases in (resolved_imp, resolved_reg):
+        for case in cases:
+            if isinstance(case, dict) and isinstance(case.get("inputs"), (list, tuple)):
+                for inp in case["inputs"]:
+                    if isinstance(inp, dict) and "path" in inp:
+                        p = Path(inp["path"])
+                        if "sha256" not in inp and p.is_file():
+                            inp["sha256"] = _sha256_file(p)
     proposal = {
         "schema_version": PROPOSAL_SCHEMA_VERSION, "proposal_id": proposal_id,
         "observed_failure": {"description": failure_description, "artifacts": arts},
         "proposed_change": {"kind": kind, "target_path": target_path, "content_path": str(cp), "content_sha256": c_sha},
         "baseline": {"identity": baseline_identity}, "candidate": {"identity": candidate_identity, "content_sha256": c_sha},
         "expected_improvement": {"description": expected_improvement_description, "rule": rule},
-        "improvement_cases": improvement_cases, "regression_cases": regression_cases,
+        "improvement_cases": resolved_imp, "regression_cases": resolved_reg,
         "execution_conditions": {
             "time_limit_seconds": time_limit_seconds, "allow_network": False, "env_sanitized": True,
             "permitted_substitution": {"target_path": target_path, "content_sha256": c_sha},
@@ -369,8 +405,20 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.action in ("create-proposal", "propose"):
         if args.from_file:
-            proposal = json.loads(Path(args.from_file).read_text(encoding="utf-8"))
-            issues = validate_proposal(proposal, base_dir=Path(args.from_file).parent)
+            draft_path = Path(args.from_file).resolve()
+            if not draft_path.is_file():
+                sys.stderr.write(f"Error: draft file not found: {draft_path}\n")
+                return 1
+            try:
+                proposal = json.loads(draft_path.read_text(encoding="utf-8"))
+            except Exception as exc:
+                sys.stderr.write(f"Error: failed to parse draft JSON: {exc}\n")
+                return 1
+            if not isinstance(proposal, dict):
+                sys.stderr.write("Error: proposal draft must be a JSON object\n")
+                return 1
+            canonicalize_draft_references(proposal, draft_path.parent)
+            issues = validate_proposal(proposal)
             if issues: sys.stderr.write(f"Error: {'; '.join(issues)}\n"); return 1
         else:
             if not all([args.proposal_id, args.failure_desc, args.kind, args.target_path, args.content_file, args.baseline_identity, args.candidate_identity, args.expected_improvement, args.cases_file]):

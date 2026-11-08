@@ -11,8 +11,8 @@ import unittest
 
 from factory.errors import UsageError
 from factory.improvement import (
-    AUTHORITY_NOTE, create_proposal, evaluate_proposal, main as improvement_main,
-    proposal_digest, validate_proposal, validate_report_for_review,
+    AUTHORITY_NOTE, canonicalize_draft_references, create_proposal, evaluate_proposal,
+    main as improvement_main, proposal_digest, validate_proposal, validate_report_for_review,
 )
 from factory.worker import RateCard
 
@@ -364,6 +364,119 @@ class ImprovementWorkflowTest(unittest.TestCase):
             )
             report = evaluate_proposal(prop, root / "ev_nested")
             self.assertEqual(report["eligibility"], "improvement-eligible")
+
+    def test_group2_draft_references_canonicalized_before_persistence(self) -> None:
+        import subprocess, sys
+        from factory.improvement import FACTORY_ROOT
+        env = dict(os.environ)
+        env["PYTHONPATH"] = str(FACTORY_ROOT)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            draft_dir = root / "draft_dir"
+            draft_dir.mkdir()
+            obs = _write_file(draft_dir / "evidence" / "failure.txt", "failure\n")
+            cand = _write_file(draft_dir / "content" / "cand.py", "def check(): return 'improved'\n")
+            inp_file = _write_file(draft_dir / "inputs" / "data.txt", "payload\n")
+
+            f_sha = hashlib.sha256(obs.read_bytes()).hexdigest()
+            c_sha = hashlib.sha256(cand.read_bytes()).hexdigest()
+            i_sha = hashlib.sha256(inp_file.read_bytes()).hexdigest()
+
+            imp_case = {
+                "case_id": "IMP-01",
+                "command": "python3 -c \"import sys, pathlib; p = pathlib.Path('target.py'); sys.exit(0 if (p.exists() and 'improved' in p.read_text()) else 1)\"",
+                "rubric": {"rubric_id": "R1", "expected_exit_code": 0, "required_output_tokens": [], "forbidden_output_tokens": []},
+                "inputs": [{"path": "inputs/data.txt", "target_path": "staged/data.txt", "sha256": i_sha}],
+            }
+            reg_case = {
+                "case_id": "REG-01",
+                "command": "python3 -c \"import sys; sys.exit(0)\"",
+                "rubric": {"rubric_id": "R2", "expected_exit_code": 0, "required_output_tokens": [], "forbidden_output_tokens": []},
+            }
+            draft = {
+                "schema_version": 1, "proposal_id": "prop-group2",
+                "observed_failure": {"description": "f", "artifacts": [{"path": "evidence/failure.txt", "sha256": f_sha}]},
+                "proposed_change": {"kind": "check", "target_path": "target.py", "content_path": "content/cand.py", "content_sha256": c_sha},
+                "baseline": {"identity": "b1"}, "candidate": {"identity": "c1", "content_sha256": c_sha},
+                "expected_improvement": {"description": "exp", "rule": "baseline-failed-candidate-passed"},
+                "improvement_cases": [imp_case], "regression_cases": [reg_case],
+                "execution_conditions": {
+                    "time_limit_seconds": 30, "allow_network": False, "env_sanitized": True,
+                    "permitted_substitution": {"target_path": "target.py", "content_sha256": c_sha},
+                },
+            }
+            draft_p = _write_file(draft_dir / "draft.json", json.dumps(draft))
+
+            out_proposal = root / "elsewhere" / "proposal.json"
+            outside_dir = root / "outside"
+            outside_dir.mkdir()
+
+            res = subprocess.run(
+                [sys.executable, "-m", "factory.improvement", "create-proposal", "--out", str(out_proposal), "--from-file", str(draft_p)],
+                cwd=outside_dir, capture_output=True, text=True, env=env,
+            )
+            self.assertEqual(res.returncode, 0, res.stderr)
+            saved = json.loads(out_proposal.read_text(encoding="utf-8"))
+            self.assertEqual(saved["proposed_change"]["content_path"], str(cand.resolve()))
+            self.assertEqual(saved["observed_failure"]["artifacts"][0]["path"], str(obs.resolve()))
+            self.assertEqual(saved["improvement_cases"][0]["inputs"][0]["path"], str(inp_file.resolve()))
+            self.assertEqual(saved["improvement_cases"][0]["inputs"][0]["target_path"], "staged/data.txt")
+
+            third_dir = root / "third"
+            third_dir.mkdir()
+            eval_res = subprocess.run(
+                [sys.executable, "-m", "factory.improvement", "evaluate", "--proposal", str(out_proposal), "--evidence-dir", str(root / "ev")],
+                cwd=third_dir, capture_output=True, text=True, env=env,
+            )
+            self.assertEqual(eval_res.returncode, 0, eval_res.stderr)
+
+    def test_group2_rejects_wrong_hashes_without_recomputing(self) -> None:
+        import subprocess, sys
+        from factory.improvement import FACTORY_ROOT
+        env = dict(os.environ)
+        env["PYTHONPATH"] = str(FACTORY_ROOT)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            draft_dir = root / "draft_dir"
+            draft_dir.mkdir()
+            obs = _write_file(draft_dir / "evidence" / "failure.txt", "failure\n")
+            cand = _write_file(draft_dir / "content" / "cand.py", "cand\n")
+            inp_file = _write_file(draft_dir / "inputs" / "data.txt", "data\n")
+
+            f_sha = hashlib.sha256(obs.read_bytes()).hexdigest()
+            c_sha = hashlib.sha256(cand.read_bytes()).hexdigest()
+            i_sha = hashlib.sha256(inp_file.read_bytes()).hexdigest()
+
+            for bad_field in ("artifact", "content", "input"):
+                with self.subTest(bad_field=bad_field):
+                    draft = {
+                        "schema_version": 1, "proposal_id": f"prop-bad-{bad_field}",
+                        "observed_failure": {"description": "f", "artifacts": [{"path": "evidence/failure.txt", "sha256": ("badsha" if bad_field == "artifact" else f_sha)}]},
+                        "proposed_change": {"kind": "check", "target_path": "target.py", "content_path": "content/cand.py", "content_sha256": ("badsha" if bad_field == "content" else c_sha)},
+                        "baseline": {"identity": "b1"}, "candidate": {"identity": "c1", "content_sha256": ("badsha" if bad_field == "content" else c_sha)},
+                        "expected_improvement": {"description": "exp", "rule": "baseline-failed-candidate-passed"},
+                        "improvement_cases": [{
+                            "case_id": "IMP-01", "command": "python3 -c \"import sys; sys.exit(0)\"",
+                            "rubric": {"rubric_id": "R1", "expected_exit_code": 0, "required_output_tokens": [], "forbidden_output_tokens": []},
+                            "inputs": [{"path": "inputs/data.txt", "target_path": "staged/data.txt", "sha256": ("badsha" if bad_field == "input" else i_sha)}],
+                        }],
+                        "regression_cases": [{
+                            "case_id": "REG-01", "command": "python3 -c \"import sys; sys.exit(0)\"",
+                            "rubric": {"rubric_id": "R2", "expected_exit_code": 0, "required_output_tokens": [], "forbidden_output_tokens": []},
+                        }],
+                        "execution_conditions": {
+                            "time_limit_seconds": 30, "allow_network": False, "env_sanitized": True,
+                            "permitted_substitution": {"target_path": "target.py", "content_sha256": ("badsha" if bad_field == "content" else c_sha)},
+                        },
+                    }
+                    draft_p = _write_file(draft_dir / f"draft_{bad_field}.json", json.dumps(draft))
+                    out_p = root / f"out_{bad_field}.json"
+                    res = subprocess.run(
+                        [sys.executable, "-m", "factory.improvement", "create-proposal", "--out", str(out_p), "--from-file", str(draft_p)],
+                        cwd=root, capture_output=True, text=True, env=env,
+                    )
+                    self.assertEqual(res.returncode, 1)
+                    self.assertFalse(out_p.exists())
 
 
 
