@@ -402,25 +402,25 @@ def evaluate_proposal(
     _write_json(manifest_path, manifest)
     b_cases, c_cases, timeout_s = [], [], proposal["execution_conditions"]["time_limit_seconds"]
     staged_inputs: dict[str, list[tuple[str, bytes]]] = {}
-    for case in proposal.get("improvement_cases", []) + proposal.get("regression_cases", []):
-        cid = case.get("case_id")
-        for inp in case.get("inputs") or ():
-            if isinstance(inp, dict):
-                src = Path(str(inp.get("path") or ""))
-                if not src.is_file():
-                    raise UsageError(f"case {cid!r} input not found: {src}")
-                data = src.read_bytes()
-                sha = hashlib.sha256(data).hexdigest()
-                if sha != str(inp.get("sha256") or ""):
-                    raise UsageError(f"case {cid!r} input sha mismatch: expected {inp.get('sha256')}, got {sha}")
-                staged_inputs.setdefault(cid, []).append((str(inp["target_path"]), data))
-    cand_path = Path(proposal["proposed_change"]["content_path"])
-    if not cand_path.is_file():
-        raise UsageError(f"proposed_change content_path not found: {cand_path}")
-    cand_bytes = cand_path.read_bytes()
-    if hashlib.sha256(cand_bytes).hexdigest() != proposal["proposed_change"]["content_sha256"]:
-        raise UsageError("proposed_change content_sha256 mismatch")
     try:
+        for case in proposal.get("improvement_cases", []) + proposal.get("regression_cases", []):
+            cid = case.get("case_id")
+            for inp in case.get("inputs") or ():
+                if isinstance(inp, dict):
+                    src = Path(str(inp.get("path") or ""))
+                    if not src.is_file():
+                        raise UsageError(f"case {cid!r} input not found: {src}")
+                    data = src.read_bytes()
+                    sha = hashlib.sha256(data).hexdigest()
+                    if sha != str(inp.get("sha256") or ""):
+                        raise UsageError(f"case {cid!r} input sha mismatch: expected {inp.get('sha256')}, got {sha}")
+                    staged_inputs.setdefault(cid, []).append((str(inp["target_path"]), data))
+        cand_path = Path(proposal["proposed_change"]["content_path"])
+        if not cand_path.is_file():
+            raise UsageError(f"proposed_change content_path not found: {cand_path}")
+        cand_bytes = cand_path.read_bytes()
+        if hashlib.sha256(cand_bytes).hexdigest() != proposal["proposed_change"]["content_sha256"]:
+            raise UsageError("proposed_change content_sha256 mismatch")
         for side, store in (("baseline", b_cases), ("candidate", c_cases)):
             for kind, case in [("improvement", c) for c in proposal["improvement_cases"]] + [("regression", c) for c in proposal["regression_cases"]]:
                 wt = attempt_dir / "worktrees" / f"{side}_{case['case_id']}"
@@ -444,7 +444,7 @@ def evaluate_proposal(
                         shutil.rmtree(wt, ignore_errors=True)
     except BaseException as exc:
         manifest["status"] = "interrupted" if isinstance(exc, (KeyboardInterrupt, TimeoutError)) else "failed"
-        manifest["error"], manifest["completed_at"] = str(exc), now()
+        manifest["error"], manifest["completed_at"] = str(exc) or repr(exc), now()
         try:
             _write_json(manifest_path, manifest)
         except Exception:
