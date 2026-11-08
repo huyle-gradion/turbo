@@ -58,7 +58,7 @@ def _delivered_child_fixture(root: Path):
         _DisposableGitHubServer(bare_repo=bare) as gh,
     ):
         res, deliver_payload = _run_deliver(repo, home, asana.base_url, gh.base_url, agy_bin=str(good_wrapper))
-        assert (res.returncode, deliver_payload["status"]) == (0, "verified")
+        assert (res.returncode, deliver_payload["status"], deliver_payload["ci_verified"], deliver_payload["verified"], deliver_payload["delivery_approved"]) == (1, "qa-missing", True, False, False)
         conf = config_module.load(config_module.RuntimePaths(repo=repo, home=home))
         attempt_dir = Path(deliver_payload["evidence"]["attempt_dir"])
         child_dir = attempt_dir / "children" / "101"

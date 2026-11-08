@@ -139,7 +139,8 @@ class AutomatedQADeliveryTest(unittest.TestCase):
             self.assertIn("ASANA_ACCESS_TOKEN", rep_disk["stripped_env_keys"])
             self.assertEqual(qa_res.measurements["usage"]["total_tokens"], 1260)
             self.assertAlmostEqual(qa_res.measurements["cost"]["usd"], 0.0044, places=6)
-            self.assertTrue(json.loads((Path(qa_res.evidence["attempt_dir"]) / "record.json").read_text(encoding="utf-8"))["verified"])
+            rec_disk = json.loads((Path(qa_res.evidence["attempt_dir"]) / "record.json").read_text(encoding="utf-8"))
+            self.assertEqual((rec_disk["ci_verified"], rec_disk["qa_verified"], rec_disk["verified"], rec_disk["delivery_approved"]), (True, True, False, False))
 
     def test_scope_violation_exhaustion_and_truthful_ci_verification(self) -> None:
         scope_violating_script = _repair_script(
@@ -329,13 +330,13 @@ class AutomatedQADeliveryTest(unittest.TestCase):
                     )
 
             (root / "mismatch").mkdir()
-            orig_deliver = deliver.deliver_feature
+            orig_deliver = deliver.deliver_ci_prerequisite
 
-            def mismatched_gid_deliver(paths, spec):
-                res = orig_deliver(paths, spec)
+            def mismatched_gid_deliver(paths, spec, **kw):
+                res = orig_deliver(paths, spec, **kw)
                 return dataclasses.replace(res, child={**(res.child or {}), "gid": "999-unknown"})
 
-            with mock.patch.object(deliver, "deliver_feature", side_effect=mismatched_gid_deliver):
+            with mock.patch.object(deliver, "deliver_ci_prerequisite", side_effect=mismatched_gid_deliver):
                 mm_res = _run_qa_with_servers(root / "mismatch", DEMO_REPAIR_BUILDER_SCRIPT)
             self.assertEqual((mm_res.status, mm_res.ci_verified, mm_res.qa_verified), ("intake-contract-mismatch", False, False))
 

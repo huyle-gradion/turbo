@@ -64,6 +64,7 @@ def evaluate_child_pr_with_security_gate(
             trace=trace, deadline=deadline, limit_s=limit_s, changed_paths=changed_paths, deleted_paths=deleted_paths,
             poll_interval_s=0.05 if loopback else 2.0, max_missing_polls=3 if loopback else 15,
             artifact_retry_delay_s=0.0 if loopback else 2.0, sleep_fn=sleep_fn)
+        atomic_json(child_dir / "ci-verification.json", redact_value(ci_res, secrets), home)
     sec_gate = sr_mod.evaluate_security_review_gate(candidate_sha, base_sha, security_review_record, home=home)
     if sec_gate["status"] == "stale-security-review":
         combined_status, combined_blockers, is_verified = "stale-security-review", [*sec_gate["blockers"], *ci_res.get("blockers", [])], False
@@ -92,8 +93,10 @@ def evaluate_child_pr_with_security_gate(
 
     pr_obj["security_verified"] = bool(sec_gate["verified"]) and is_verified
     pr_obj["verified"] = is_verified
-    return {**ci_res, "status": combined_status, "verified": is_verified, "verification_scope": VERIFICATION_SCOPE_SECURITY_NOTE,
-            "blockers": combined_blockers, "security_gate": sec_gate, "security_review": security_review_record, "pr": pr_obj}
+    return {**ci_res, "status": combined_status, "ci_verified": bool(ci_res.get("verified")) and bool(pr_obj.get("ci_verified", True)),
+            "security_verified": pr_obj["security_verified"], "verified": is_verified, "delivery_approved": False,
+            "verification_scope": VERIFICATION_SCOPE_SECURITY_NOTE, "blockers": combined_blockers,
+            "security_gate": sec_gate, "security_review": security_review_record, "pr": pr_obj}
 
 
 def build_security_repair_prompt(
@@ -172,9 +175,10 @@ def deliver_with_security_review(paths: RuntimePaths, spec: DeliverSecuritySpec)
     deadline, reviewer_bin = started + limit_s, (spec.reviewer_agy_bin if spec.reviewer_agy_bin is not None else spec.agy_bin)
     if reviewer_bin and str(reviewer_bin).strip():
         worker_module.validate_execution_options(worker_module.platform_info(), time_limit_seconds=limit_s, agy_bin=str(reviewer_bin), rates=spec.rates)
-    initial_res = deliver_module.deliver_feature(
-        paths, deliver_module.DeliverSpec(task_ref=spec.task_ref, time_limit_seconds=limit_s, agy_bin=spec.agy_bin, rates=spec.rates, verified_status="security-review-pending"))
-    if initial_res.status not in ("verified", "security-review-pending") or initial_res.child is None:
+    initial_res = deliver_module.deliver_ci_prerequisite(
+        paths, deliver_module.DeliverSpec(task_ref=spec.task_ref, time_limit_seconds=limit_s, agy_bin=spec.agy_bin, rates=spec.rates),
+        pending_status="security-review-pending")
+    if not (initial_res.ci_verified or initial_res.status in ("verified", "security-review-pending")) or initial_res.child is None:
         return initial_res
 
     secrets = collect_redaction_secrets()
@@ -299,24 +303,66 @@ def deliver_with_security_review(paths: RuntimePaths, spec: DeliverSecuritySpec)
     except (FactoryError, OSError, ValueError, KeyError) as exc:
         final_status, final_blockers = "security-review-failed", [f"security review failed: {exc}", *final_blockers]
 
-    is_verified = final_status == "verified"
-    pr_info["verified"] = pr_info["security_verified"] = is_verified
+    sec_verified = final_status == "verified" and bool(combined_gate.get("verified"))
+    ci_ok = bool(combined_gate.get("ci_verified", combined_gate.get("verified")))
+    approval_rec: dict[str, Any] | None = None
+    is_verified = False
+    if sec_verified and ci_ok:
+        approval_rec = deliver_module.enforce_delivery_approval(
+            candidate_sha=candidate_sha, base_sha=base_sha, repo=paths.repo, home=paths.home,
+            child_dir=child_dir, child=child_spec, conf=conf, security_record=sec_rev,
+            builder_session_id=builder_session_id, deadline=deadline, limit_s=limit_s,
+        )
+        is_verified = bool(
+            approval_rec.get("delivery_approved") is True
+            and approval_rec.get("status") == "approved"
+            and approval_rec.get("outcome") == "approved"
+            and approval_rec.get("approved_revision") == candidate_sha
+        )
+        if is_verified:
+            final_status = "verified"
+        else:
+            final_status = (
+                str(approval_rec["status"])
+                if (approval_rec.get("status") in ("stale-candidate-revision", "authority-violation", "prerequisite-unverified", "approval-missing", "invalid-candidate-revision") or approval_rec.get("prior_approval_rejected"))
+                else "security-verified"
+            )
+            final_blockers = list(dict.fromkeys([*final_blockers, *(approval_rec.get("blockers") or [])]))
+
+    app_out = "approved" if is_verified else "rejected"
+    app_rev = candidate_sha if is_verified else None
+    t_sha = (approval_rec or {}).get("tested_sha") or combined_gate.get("tested_sha")
+    r_kind = (approval_rec or {}).get("revision_kind") or combined_gate.get("revision_kind")
+    v_scope = str(approval_rec["verification_scope"]) if (is_verified and isinstance(approval_rec, dict)) else VERIFICATION_SCOPE_SECURITY_NOTE
+    pr_info["ci_verified"] = ci_ok
+    pr_info["security_verified"] = sec_verified
+    pr_info["verified"] = pr_info["delivery_approved"] = is_verified
+    pr_info["approved_revision"] = app_rev
     gh_trace_text = json.dumps(redact_value({"requests": gh_trace, "pr": pr_info, "ci_verification": combined_gate}, secrets), indent=2, sort_keys=True) + "\n"
     gh_evidence_path = str(write_evidence(child_dir, "github-pr", gh_trace_text, paths.home))
     updated_child = {
-        **child_rec, "status": final_status, "verified": is_verified, "verification_scope": VERIFICATION_SCOPE_SECURITY_NOTE,
-        "candidate_sha": candidate_sha, "tested_sha": combined_gate.get("tested_sha"), "diff": diff_info,
+        **child_rec, "status": final_status, "ci_verified": ci_ok, "security_verified": sec_verified,
+        "verified": is_verified, "delivery_approved": is_verified,
+        "approval_outcome": app_out, "approved_revision": app_rev, "verification_scope": v_scope,
+        "candidate_sha": candidate_sha, "tested_sha": t_sha, "revision_kind": r_kind, "diff": diff_info,
         "scope_check": scope_detail, "verification_checks": combined_gate.get("checks", []), "ci_verification": combined_gate,
-        "security_review": sec_rev, "security_repair": {"repairs_used": repairs_used, "max_repair_rounds": spec.max_repair_rounds,
-                                                        "repair_attempts": repair_records, "rounds": rounds_history}, "pr": pr_info}
+        "security_review": sec_rev, "approval": approval_rec,
+        "security_repair": {"repairs_used": repairs_used, "max_repair_rounds": spec.max_repair_rounds,
+                            "repair_attempts": repair_records, "rounds": rounds_history}, "pr": pr_info}
     updated_evidence = {
         **initial_res.evidence, "candidate_diff_path": cand_diff_path, "github_evidence_path": gh_evidence_path,
         "github_evidence_sha256": runner.digest_text(gh_trace_text), "security_review_path": str(child_dir / "security-review.json"),
         "security_rounds": len(rounds_history), "security_repairs_used": repairs_used, "github_requests": gh_trace}
+    if approval_rec is not None:
+        updated_evidence["approval_gate_path"] = str(child_dir / "approval-gate.json")
     updated_meas = _merge_measurements(initial_res.measurements, repair_meas_list, int((time.monotonic() - started) * 1000), spec.rates)
     result = replace(
-        initial_res, status=final_status, verified=is_verified, verification_scope=VERIFICATION_SCOPE_SECURITY_NOTE,
+        initial_res, status=final_status, verified=is_verified, verification_scope=v_scope,
         child=redact_value(updated_child, secrets), blockers=redact_value(final_blockers, secrets),
-        measurements=updated_meas, evidence=redact_value(updated_evidence, secrets), recorded_at=now())
+        measurements=updated_meas, evidence=redact_value(updated_evidence, secrets), recorded_at=now(),
+        ci_verified=ci_ok, delivery_approved=is_verified, approval_outcome=app_out,
+        approved_revision=app_rev, candidate_sha=candidate_sha, base_sha=base_sha,
+        tested_sha=t_sha, revision_kind=r_kind,
+        approval=redact_value(approval_rec, secrets) if approval_rec is not None else None)
     atomic_json(attempt_dir / "record.json", result.to_dict(), paths.home); atomic_json(parent_root / "record.json", result.to_dict(), paths.home)
     return result

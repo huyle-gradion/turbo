@@ -326,7 +326,7 @@ class ThermosRegressionsTest(unittest.TestCase):
                 res = security_review.deliver_with_security_review(
                     RuntimePaths(repo=repo, home=home),
                     security_review.DeliverSecuritySpec(task_ref="900", time_limit_seconds=30, agy_bin=str(builder_agy), reviewer_agy_bin=str(rev_agy), rates=rates))
-            self.assertTrue(res.verified)
+            self.assertEqual((res.status, res.ci_verified, res.child["security_verified"], res.verified, res.delivery_approved), ("security-verified", True, True, False, False))
             self.assertNotIn("BACKDOOR_SECRET", Path(res.evidence["candidate_diff_path"]).read_text(encoding="utf-8"))
             gh_ev = json.loads(Path(res.evidence["github_evidence_path"]).read_text(encoding="utf-8"))
             self.assertEqual(gh_ev["ci_verification"]["candidate_sha"], res.child["candidate_sha"])
@@ -344,19 +344,19 @@ class ThermosRegressionsTest(unittest.TestCase):
             root = Path(tmp)
             repo, home, bare = _make_disposable_product_workspace(root)
             builder_agy, rev_agy = _make_fake_agy(root, "agy-builder", _make_builder_script("fix-with-usage")), _make_fake_agy(root, "agy-rev", REVIEWER_SCRIPT)
-            pre_gate_writes, orig_atomic, orig_deliver = [], security_review.delivery.deliver_module.atomic_json, security_review.delivery.deliver_module.deliver_feature
+            pre_gate_writes, orig_atomic, orig_deliver = [], security_review.delivery.deliver_module.atomic_json, security_review.delivery.deliver_module.deliver_ci_prerequisite
             def _spy_atomic(path: Path, payload: dict, root_dir: Path | None = None) -> None:
                 if path.name == "record.json" and not list(home.glob("deliveries/900/attempt-*/children/*/security-review.json")):
                     pre_gate_writes.append((str(path), dict(payload)))
                 return orig_atomic(path, payload, root_dir)
             def _interrupt_on_deliver_return(*args, **kwargs):
                 orig_deliver(*args, **kwargs)
-                raise KeyboardInterrupt("interrupted immediately as deliver_feature returned")
+                raise KeyboardInterrupt("interrupted immediately as deliver_ci_prerequisite returned")
             with (_DisposableAsanaServer(PARENT_TASK, [{"data": [READY_CHILD], "next_page": None}]) as asana, _SyncingGitHubServer(bare_repo=bare) as gh,
                   unittest.mock.patch.dict(os.environ, {"TURBO_ASANA_API_URL": asana.base_url, "ASANA_ACCESS_TOKEN": "tok-a", "TURBO_GITHUB_API_URL": gh.base_url, "TURBO_GITHUB_TOKEN": "tok-g"})):
                 run_sec = lambda: security_review.deliver_with_security_review(
                     RuntimePaths(repo=repo, home=home), security_review.DeliverSecuritySpec(task_ref="900", time_limit_seconds=30, agy_bin=str(builder_agy), reviewer_agy_bin=str(rev_agy)))
-                with unittest.mock.patch.object(security_review.delivery.deliver_module, "deliver_feature", side_effect=_interrupt_on_deliver_return):
+                with unittest.mock.patch.object(security_review.delivery.deliver_module, "deliver_ci_prerequisite", side_effect=_interrupt_on_deliver_return):
                     with self.assertRaises(KeyboardInterrupt):
                         run_sec()
                 interrupted_parent = json.loads((home / "deliveries/900/record.json").read_text(encoding="utf-8"))
@@ -367,7 +367,7 @@ class ThermosRegressionsTest(unittest.TestCase):
                 self.assertFalse(interrupted_parent["child"]["pr"]["verified"])
                 with unittest.mock.patch.object(security_review.delivery.deliver_module, "atomic_json", side_effect=_spy_atomic):
                     res = run_sec()
-                self.assertTrue(res.verified); self.assertGreaterEqual(len(pre_gate_writes), 2)
+                self.assertEqual((res.status, res.child["security_verified"], res.verified, res.delivery_approved), ("security-verified", True, False, False)); self.assertGreaterEqual(len(pre_gate_writes), 2)
                 for wpath, wpayload in pre_gate_writes:
                     self.assertFalse(wpayload.get("verified"), f"premature verified=True written to {wpath} before security gate")
                     self.assertEqual(wpayload.get("status"), "security-review-pending", f"premature status written to {wpath}")

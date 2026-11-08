@@ -464,10 +464,15 @@ def evaluate_child_qa(
     round_dir = safe_dir(qa_root / f"round-{round_number}", create=True, root=home)
     boundary = build_parent_acceptance_boundary(parent)
     reval_trace: list[dict[str, Any]] = []
+    ci_reval_rec = (
+        {**child_record, "status": "verified", "verified": True}
+        if child_record.get("ci_verified") is True and (child_record.get("ci_verification") or {}).get("verified") is True
+        else child_record
+    )
     try:
         reval = dict(ci_gate.revalidate_child_verification(
             repo=repo, base_url=base_url, token=token, repo_slug=repo_slug,
-            child_record=child_record, trace=reval_trace, deadline=deadline, limit_s=limit_s,
+            child_record=ci_reval_rec, trace=reval_trace, deadline=deadline, limit_s=limit_s,
         ))
     except (deliver_checks.AttemptTimeoutError, TimeoutError) as exc:
         reval = {"verified": False, "status": "timed-out", "blockers": [str(exc)]}

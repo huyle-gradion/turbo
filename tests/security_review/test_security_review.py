@@ -144,7 +144,7 @@ def run_disposable_demo(tmp: Path) -> dict[str, Any]:
     summary = {
         "clean": {"status": r_clean["status"], "verified": r_clean["verified"]},
         "vulnerable": {"status": d_vuln["status"], "verified": d_vuln["verified"], "finding_id": d_vuln["child"]["security_review"]["blocking_findings"][0]["finding_id"]},
-        "corrected": {"status": d_corr["status"], "verified": d_corr["verified"], "repairs_used": d_corr["child"]["security_repair"]["repairs_used"],
+        "corrected": {"status": d_corr["status"], "security_verified": d_corr["child"]["security_verified"], "verified": d_corr["verified"], "repairs_used": d_corr["child"]["security_repair"]["repairs_used"],
                       "failure_before_exit": r1_f0["reproducer_verification"]["exit_code"], "pass_after_exit": r2_res0["reproducer_verification"]["exit_code"],
                       "resolved_findings": [x["finding_id"] for x in d_corr["child"]["security_review"]["previous_findings_resolution"] if x["status"] == "resolved"],
                       "evidence_path": d_corr["evidence"]["security_review_path"]},
@@ -157,7 +157,7 @@ def run_disposable_demo(tmp: Path) -> dict[str, Any]:
     }
     assert summary["clean"] == {"status": "verified", "verified": True} and summary["missing-review"] == {"status": "security-review-missing", "verified": False}
     assert summary["vulnerable"]["status"] == "security-blockers-unresolved" and not summary["vulnerable"]["verified"]
-    assert summary["corrected"]["status"] == "verified" and summary["corrected"]["verified"] and summary["corrected"]["repairs_used"] == 1
+    assert summary["corrected"]["status"] == "security-verified" and summary["corrected"]["security_verified"] and not summary["corrected"]["verified"] and summary["corrected"]["repairs_used"] == 1
     assert summary["stale-review"] == {"status": "stale-security-review", "verified": False} and summary["unresolved-blocker"] == {"status": "security-blockers-unresolved", "verified": False}
     assert summary["non-blocking-suggestion"] == {"status": "verified", "verified": True, "suggestions": 1} and summary["missing-verification"] == {"status": "security-verification-missing", "verified": False}
     assert summary["exhausted-repair"] == {"status": "security-repair-exhausted", "verified": False, "repairs_used": 2}
@@ -171,7 +171,7 @@ class SecurityReviewSlice2Test(unittest.TestCase):
             demo_dir = root / "demo"
             demo_dir.mkdir(parents=True, exist_ok=True)
             summary = run_disposable_demo(demo_dir)
-            self.assertEqual(summary["corrected"]["status"], "verified")
+            self.assertEqual((summary["corrected"]["status"], summary["corrected"]["security_verified"], summary["corrected"]["verified"]), ("security-verified", True, False))
             self.assertEqual((summary["corrected"]["failure_before_exit"], summary["corrected"]["pass_after_exit"]), (1, 0))
 
             tamper_dir = root / "tamper"
