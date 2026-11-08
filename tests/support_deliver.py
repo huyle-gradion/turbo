@@ -50,8 +50,24 @@ class DeliveryContext:
             shutil.rmtree(self.child_dir)
         shutil.copytree(self.backup_child_dir, self.child_dir)
         (self.child_dir / "approval-gate.json").unlink(missing_ok=True)
+        (self.child_dir / "integration-request.json").unlink(missing_ok=True)
+        (self.child_dir / "integration-record.json").unlink(missing_ok=True)
         atomic_json(self.att_dir / "record.json", copy.deepcopy(self.valid_snapshots["att_record"]), self.home)
         atomic_json(self.home / "deliveries" / "900" / "record.json", copy.deepcopy(self.valid_snapshots["att_record"]), self.home)
+        b_branch = str(self.intake_rec["parent"]["target_feature_branch"])
+        git(self.bare, "branch", "-f", b_branch, self.base_sha)
+        git(self.bare, "branch", "-f", self.head_branch, self.cand_sha)
+        git(self.repo, "branch", "-f", b_branch, self.base_sha)
+        git(self.repo, "branch", "-f", self.head_branch, self.cand_sha)
+        git(self.repo, "fetch", "origin")
+        if 1 in self.gh.pulls:
+            self.gh.pulls[1]["state"] = "open"
+            self.gh.pulls[1]["merged"] = False
+            self.gh.pulls[1]["merge_commit_sha"] = None
+        self.gh.merge_status = 200
+        self.gh.disconnect_after_merge = False
+        self.gh.branch_protections = None
+        self.gh.protection_status = 200
 
 
 @contextmanager
@@ -180,6 +196,8 @@ def run_delivery_lifecycle_demo(evidence_dir: Path) -> dict[str, Any]:
             "stage": stage_num, "name": stage_name, "candidate_sha": cand_sha,
             "base_sha": base_sha, "delivery_approved": getattr(delivery_res, "delivery_approved", False),
             "status": getattr(delivery_res, "status", "unknown"),
+            "merged": getattr(delivery_res, "merged", False),
+            "landed_sha": getattr(delivery_res, "landed_sha", None),
             "approved_revision": getattr(delivery_res, "approved_revision", None),
             "blockers": list(getattr(delivery_res, "blockers", [])),
             **extra,
@@ -375,7 +393,7 @@ def run_delivery_lifecycle_demo(evidence_dir: Path) -> dict[str, Any]:
         r_stage3 = deliver_module.deliver_feature(paths, spec)
         record_cmd(3, "deliver_feature_stage3", ["deliver_feature"], 0, r_stage3.delivery_approved, f"status={r_stage3.status}")
         gate_3 = json.loads((child_dir / "approval-gate.json").read_text(encoding="utf-8"))
-        assert r_stage3.delivery_approved and r_stage3.status == "verified" and r_stage3.approved_revision == cand_3 and r_stage3.candidate_sha == cand_3, r_stage3
+        assert r_stage3.delivery_approved and r_stage3.status == "completed" and r_stage3.merged and r_stage3.approved_revision == cand_3 and r_stage3.candidate_sha == cand_3, r_stage3
         stage3_summary = _snapshot_stage(3, "verified", cand_3, base_sha, r_stage3, gate_3, {
             "finding_id": fid, "finding_status": "resolved", "reproducer_command": vcmd,
             "reproducer_executed": True, "reproducer_ok": True, "reconciliation_history_rounds": len(r3_rev["findings"][0]["history"]),
@@ -496,5 +514,122 @@ def run_integration_demo(evidence_dir: Path) -> dict[str, Any]:
         "success": True,
     }
     atomic_json(evidence_dir / "integration-demo-summary.json", summary, evidence_dir)
+    return summary
+
+
+def run_delivery_integration_demo(evidence_dir: Path) -> dict[str, Any]:
+    """Execute four-stage disposable delivery integration demonstration and retain evidence (#78)."""
+    evidence_dir.mkdir(parents=True, exist_ok=True)
+    stages_dir = safe_dir(evidence_dir / "stages", create=True)
+    if (evidence_dir / "workspace").exists():
+        shutil.rmtree(evidence_dir / "workspace", ignore_errors=True)
+    ws_root = safe_dir(evidence_dir / "workspace", create=True)
+    factory_rev_res = gitio.git(Path(__file__).resolve().parents[1], "rev-parse", "HEAD")
+    factory_rev = factory_rev_res.output.strip() if factory_rev_res.ok else "unknown"
+
+    with setup_disposable_delivery_context(ws_root) as ctx:
+        main_sha_before = git(ctx.bare, "rev-parse", "refs/heads/main")
+        commands_log: list[dict[str, Any]] = []
+
+        def _record_cmd(stage: int, cmd_name: str, argv: list[str], exit_code: int, ok: bool, output: str = "") -> None:
+            commands_log.append({
+                "stage": stage, "command": cmd_name, "argv": argv,
+                "exit_code": exit_code, "ok": ok, "output_preview": output[:200],
+            })
+
+        def _snapshot_demo_stage(stage_num: int, stage_name: str, res: Any, extra: dict[str, Any]) -> dict[str, Any]:
+            sdir = stages_dir / f"stage-{stage_num}-{stage_name}"
+            sdir.mkdir(parents=True, exist_ok=True)
+            atomic_json(sdir / "delivery-result.json", res.to_dict() if hasattr(res, "to_dict") else res, evidence_dir)
+            gate_p = ctx.child_dir / "approval-gate.json"
+            if gate_p.is_file():
+                shutil.copy2(gate_p, sdir / "approval-gate.json")
+            req_p = ctx.child_dir / "integration-request.json"
+            if req_p.is_file():
+                shutil.copy2(req_p, sdir / "integration-request.json")
+            rec_p = ctx.child_dir / "integration-record.json"
+            if rec_p.is_file():
+                shutil.copy2(rec_p, sdir / "integration-record.json")
+            summary = {
+                "stage": stage_num, "name": stage_name, "status": getattr(res, "status", "unknown"),
+                "delivery_approved": getattr(res, "delivery_approved", False),
+                "approval_outcome": getattr(res, "approval_outcome", "rejected"),
+                "approved_revision": getattr(res, "approved_revision", None),
+                "merged": getattr(res, "merged", False),
+                "landed_sha": getattr(res, "landed_sha", None),
+                "blockers": list(getattr(res, "blockers", [])),
+                **extra,
+            }
+            atomic_json(sdir / "stage-summary.json", summary, evidence_dir)
+            return summary
+
+        # STAGE 1: Confirmed delivery success
+        ctx.restore_valid_evidence()
+        r1 = deliver_module.deliver_feature(ctx.paths, ctx.spec)
+        _record_cmd(1, "deliver_feature_success", ["deliver_feature"], 0, r1.status == "completed", f"status={r1.status}")
+        assert r1.status == "completed" and r1.merged and r1.landed_sha, r1
+        assert git(ctx.bare, "rev-parse", "refs/heads/main") == main_sha_before
+        s1 = _snapshot_demo_stage(1, "success", r1, {
+            "completion_confirmed": r1.evidence.get("completion_confirmed", False),
+            "original_base_sha": ctx.base_sha,
+            "candidate_sha": ctx.cand_sha,
+        })
+
+        # STAGE 2: Stale-base rejection
+        ctx.restore_valid_evidence()
+        new_base = git(
+            ctx.bare, "-c", "user.name=CI", "-c", "user.email=ci@test",
+            "commit-tree", f"{ctx.base_sha}^{{tree}}", "-p", ctx.base_sha, "-m", "Advanced base",
+        )
+        git(ctx.bare, "update-ref", f"refs/heads/{ctx.intake_rec['parent']['target_feature_branch']}", new_base, ctx.base_sha)
+        git(ctx.repo, "fetch", "origin")
+        r2 = deliver_module.deliver_feature(ctx.paths, ctx.spec)
+        _record_cmd(2, "deliver_feature_stale_base", ["deliver_feature"], 0, not r2.merged, f"status={r2.status}")
+        assert r2.status != "completed" and not r2.merged and r2.landed_sha is None, r2
+        assert not ctx.gh.pulls[1]["merged"]
+        s2 = _snapshot_demo_stage(2, "stale-base", r2, {
+            "advanced_base_sha": new_base,
+            "original_base_sha": ctx.base_sha,
+        })
+
+        # STAGE 3: Permission denial
+        ctx.restore_valid_evidence()
+        ctx.gh.merge_status = 403
+        r3 = deliver_module.deliver_feature(ctx.paths, ctx.spec)
+        _record_cmd(3, "deliver_feature_denied", ["deliver_feature"], 0, r3.status == "denied-permissions", f"status={r3.status}")
+        assert r3.status == "denied-permissions" and r3.delivery_approved and not r3.merged and r3.landed_sha is None, r3
+        assert not ctx.gh.pulls[1]["merged"]
+        ctx.gh.merge_status = 200
+        s3 = _snapshot_demo_stage(3, "denied", r3, {
+            "delivery_approved": r3.delivery_approved,
+            "denial_reason": "denied-permissions",
+        })
+
+        # STAGE 4: Uncertain outcome with retained evidence
+        ctx.restore_valid_evidence()
+        ctx.gh.merge_status = 502
+        r4 = deliver_module.deliver_feature(ctx.paths, ctx.spec)
+        _record_cmd(4, "deliver_feature_uncertain", ["deliver_feature"], 0, r4.status == "uncertain", f"status={r4.status}")
+        assert r4.status == "uncertain" and r4.delivery_approved and not r4.merged and r4.landed_sha is None, r4
+        ctx.gh.merge_status = 200
+        s4 = _snapshot_demo_stage(4, "uncertain", r4, {
+            "delivery_approved": r4.delivery_approved,
+            "uncertain_reason": "uncertain",
+        })
+
+    summary: dict[str, Any] = {
+        "demo": "four-stage-disposable-delivery-integration",
+        "provenance": PROVENANCE_NOTE,
+        "factory_revision": factory_rev,
+        "stages": {
+            "stage_1_success": s1,
+            "stage_2_stale_base": s2,
+            "stage_3_denied": s3,
+            "stage_4_uncertain": s4,
+        },
+        "commands": commands_log,
+        "success": True,
+    }
+    atomic_json(evidence_dir / "delivery-integration-summary.json", summary, evidence_dir)
     return summary
 

@@ -817,7 +817,15 @@ class DeliverChildTest(unittest.TestCase):
                 cli_ok, payload_ok = _run_deliver(repo, home, asana.base_url, gh.base_url, agy_bin=str(builder_agy))
                 self.assertEqual(cli_ok.returncode, 0, cli_ok.stdout + cli_ok.stderr)
                 for p_rec in (payload_ok, json.loads((att_dir / "record.json").read_text(encoding="utf-8")), json.loads((home / "deliveries" / "900" / "record.json").read_text(encoding="utf-8"))):
-                    self.assertEqual((p_rec["status"], p_rec["verified"], p_rec["delivery_approved"], p_rec["approval_outcome"], p_rec["approved_revision"], p_rec["candidate_sha"], p_rec["base_sha"], p_rec["child"]["verified"], p_rec["child"]["delivery_approved"], p_rec["child"]["pr"]["verified"]), ("verified", True, True, "approved", cand_a, cand_a, base_1, True, True, True))
+                    self.assertEqual((p_rec["status"], p_rec["verified"], p_rec["delivery_approved"], p_rec["approval_outcome"], p_rec["approved_revision"], p_rec["candidate_sha"], p_rec["base_sha"], p_rec["child"]["verified"], p_rec["child"]["delivery_approved"], p_rec["child"]["pr"]["verified"]), ("completed", True, True, "approved", cand_a, cand_a, base_1, True, True, True))
+
+                # Isolate stateful success case so integration does not contaminate subsequent candidate/base rejection checks
+                (child_dir / "integration-record.json").unlink(missing_ok=True)
+                (child_dir / "integration-request.json").unlink(missing_ok=True)
+                git(repo, "push", "-q", "-f", "origin", f"{base_1}:refs/heads/feature/chat-auth")
+                gh.pulls[1]["state"] = "open"
+                gh.pulls[1]["merged"] = False
+                gh.pulls[1]["merge_commit_sha"] = None
 
                 git(repo, "checkout", "-q", head_branch)
                 (repo / "src" / "chat_bridge" / "auth.py").write_text((repo / "src" / "chat_bridge" / "auth.py").read_text(encoding="utf-8") + "# candidate B\n", encoding="utf-8")
@@ -872,11 +880,18 @@ class DeliverChildTest(unittest.TestCase):
                     qa_record=qa_rec_b, security_record=sec_rec_b, deadline=time.monotonic() + 30.0, limit_s=30,
                 )
                 r_b = deliver_module.deliver_feature(paths, spec)
-                self.assertEqual((r_b.status, r_b.verified, r_b.delivery_approved, r_b.approved_revision), ("verified", True, True, cand_b))
+                self.assertEqual((r_b.status, r_b.verified, r_b.delivery_approved, r_b.approved_revision), ("completed", True, True, cand_b))
                 gate_b = json.loads((child_dir / "approval-gate.json").read_text(encoding="utf-8"))
                 for rec_map in (json.loads((att_dir / "record.json").read_text(encoding="utf-8")), json.loads((home / "deliveries" / "900" / "record.json").read_text(encoding="utf-8"))):
-                    self.assertEqual((rec_map["status"], rec_map["verified"], rec_map["delivery_approved"], rec_map["approved_revision"]), ("verified", True, True, cand_b))
+                    self.assertEqual((rec_map["status"], rec_map["verified"], rec_map["delivery_approved"], rec_map["approved_revision"]), ("completed", True, True, cand_b))
                 self.assertEqual((gate_b["status"], gate_b["delivery_approved"], gate_b["approved_revision"], gate_b.get("superseded_approved_revision")), ("approved", True, cand_b, None))
+
+                (child_dir / "integration-record.json").unlink(missing_ok=True)
+                (child_dir / "integration-request.json").unlink(missing_ok=True)
+                git(repo, "push", "-q", "-f", "origin", f"{base_1}:refs/heads/feature/chat-auth")
+                gh.pulls[1]["state"] = "open"
+                gh.pulls[1]["merged"] = False
+                gh.pulls[1]["merge_commit_sha"] = None
 
                 git(repo, "branch", "-f", head_branch, cand_a)
                 git(repo, "push", "-q", "-f", "origin", f"{cand_a}:refs/heads/{head_branch}")
@@ -994,7 +1009,7 @@ class DeliverChildTest(unittest.TestCase):
                 )
                 self.assertTrue(ir_rec_s["review_verified"])
                 final_res = deliver_module.deliver_feature(paths_s, deliver_module.DeliverSpec(task_ref="900", time_limit_seconds=60, agy_bin=str(sec_builder)))
-                self.assertEqual((final_res.status, final_res.verified, final_res.delivery_approved, final_res.approved_revision), ("verified", True, True, repaired_sha))
+                self.assertEqual((final_res.status, final_res.verified, final_res.delivery_approved, final_res.approved_revision), ("completed", True, True, repaired_sha))
 
     def test_approval_timeout_closure_across_callers(self) -> None:
         from factory import automated_qa, deliver as deliver_module, security_review

@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from factory import ci_gate, config as config_module, gitio, intake as intake_module, runner, worker as worker_module
+from factory.ci_gate import SHA40_RE
 from factory.config import now
 from factory.deliver_checks import (
     AttemptTimeoutError, GitHubError, collect_redaction_secrets, evaluate_scope, git_timed,
@@ -15,6 +16,7 @@ from factory.deliver_checks import (
     resolve_github_api, resolve_github_token, verify_origin_remote,
 )
 from factory.errors import UsageError
+from factory.integration import integrate_approved_child
 from factory.intake import redact_value
 from factory.limits import parse_duration
 from factory.paths import RuntimePaths, atomic_json, safe_dir, write_evidence
@@ -63,6 +65,8 @@ class DeliverResult:
     revision_kind: str | None = None
     approval: dict[str, Any] | None = None
     policy_consumption: dict[str, Any] | None = None
+    integration: dict[str, Any] | None = None
+    landed_sha: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -459,9 +463,10 @@ def _execute_delivery(paths: RuntimePaths, spec: DeliverSpec, *, require_final_a
                 except Exception:
                     gate_changed = True
             has_prereq_activity = (
-                prev_rec.get("status") in ("ci-verified", "qa-verified", "security-verified", "security-review-pending")
+                prev_rec.get("status") in ("ci-verified", "qa-verified", "security-verified", "security-review-pending", "completed", "confirmed")
                 or (prev_cdir / "automated-qa").exists() or (prev_cdir / "security-review.json").is_file()
                 or (prev_cdir / "independent-review.json").is_file() or gate_changed or prev_rec.get("delivery_approved") is True
+                or (prev_cdir / "integration-request.json").is_file() or (prev_cdir / "integration-record.json").is_file()
             )
             compat, compat_msg = validate_resume_policy(prev_rec, policy_consumption)
             if (
@@ -472,47 +477,135 @@ def _execute_delivery(paths: RuntimePaths, spec: DeliverSpec, *, require_final_a
             ):
                 repo_slug = parse_repo_slug(str(intake_res.parent.get("repository") or child0.get("repository") or ""))
                 origin_issue = verify_origin_remote(paths.repo, repo_slug, deadline, limit_s)
-                base_sha, branch_issues = ("", [origin_issue]) if origin_issue else _ensure_feature_branch(paths.repo, feature_branch, deadline, limit_s)
+                live_feat_sha, branch_issues = ("", [origin_issue]) if origin_issue else _ensure_feature_branch(paths.repo, feature_branch, deadline, limit_s)
                 if not branch_issues:
                     head_branch, prev_cand = str(prev_child.get("head_branch") or ""), str(prev_child.get("candidate_sha") or "")
                     rem_cand = gitio.remote_ref(paths.repo, head_branch) if head_branch else None
                     loc_cand = gitio.commit_sha(paths.repo, f"refs/heads/{head_branch}") if (head_branch and gitio.branch_exists(paths.repo, head_branch)) else None
                     cand_sha = rem_cand or loc_cand or prev_cand
+                    orig_base = str(prev_child.get("base_sha") or prev_rec.get("base_sha") or "")
+                    is_recovering = False
+                    if (prev_cdir / "integration-record.json").is_file():
+                        try:
+                            _pr_rec = json.loads((prev_cdir / "integration-record.json").read_text(encoding="utf-8"))
+                            is_recovering = bool(_pr_rec.get("candidate_sha") == cand_sha and _pr_rec.get("status") in ("confirmed", "uncertain"))
+                        except Exception:
+                            is_recovering = False
+                    elif (prev_cdir / "integration-request.json").is_file():
+                        try:
+                            _pr_req = json.loads((prev_cdir / "integration-request.json").read_text(encoding="utf-8"))
+                            is_recovering = bool(_pr_req.get("candidate_sha") == cand_sha)
+                        except Exception:
+                            is_recovering = False
+                    auth_base_sha = (orig_base if (orig_base and SHA40_RE.fullmatch(orig_base)) else live_feat_sha) if is_recovering else live_feat_sha
                     try:
                         app_rec = enforce_delivery_approval(
-                            candidate_sha=cand_sha, base_sha=base_sha, repo=paths.repo, home=paths.home,
+                            candidate_sha=cand_sha, base_sha=auth_base_sha, repo=paths.repo, home=paths.home,
                             child_dir=prev_cdir, child=child0, conf=conf, deadline=deadline, limit_s=limit_s,
                         )
                     except (AttemptTimeoutError, TimeoutError) as exc:
                         t_msg = f"delivery approval timed out: {exc}"
-                        app_rec = {"schema": 1, "role": "delivery-approval-gate", "status": "timed-out", "outcome": "rejected", "delivery_approved": False, "approved_revision": None, "candidate_sha": cand_sha, "base_sha": base_sha, "blockers": [t_msg]}
+                        app_rec = {"schema": 1, "role": "delivery-approval-gate", "status": "timed-out", "outcome": "rejected", "delivery_approved": False, "approved_revision": None, "candidate_sha": cand_sha, "base_sha": auth_base_sha, "blockers": [t_msg]}
                         if prev_cdir.exists(): atomic_json(gate_p, app_rec, paths.home)
                     approved = bool(app_rec.get("delivery_approved") is True and app_rec.get("status") == "approved" and app_rec.get("outcome") == "approved" and app_rec.get("approved_revision") == cand_sha)
-                    st = "verified" if approved else str(app_rec.get("status") or "approval-rejected")
-                    v_scope = approval_mod.APPROVAL_GATE_SCOPE_NOTE if approved else ci_gate.VERIFICATION_SCOPE_NOTE
-                    blks = [] if approved else list(dict.fromkeys(app_rec.get("blockers") or []))
                     ci_eval = (app_rec.get("prerequisites") or {}).get("ci") or {}
                     ci_ok = bool(ci_eval.get("verified") is True) if ci_eval else bool(prev_child.get("ci_verified"))
                     t_sha = app_rec.get("tested_sha") or (ci_eval.get("tested_sha") if ci_ok else None)
                     r_kind = app_rec.get("revision_kind") or (ci_eval.get("revision_kind") if ci_ok else None)
-                    app_rev, app_out = (app_rec.get("approved_revision") if approved else None), ("approved" if approved else "rejected")
-                    upd_pr = {**(prev_child.get("pr") or {}), "head_sha": cand_sha, "base_sha": base_sha, "ci_verified": ci_ok, "verified": approved, "delivery_approved": approved, "approved_revision": app_rev}
+                    app_rev, app_out = (cand_sha if approved else None), ("approved" if approved else "rejected")
+
+                    merged = False
+                    landed_sha: str | None = None
+                    integration_rec: dict[str, Any] | None = None
+                    blks: list[str] = []
+                    full_ci_rec: dict[str, Any] | None = None
+                    if (prev_cdir / "ci-verification.json").is_file():
+                        try:
+                            full_ci_rec = json.loads((prev_cdir / "ci-verification.json").read_text(encoding="utf-8"))
+                        except Exception:
+                            full_ci_rec = None
+                    if full_ci_rec is None and isinstance(prev_child.get("ci_verification"), dict):
+                        full_ci_rec = prev_child["ci_verification"]
+
+                    if approved:
+                        try:
+                            gh_token = resolve_github_token(gh_is_loopback)
+                            pr_num = int((prev_child.get("pr") or {}).get("number") or 1)
+                            int_res = integrate_approved_child(
+                                repo=paths.repo, home=paths.home, child_dir=prev_cdir, child=child0, conf=conf,
+                                pr_number=pr_num, candidate_sha=cand_sha, base_sha=auth_base_sha,
+                                head_branch=head_branch, base_branch=feature_branch, approval_record=app_rec,
+                                ci_record=full_ci_rec,
+                                repo_slug=repo_slug, base_url=gh_api_url, token=gh_token,
+                                deadline=deadline, limit_s=limit_s,
+                            )
+                            integration_rec = {
+                                "status": int_res.status, "outcome": int_res.outcome,
+                                "landed_sha": int_res.landed_sha, "reconciled": int_res.reconciled,
+                                "record_path": int_res.record_path, "request_path": int_res.request_path,
+                            }
+                            if int_res.status == "confirmed" and int_res.landed_sha:
+                                st = "completed"
+                                merged = True
+                                landed_sha = int_res.landed_sha
+                            else:
+                                st = int_res.status
+                                blks.extend(b for b in int_res.blockers if b not in blks)
+                        except (AttemptTimeoutError, TimeoutError) as exc:
+                            st, blks = "timed-out", [f"integration timed out: {exc}"]
+                        except Exception as exc:
+                            st, blks = "integration-failed", [f"integration error: {exc}"]
+                    else:
+                        st = str(app_rec.get("status") or "approval-rejected")
+                        blks = list(dict.fromkeys(app_rec.get("blockers") or []))
+
+                    is_completed = bool(approved and merged and st == "completed")
+                    is_verified = bool(is_completed or (approved and st == "verified"))
+                    v_scope = approval_mod.APPROVAL_GATE_SCOPE_NOTE if (is_verified or approved) else ci_gate.VERIFICATION_SCOPE_NOTE
+
+                    upd_pr = {
+                        **(prev_child.get("pr") or {}), "head_sha": cand_sha, "base_sha": auth_base_sha,
+                        "ci_verified": ci_ok, "verified": is_completed, "delivery_approved": approved,
+                        "approved_revision": app_rev, "merged": merged, "landed_sha": landed_sha,
+                    }
                     upd_child = {
-                        **prev_child, "status": st, "ci_verified": ci_ok, "verified": approved, "delivery_approved": approved,
+                        **prev_child, "status": st, "ci_verified": ci_ok, "verified": is_completed, "delivery_approved": approved,
                         "approval_outcome": app_out, "approved_revision": app_rev, "verification_scope": v_scope,
-                        "base_sha": base_sha, "candidate_sha": cand_sha, "tested_sha": t_sha, "revision_kind": r_kind,
-                        "approval": app_rec, "pr": upd_pr,
+                        "base_sha": auth_base_sha, "candidate_sha": cand_sha, "tested_sha": t_sha, "revision_kind": r_kind,
+                        "ci_verification": full_ci_rec or prev_child.get("ci_verification"),
+                        "approval": app_rec, "integration": integration_rec, "pr": upd_pr,
+                        "merged": merged, "landed_sha": landed_sha,
                     }
                     upd_ev = {**(prev_rec.get("evidence") or {}), "approval_gate_path": str(gate_p)}
+                    if (prev_cdir / "ci-verification.json").is_file():
+                        upd_ev["ci_verification_path"] = str(prev_cdir / "ci-verification.json")
+                    if (prev_cdir / "integration-request.json").is_file():
+                        upd_ev["integration_request_path"] = str(prev_cdir / "integration-request.json")
+                    if (prev_cdir / "integration-record.json").is_file():
+                        upd_ev["integration_record_path"] = str(prev_cdir / "integration-record.json")
+                    if landed_sha:
+                        upd_ev["landed_sha"] = landed_sha
+                        upd_ev["completion_confirmed"] = True
+                    upd_ev["task_gid"] = task_gid
+                    upd_ev["parent_task_url"] = f"https://app.asana.com/0/0/{task_gid}"
+                    upd_ev["child_task_url"] = f"https://app.asana.com/0/{task_gid}/{child0_gid}"
+                    pr_url = str(upd_pr.get("url") or upd_pr.get("html_url") or (prev_rec.get("evidence") or {}).get("pr_url") or "").strip()
+                    if pr_url:
+                        upd_ev["pr_url"] = pr_url
+                    upd_ev["reviewed_revision"] = app_rev
+                    upd_ev["tested_revision"] = t_sha
+                    upd_ev["original_base_sha"] = auth_base_sha
+
                     res = DeliverResult(
-                        schema=1, task_gid=task_gid, attempt=latest_num, status=st, pr_opened=True, verified=approved,
-                        verification_scope=v_scope, merged=False, factory_revision=factory_rev, feature_branch=feature_branch,
+                        schema=1, task_gid=task_gid, attempt=latest_num, status=st, pr_opened=True, verified=is_verified,
+                        verification_scope=v_scope, merged=merged, factory_revision=factory_rev, feature_branch=feature_branch,
                         parent=redact_value(intake_res.parent, secrets), child=redact_value(upd_child, secrets),
                         blockers=redact_value(blks, secrets), measurements=prev_rec.get("measurements") or {},
                         evidence=redact_value(upd_ev, secrets), recorded_at=now(), ci_verified=ci_ok, delivery_approved=approved,
-                        approval_outcome=app_out, approved_revision=app_rev, candidate_sha=cand_sha, base_sha=base_sha,
+                        approval_outcome=app_out, approved_revision=app_rev, candidate_sha=cand_sha, base_sha=auth_base_sha,
                         tested_sha=t_sha, revision_kind=r_kind, approval=redact_value(app_rec, secrets),
                         policy_consumption=prev_rec.get("policy_consumption") or policy_consumption,
+                        integration=redact_value(integration_rec, secrets), landed_sha=landed_sha,
                     )
                     atomic_json(latest_dir / "record.json", res.to_dict(), paths.home)
                     atomic_json(parent_root / "record.json", res.to_dict(), paths.home)
@@ -532,25 +625,30 @@ def _execute_delivery(paths: RuntimePaths, spec: DeliverSpec, *, require_final_a
         candidate_sha: str | None = None, base_sha: str | None = None,
         tested_sha: str | None = None, revision_kind: str | None = None,
         approval: dict[str, Any] | None = None,
+        merged: bool = False, landed_sha: str | None = None,
+        integration: dict[str, Any] | None = None,
         policy_consumption: dict[str, Any] | None = None,
     ) -> DeliverResult:
-        is_verified = bool(delivery_approved and status == "verified")
-        v_scope = approval_mod.APPROVAL_GATE_SCOPE_NOTE if is_verified else ci_gate.VERIFICATION_SCOPE_NOTE
+        is_completed = bool(delivery_approved and merged and status == "completed")
+        is_verified = bool(is_completed or (delivery_approved and status == "verified"))
+        v_scope = approval_mod.APPROVAL_GATE_SCOPE_NOTE if (is_verified or delivery_approved) else ci_gate.VERIFICATION_SCOPE_NOTE
         eff_policy = policy_consumption if policy_consumption is not None else evidence.get("policy_consumption")
         res = DeliverResult(
             schema=1, task_gid=task_gid, attempt=attempt, status=status,
             pr_opened=pr_opened, verified=is_verified, verification_scope=v_scope,
-            merged=False, factory_revision=factory_rev,
+            merged=merged, factory_revision=factory_rev,
             feature_branch=feature_branch, parent=redact_value(intake_res.parent, active_secrets),
             child=redact_value(child_payload, active_secrets) if child_payload is not None else None,
             blockers=redact_value(blockers, active_secrets), measurements=measurements,
             evidence=redact_value({**evidence, "policy_consumption": eff_policy}, active_secrets), recorded_at=now(),
-            ci_verified=ci_verified, delivery_approved=is_verified,
-            approval_outcome="approved" if is_verified else approval_outcome,
-            approved_revision=approved_revision if is_verified else None,
+            ci_verified=ci_verified, delivery_approved=delivery_approved,
+            approval_outcome=approval_outcome,
+            approved_revision=approved_revision,
             candidate_sha=candidate_sha, base_sha=base_sha,
             tested_sha=tested_sha, revision_kind=revision_kind,
             approval=redact_value(approval, active_secrets) if approval is not None else None,
+            integration=redact_value(integration, active_secrets) if integration is not None else None,
+            landed_sha=landed_sha,
             policy_consumption=eff_policy,
         )
         atomic_json(attempt_dir / "record.json", res.to_dict(), paths.home)
@@ -748,6 +846,9 @@ def _execute_delivery(paths: RuntimePaths, spec: DeliverSpec, *, require_final_a
         approval_rec: dict[str, Any] | None = None
         ci_ok = False
         delivery_approved = False
+        merged = False
+        landed_sha: str | None = None
+        integration_rec: dict[str, Any] | None = None
         if builder_status == "completed":
             try:
                 gh_token = resolve_github_token(gh_is_loopback)
@@ -798,8 +899,29 @@ def _execute_delivery(paths: RuntimePaths, spec: DeliverSpec, *, require_final_a
                             and approval_rec.get("outcome") == "approved"
                             and approval_rec.get("approved_revision") == candidate_sha
                         )
-                        final_status = "verified" if delivery_approved else str(approval_rec.get("status") or "approval-rejected")
-                        if not delivery_approved:
+                        if delivery_approved:
+                            app_out, app_rev = "approved", candidate_sha
+                            int_res = integrate_approved_child(
+                                repo=paths.repo, home=paths.home, child_dir=child_dir, child=child, conf=conf,
+                                pr_number=int(pr_info["number"]), candidate_sha=candidate_sha, base_sha=base_sha,
+                                head_branch=head_branch, base_branch=feature_branch, approval_record=approval_rec,
+                                ci_record=ci_verification, repo_slug=repo_slug, base_url=gh_api_url, token=gh_token,
+                                deadline=deadline, limit_s=limit_s,
+                            )
+                            integration_rec = {
+                                "status": int_res.status, "outcome": int_res.outcome,
+                                "landed_sha": int_res.landed_sha, "reconciled": int_res.reconciled,
+                                "record_path": int_res.record_path, "request_path": int_res.request_path,
+                            }
+                            if int_res.status == "confirmed" and int_res.landed_sha:
+                                final_status = "completed"
+                                merged = True
+                                landed_sha = int_res.landed_sha
+                            else:
+                                final_status = int_res.status
+                                blockers.extend(b for b in int_res.blockers if b not in blockers)
+                        else:
+                            final_status = str(approval_rec.get("status") or "approval-rejected")
                             blockers.extend(b for b in (approval_rec.get("blockers") or []) if b not in blockers)
                     except (AttemptTimeoutError, TimeoutError) as exc:
                         delivery_approved, final_status = False, "timed-out"
@@ -812,13 +934,14 @@ def _execute_delivery(paths: RuntimePaths, spec: DeliverSpec, *, require_final_a
                 else:
                     final_status = str(ci_verification["status"])
                 pr_info = {
-                    **pr_info, "ci_verified": ci_ok, "verified": delivery_approved,
+                    **pr_info, "ci_verified": ci_ok, "verified": merged,
                     "delivery_approved": delivery_approved,
                     "approved_revision": candidate_sha if delivery_approved else None,
+                    "merged": merged, "landed_sha": landed_sha,
                 }
             except AttemptTimeoutError as exc:
                 if pr_info is not None:
-                    pr_info = {**pr_info, "pr_confirmed": True, "ci_verified": False, "verified": False, "delivery_approved": False}
+                    pr_info = {**pr_info, "pr_confirmed": True, "ci_verified": False, "verified": False, "delivery_approved": False, "merged": False, "landed_sha": None}
                     final_status = "ci-pending"
                     blockers.append(f"CI verification still pending when time allowance expired: {exc}")
                 else:
@@ -839,17 +962,18 @@ def _execute_delivery(paths: RuntimePaths, spec: DeliverSpec, *, require_final_a
         rev_kind = (approval_rec or {}).get("revision_kind") or (ci_verification.get("revision_kind") if isinstance(ci_verification, dict) else None)
         app_out = "approved" if delivery_approved else "rejected"
         app_rev = candidate_sha if delivery_approved else None
-        v_scope = approval_mod.APPROVAL_GATE_SCOPE_NOTE if delivery_approved else ci_gate.VERIFICATION_SCOPE_NOTE
+        v_scope = approval_mod.APPROVAL_GATE_SCOPE_NOTE if (delivery_approved or merged) else ci_gate.VERIFICATION_SCOPE_NOTE
         child_payload = {
             "gid": child_gid, "name": child["name"], "status": final_status,
-            "ci_verified": ci_ok, "verified": delivery_approved, "delivery_approved": delivery_approved,
+            "ci_verified": ci_ok, "verified": merged, "delivery_approved": delivery_approved,
             "approval_outcome": app_out, "approved_revision": app_rev,
+            "merged": merged, "landed_sha": landed_sha,
             "verification_scope": v_scope,
             "base_branch": feature_branch, "base_sha": base_sha, "head_branch": head_branch,
             "candidate_sha": candidate_sha, "tested_sha": tested_sha, "revision_kind": rev_kind,
             "diff": diff_info, "scope_check": scope_detail,
             "verification_checks": ci_verification.get("checks", []) if isinstance(ci_verification, dict) else [],
-            "ci_verification": ci_verification, "approval": approval_rec, "pr": pr_info,
+            "ci_verification": ci_verification, "approval": approval_rec, "integration": integration_rec, "pr": pr_info,
             "policy_consumption": policy_consumption,
             "safety": {
                 "sandbox_flag": "--sandbox", "permission_mode": "auto", "bypass_permissions_used": False,
@@ -868,13 +992,33 @@ def _execute_delivery(paths: RuntimePaths, spec: DeliverSpec, *, require_final_a
         }
         if retained_file is not None:
             evidence["retained_consumed_policy_path"] = str(retained_file)
+        if (child_dir / "ci-verification.json").is_file():
+            evidence["ci_verification_path"] = str(child_dir / "ci-verification.json")
         if approval_rec is not None:
             evidence["approval_gate_path"] = str(child_dir / "approval-gate.json")
+        if (child_dir / "integration-request.json").is_file():
+            evidence["integration_request_path"] = str(child_dir / "integration-request.json")
+        if (child_dir / "integration-record.json").is_file():
+            evidence["integration_record_path"] = str(child_dir / "integration-record.json")
+        if landed_sha:
+            evidence["landed_sha"] = landed_sha
+            evidence["completion_confirmed"] = True
+        evidence["task_gid"] = task_gid
+        evidence["parent_task_url"] = f"https://app.asana.com/0/0/{task_gid}"
+        evidence["child_task_url"] = f"https://app.asana.com/0/{task_gid}/{child_gid}"
+        pr_url = str((pr_info.get("url") or pr_info.get("html_url") or "") if pr_info else "").strip()
+        if pr_url:
+            evidence["pr_url"] = pr_url
+        evidence["reviewed_revision"] = app_rev
+        evidence["tested_revision"] = tested_sha
+        evidence["original_base_sha"] = base_sha
+
         return _finish(
             final_status, blockers, child_payload, measurements, evidence,
             pr_opened=(pr_info is not None), ci_verified=ci_ok, delivery_approved=delivery_approved,
             approval_outcome=app_out, approved_revision=app_rev, candidate_sha=candidate_sha,
             base_sha=base_sha, tested_sha=tested_sha, revision_kind=rev_kind, approval=approval_rec,
+            merged=merged, landed_sha=landed_sha, integration=integration_rec,
             policy_consumption=policy_consumption,
         )
     except AttemptTimeoutError as exc:
