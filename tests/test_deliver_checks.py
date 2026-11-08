@@ -3,9 +3,7 @@
 from __future__ import annotations
 
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-import io
-import json
-import os
+import io, json, os, socket
 from pathlib import Path
 import subprocess
 import sys
@@ -58,6 +56,7 @@ class _DisposableGitHubServer:
         self.patch_status, self.ci_spec, self.page_size, self.on_patch_pull = patch_status, ci_spec, page_size, on_patch_pull
         self.branch_protections, self.protection_status = branch_protections, protection_status
         self.merge_status, self.merge_override, self.on_before_merge = merge_status, merge_override, on_before_merge
+        self.disconnect_after_merge = False
         self.check_runs_by_sha = check_runs_by_sha or {}
         self.artifacts_by_run = artifacts_by_run or {}
         self.artifact_zips = artifact_zips or {}
@@ -359,6 +358,14 @@ class _DisposableGitHubServer:
                     pr_obj["merged"] = True
                     pr_obj["state"] = "closed"
                     pr_obj["merge_commit_sha"] = merge_sha
+                    if outer.disconnect_after_merge:
+                        self.close_connection = True
+                        try:
+                            self.connection.shutdown(socket.SHUT_RDWR)
+                            self.connection.close()
+                        except Exception:
+                            pass
+                        return
                     return self._send_json(200, {"sha": merge_sha, "merged": True, "message": "Pull Request successfully merged"})
                 self._send_json(405, {"message": "Merge forbidden"})
 

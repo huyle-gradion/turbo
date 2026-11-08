@@ -159,17 +159,33 @@ class IntegrationBehaviorTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp_str:
             with setup_disposable_delivery_context(Path(tmp_str)) as ctx:
                 gate, b_branch = self._setup_ctx(ctx)
-                secret, old = "secret-token-xyz-987", os.environ.get("TURBO_GITHUB_TOKEN")
-                os.environ["TURBO_GITHUB_TOKEN"] = secret
+                kwarg_secret = "synthetic-kwarg-token/with-special%chars"
+                quoted_secret = "synthetic-kwarg-token%2Fwith-special%25chars"
+                old_env = {k: os.environ.pop(k, None) for k in ("GITHUB_TOKEN", "GH_TOKEN", "TURBO_GITHUB_TOKEN")}
                 try:
-                    res = self._call(ctx, gate, b_branch, token=secret)
+                    res = self._call(ctx, gate, b_branch, token=kwarg_secret)
                     self.assertEqual(res.status, "confirmed")
                     req_txt = (ctx.child_dir / "integration-request.json").read_text(encoding="utf-8")
                     rec_txt = (ctx.child_dir / "integration-record.json").read_text(encoding="utf-8")
-                    self.assertNotIn(secret, req_txt + rec_txt)
+                    combined = req_txt + rec_txt
+                    self.assertNotIn(kwarg_secret, combined)
+                    self.assertNotIn(quoted_secret, combined)
                 finally:
-                    if old is not None: os.environ["TURBO_GITHUB_TOKEN"] = old
-                    else: os.environ.pop("TURBO_GITHUB_TOKEN", None)
+                    for k, v in old_env.items():
+                        if v is not None: os.environ[k] = v
+
+    def test_transport_disconnect_after_mutation_yields_uncertain_and_no_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_str:
+            with setup_disposable_delivery_context(Path(tmp_str)) as ctx:
+                gate, b_branch = self._setup_ctx(ctx)
+                ctx.gh.disconnect_after_merge = True
+                res = self._call(ctx, gate, b_branch)
+                self.assertEqual((res.status, res.outcome), ("uncertain", "uncertain"))
+                rec_data = json.loads((ctx.child_dir / "integration-record.json").read_text(encoding="utf-8"))
+                self.assertEqual((rec_data["status"], rec_data["outcome"]), ("uncertain", "uncertain"))
+                self.assertTrue(ctx.gh.pulls[1]["merged"] and ctx.gh.pulls[1]["state"] == "closed")
+                put_reqs = [r for r in ctx.gh.requests if r["method"] == "PUT"]
+                self.assertEqual(len(put_reqs), 1)
 
     def test_branch_protection_contract_and_single_encoded_segment(self) -> None:
         import urllib.request, urllib.error

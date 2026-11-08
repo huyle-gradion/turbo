@@ -89,7 +89,11 @@ def integrate_approved_child(
     merge_method: str = "merge", commit_title: str | None = None, commit_message: str | None = None,
     on_before_merge: Callable[[], None] | None = None, deadline: float | None = None, limit_s: int = 30,
 ) -> IntegrationResult:
-    secrets, trace, blockers, prot_obs = collect_redaction_secrets(), [], [], {}
+    secrets: list[str] = list(collect_redaction_secrets())
+    if token:
+        for t in (token, quote(token, safe="")):
+            if t and t not in secrets: secrets.append(t)
+    trace, blockers, prot_obs = [], [], {}
     f_rev, dl = _factory_rev(), deadline or (time.monotonic() + float(limit_s))
 
     def _make(st: str, out: str, landed: str | None = None, req_p: str | None = None, rec_p: str | None = None) -> IntegrationResult:
@@ -128,6 +132,9 @@ def integrate_approved_child(
         resolved_api, is_loopback = resolve_github_api() if base_url is None else (base_url, any(h in base_url for h in ("127.0.0.1", "localhost", "::1")))
         eff_base_url = resolved_api.rstrip("/")
         eff_token = token if token is not None else resolve_github_token(is_loopback)
+        if eff_token:
+            for t in (eff_token, quote(eff_token, safe="")):
+                if t and t not in secrets: secrets.append(t)
     except Exception as exc:
         return _fail("provider-config-error", f"failed to resolve GitHub API or token: {exc}")
 
@@ -251,9 +258,9 @@ def integrate_approved_child(
         elif m_code in (401, 403):
             status, outcome = "denied-permissions", "rejected"
             blockers.append(f"provider denied merge permissions (HTTP {m_code}): {m_msg}")
-        elif m_code >= 500:
+        elif m_code >= 500 or m_code == 0:
             status, outcome = "uncertain", "uncertain"
-            blockers.append(f"provider server error (HTTP {m_code}): {m_msg}; remote integration state is uncertain")
+            blockers.append(f"merge communication failure (HTTP {m_code}): {m_msg or 'transport failure'}; remote integration state is uncertain")
         else:
             status, outcome = "rejected-provider-error", "rejected"
             blockers.append(f"provider rejected merge (HTTP {m_code}): {m_msg}")
