@@ -47,11 +47,17 @@ class _DisposableGitHubServer:
         artifacts_by_run: dict[int, list[dict[str, Any]]] | None = None,
         artifact_zips: dict[int, bytes] | None = None, page_size: int = 100,
         on_patch_pull: Callable[[dict[str, Any]], None] | None = None,
+        branch_protections: dict[str, dict[str, Any]] | None = None,
+        protection_status: int = 200, merge_status: int = 200,
+        merge_override: dict[str, Any] | None = None,
+        on_before_merge: Callable[[int, dict[str, Any]], None] | None = None,
     ) -> None:
         self.bare_repo, self.owner, self.repo = bare_repo, owner, repo
         self.post_status, self.get_status, self.redirect_to = post_status, get_status, redirect_to
         self.verify_override = verify_override or {}
         self.patch_status, self.ci_spec, self.page_size, self.on_patch_pull = patch_status, ci_spec, page_size, on_patch_pull
+        self.branch_protections, self.protection_status = branch_protections, protection_status
+        self.merge_status, self.merge_override, self.on_before_merge = merge_status, merge_override, on_before_merge
         self.check_runs_by_sha = check_runs_by_sha or {}
         self.artifacts_by_run = artifacts_by_run or {}
         self.artifact_zips = artifact_zips or {}
@@ -269,6 +275,22 @@ class _DisposableGitHubServer:
                     self.end_headers()
                     self.wfile.write(raw_zip)
                     return
+                if path.startswith(f"{repo_prefix}/branches/") and path.endswith("/protection"):
+                    bname = path[len(f"{repo_prefix}/branches/") : -len("/protection")]
+                    if outer.protection_status != 200:
+                        return self._send_json(outer.protection_status, {"message": f"Protection HTTP {outer.protection_status}"})
+                    if outer.branch_protections is not None:
+                        if bname in outer.branch_protections:
+                            return self._send_json(200, outer.branch_protections[bname])
+                        return self._send_json(404, {"message": "Branch not protected"})
+                    if bname.startswith("feature/"):
+                        return self._send_json(200, {
+                            "required_status_checks": {"strict": True, "contexts": ["guard/gate-1"]},
+                            "enforce_admins": {"enabled": True},
+                            "allow_force_pushes": {"enabled": False},
+                            "allow_deletions": {"enabled": False},
+                        })
+                    return self._send_json(404, {"message": "Branch not protected"})
                 prefix = f"/api/v3/repos/{outer.owner}/{outer.repo}/pulls/"
                 if not path.startswith(prefix):
                     self._send_json(404, {"message": "Not Found"})
@@ -299,8 +321,43 @@ class _DisposableGitHubServer:
                 self._send_json(200, pr_obj)
 
             def do_PUT(self) -> None:
-                self._record_or_redirect()
-                self._send_json(405, {"message": "Merge forbidden in #19"})
+                path = self._record_or_redirect()
+                if path is None:
+                    return
+                repo_prefix = f"/api/v3/repos/{outer.owner}/{outer.repo}"
+                if path.startswith(f"{repo_prefix}/pulls/") and path.endswith("/merge"):
+                    pr_num = int(path[len(f"{repo_prefix}/pulls/") : -len("/merge")])
+                    raw_b = self.rfile.read(int(self.headers.get("Content-Length", 0))).decode("utf-8")
+                    payload = json.loads(raw_b) if raw_b else {}
+                    if outer.on_before_merge:
+                        outer.on_before_merge(pr_num, payload)
+                    if outer.merge_status != 200:
+                        return self._send_json(outer.merge_status, outer.merge_override or {"message": f"Merge failed HTTP {outer.merge_status}"})
+                    if pr_num not in outer.pulls:
+                        return self._send_json(404, {"message": "PR Not Found"})
+                    pr_obj = outer.pulls[pr_num]
+                    if pr_obj.get("state") != "open" or pr_obj.get("merged"):
+                        return self._send_json(405, {"message": "Pull request is not open"})
+                    req_sha = payload.get("sha")
+                    if req_sha and req_sha != pr_obj["head"]["sha"]:
+                        return self._send_json(409, {"message": "Head branch was modified. Review and try the merge again."})
+                    base_ref = pr_obj["base"]["ref"]
+                    if outer.bare_repo is not None:
+                        live_base = outer._resolve_branch_sha(base_ref)
+                        if live_base != pr_obj["base"]["sha"]:
+                            return self._send_json(405, {"message": "Base branch was modified. Review and try the merge again."})
+                        merge_sha = git(outer.bare_repo, "-c", "user.name=CI", "-c", "user.email=ci@example.test", "commit-tree", f"{pr_obj['head']['sha']}^{{tree}}", "-p", pr_obj["base"]["sha"], "-p", pr_obj["head"]["sha"], "-m", payload.get("commit_title") or f"Merge pull request #{pr_num}")
+                        try:
+                            git(outer.bare_repo, "update-ref", f"refs/heads/{base_ref}", merge_sha, pr_obj["base"]["sha"])
+                        except AssertionError:
+                            return self._send_json(405, {"message": "Base branch was modified. Review and try the merge again."})
+                    else:
+                        merge_sha = pr_obj["head"]["sha"]
+                    pr_obj["merged"] = True
+                    pr_obj["state"] = "closed"
+                    pr_obj["merge_commit_sha"] = merge_sha
+                    return self._send_json(200, {"sha": merge_sha, "merged": True, "message": "Pull Request successfully merged"})
+                self._send_json(405, {"message": "Merge forbidden"})
 
         return Handler
 
