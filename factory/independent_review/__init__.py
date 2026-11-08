@@ -170,16 +170,15 @@ def _validate_qa_record(candidate_sha: str, base_sha: str, qa_record: dict[str, 
         if not parents_ok: return {"status": "stale-qa-evidence", "verified": False, "blockers": [f"unverified integration-merge tested_sha {rec_tested}"]}
     if any(ci_reval.get(k) not in (None, exp) for k, exp in (("candidate_sha", candidate_sha), ("base_sha", base_sha), ("tested_sha", rec_tested))):
         return {"status": "stale-qa-evidence", "verified": False, "blockers": ["ci_revalidation revision bindings do not match QA record"]}
+    _chk_ok = lambda x: isinstance(x, dict) and x.get("passed") is True and x.get("executed") is True and x.get("timed_out") is not True and x.get("status") != "invalid-rubric" and type(x.get("exit_code")) is int and x.get("exit_code") == 0 and isinstance(x.get("output_path"), str) and bool(x["output_path"].strip()) and isinstance(x.get("output_sha256"), str) and bool(x["output_sha256"].strip())
     cov_ok = all(
         isinstance(c, dict) and isinstance(c.get("criterion_id"), str) and bool(c["criterion_id"].strip()) and c["criterion_id"] != "CRITERIA-MISSING"
-        and c.get("passed") is True and isinstance(det := c.get("deterministic_check"), dict) and det.get("passed") is True and det.get("executed") is True
-        and det.get("timed_out") is not True and det.get("status") != "invalid-rubric" and isinstance(ecs := c.get("evaluation_cases", []), list)
-        and all(isinstance(ec, dict) and ec.get("passed") is True and ec.get("executed") is True and ec.get("timed_out") is not True and ec.get("status") != "invalid-rubric" for ec in ecs)
+        and c.get("passed") is True and _chk_ok(c.get("deterministic_check")) and isinstance(ecs := c.get("evaluation_cases", []), list) and all(_chk_ok(ec) for ec in ecs)
         for c in cov
     )
     req_cids = {str(cr.get("id") or "AC").strip() for cr in ((child or {}).get("criteria") or ()) if isinstance(cr, dict)} if isinstance(child, dict) else set()
     cov_cids = {c["criterion_id"].strip() for c in cov if isinstance(c, dict) and isinstance(c.get("criterion_id"), str)}
-    reg_ok = qa_record.get("regression_passed") is True and (reg_checks is None or (isinstance(reg_checks, list) and bool(reg_checks) and all(isinstance(rc, dict) and rc.get("passed") is True and rc.get("executed") is True and rc.get("timed_out") is not True for rc in reg_checks)))
+    reg_ok = qa_record.get("regression_passed") is True and isinstance(reg_checks, list) and bool(reg_checks) and all(_chk_ok(rc) for rc in reg_checks)
     findings_ok = isinstance(open_fids, list) and len(open_fids) == 0 and isinstance(findings, list) and all(isinstance(f, dict) and f.get("status") == "resolved" and f.get("resolution_blocker") is None and f.get("latest_candidate_sha", candidate_sha) == candidate_sha for f in findings)
     role_ok = (qa_record.get("role") == "automated-qa" and qa_record.get("status") == "qa-verified" and qa_record.get("qa_verified") is True and ci_reval.get("verified") is True and ci_reval.get("status") in (None, "verified") and not ci_reval.get("blockers")
                and role_sep.get("role") in (None, "automated-qa") and role_sep.get("candidate_modified_by_qa") is False and role_sep.get("worktree_clean") is True and role_sep.get("head_before", candidate_sha) == candidate_sha and role_sep.get("head_after", candidate_sha) == candidate_sha
@@ -189,13 +188,13 @@ def _validate_qa_record(candidate_sha: str, base_sha: str, qa_record: dict[str, 
         return {"status": st, "verified": False, "blockers": [f"automated QA contract not satisfied on {candidate_sha}"]}
     return {"status": "qa-verified", "verified": True, "blockers": []}
 
-def evaluate_upstream_evidence(candidate_sha: str, base_sha: str, qa_record: dict[str, Any] | None, security_record: dict[str, Any] | None, *, home: Path | None = None, repo: Path | None = None, child: dict[str, Any] | None = None, deadline: float | None = None, limit_s: int = 30) -> tuple[dict[str, Any], dict[str, Any], list[dict[str, Any]]]:
+def evaluate_upstream_evidence(candidate_sha: str, base_sha: str, qa_record: dict[str, Any] | None, security_record: dict[str, Any] | None, *, home: Path | None = None, repo: Path | None = None, child: dict[str, Any] | None = None, child_dir: Path | None = None, deadline: float | None = None, limit_s: int = 30) -> tuple[dict[str, Any], dict[str, Any], list[dict[str, Any]]]:
     gaps: list[dict[str, Any]] = []
-    qa_eval = _validate_qa_record(candidate_sha, base_sha, qa_record, repo=repo, child=child, deadline=deadline, limit_s=limit_s)
+    qa_eval = evaluate_qa_prerequisite(candidate_sha, base_sha, qa_record, child_dir=child_dir, home=home, repo=repo, child=child, deadline=deadline, limit_s=limit_s)
     if not qa_eval["verified"]:
         rule = "stale-qa-evidence" if qa_eval["status"] == "stale-qa-evidence" else "qa-evidence-unverified"
         gaps.append(_gap_finding("automated-qa", rule, f"Automated QA evidence gap ({qa_eval['status']})", "; ".join(qa_eval["blockers"]), f"Run automated QA on candidate {candidate_sha} (base {base_sha}) and resolve all QA findings.", "observed-upstream-gate"))
-    sec_eval = security_review.evaluate_security_review_gate(candidate_sha, base_sha, security_record, home=home)
+    sec_eval = evaluate_security_prerequisite(candidate_sha, base_sha, security_record, child_dir=child_dir, home=home)
     if not sec_eval["verified"]:
         rule = "stale-security-evidence" if sec_eval["status"] == "stale-security-review" else "security-evidence-unverified"
         gaps.append(_gap_finding("security-review", rule, f"Security review evidence gap ({sec_eval['status']})", "; ".join(sec_eval["blockers"]), f"Run security review on candidate {candidate_sha} (base {base_sha}) and resolve all security blockers.", "observed-upstream-gate"))
@@ -646,7 +645,7 @@ def review_candidate_independently(*, repo: Path, home: Path, child_dir: Path, c
             diff_text = redact_value(diff_res.output + ("\n" if not diff_res.output.endswith("\n") else ""), secrets)
             diff_path = write_evidence(round_dir, "reviewed-diff", diff_text, home)
             standards = load_project_standards(repo, base_sha, child, conf, deadline, limit_s)
-            qa_eval, sec_eval, upstream_gaps = evaluate_upstream_evidence(resolved_sha, base_sha, qa_record, security_record, home=home, repo=repo, child=child, deadline=deadline, limit_s=limit_s)
+            qa_eval, sec_eval, upstream_gaps = evaluate_upstream_evidence(resolved_sha, base_sha, qa_record, security_record, home=home, repo=repo, child=child, child_dir=child_dir, deadline=deadline, limit_s=limit_s)
 
             role_issues = [f"sandbox or execution unavailable: {sandbox_error}"] if sandbox_error else ([] if probes_ok else ["independent reviewer safety probes failed"])
             if not diff_ok: role_issues.append("failed to produce non-empty exact base-to-candidate diff")
@@ -801,3 +800,15 @@ def main(argv: list[str] | None = None) -> int:
         with tempfile.TemporaryDirectory() as tmp: summary = run_disposable_demo(Path(tmp))
     print(json.dumps(summary, indent=2, sort_keys=True)); print("DEMO_INDEPENDENT_REVIEW_OK")
     return 0
+
+
+from factory.independent_review.approval import (  # noqa: E402
+    APPROVAL_GATE_SCOPE_NOTE,
+    evaluate_approval_gate,
+    evaluate_ci_prerequisite,
+    evaluate_independent_review_prerequisite,
+    evaluate_qa_prerequisite,
+    evaluate_security_prerequisite,
+    load_prerequisite_evidence,
+    verify_candidate_approval,
+)

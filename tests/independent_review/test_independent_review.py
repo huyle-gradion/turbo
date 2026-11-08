@@ -48,24 +48,37 @@ def _make_staged_reviewer_script(*, session_id: str = "ind-rev-1", phase2_sessio
         "    print(json.dumps({'event': 'result', 'result': {'conversation_id': out_sid, 'status': 'SUCCESS', 'response': resp}}))\n"
     )
 
-def _valid_qa_record(candidate_sha: str, base_sha: str, tested_sha: str | None = None) -> dict:
+_LAST_QA_HOME: Path | None = None
+
+def _valid_qa_record(candidate_sha: str, base_sha: str, tested_sha: str | None = None, home: Path | None = None) -> dict:
+    global _LAST_QA_HOME
+    if home is not None: _LAST_QA_HOME = home
     t_sha = tested_sha or candidate_sha
+    r_kind = "fast-forward-head" if t_sha == candidate_sha else "integration-merge"
+    qa_dir = ((home or _LAST_QA_HOME or Path(tempfile.gettempdir())) / "qa-fixture")
+    qa_dir.mkdir(parents=True, exist_ok=True)
+    log_txt = f"candidate_sha={candidate_sha}\nbase_sha={base_sha}\ntested_sha={t_sha}\nrevision_kind={r_kind}\nqa check ok\n"
+    log_p = qa_dir / f"qa-{candidate_sha[:8]}-{t_sha[:8]}.log"
+    log_p.write_text(log_txt, encoding="utf-8")
+    log_sha = runner.digest_text(log_txt)
     return {
-        "schema": 1, "role": "automated-qa", "status": "qa-verified", "qa_verified": True, "candidate_sha": candidate_sha, "base_sha": base_sha, "tested_sha": t_sha,
+        "schema": 1, "role": "automated-qa", "round": 1, "status": "qa-verified", "qa_verified": True, "candidate_sha": candidate_sha, "base_sha": base_sha, "tested_sha": t_sha,
         "ci_revalidation": {"status": "verified", "verified": True, "candidate_sha": candidate_sha, "base_sha": base_sha, "tested_sha": t_sha, "blockers": []},
         "role_separation": {"role": "automated-qa", "head_before": candidate_sha, "head_after": candidate_sha, "worktree_clean": True, "candidate_modified_by_qa": False},
-        "criterion_coverage": [{"criterion_id": "AC-1", "description": "Reject expired auth tokens", "passed": True, "deterministic_check": {"command": "python3 -m unittest -v", "executed": True, "passed": True, "timed_out": False, "exit_code": 0, "status": "passed"}, "evaluation_cases": []}],
-        "regression_checks": [{"id": "gate-2", "kind": "guard", "executed": True, "passed": True, "timed_out": False, "exit_code": 0}],
+        "criterion_coverage": [{"criterion_id": "AC-1", "description": "Reject expired auth tokens", "passed": True, "deterministic_check": {"command": "python3 -m unittest -v", "executed": True, "passed": True, "timed_out": False, "exit_code": 0, "status": "passed", "output_path": str(log_p), "output_sha256": log_sha}, "evaluation_cases": []}],
+        "regression_checks": [{"id": "gate-2", "kind": "guard", "executed": True, "passed": True, "timed_out": False, "exit_code": 0, "output_path": str(log_p), "output_sha256": log_sha}],
         "regression_passed": True, "open_finding_ids": [], "findings": [],
         "parent_acceptance_boundary": {"parent_gid": "900", "parent_accepted": False, "parent_acceptance_status": "pending-human-acceptance"},
     }
 
 def _valid_security_record(candidate_sha: str, base_sha: str, home: Path) -> dict:
+    global _LAST_QA_HOME
+    _LAST_QA_HOME = home
     sec_dir = home / "sec-fixture"; sec_dir.mkdir(parents=True, exist_ok=True)
     out_p, chk_p = sec_dir / "rev-stdout.txt", sec_dir / "chk.txt"
     out_p.write_text("ok\n", encoding="utf-8"); chk_p.write_text("ok\n", encoding="utf-8")
     return {
-        "schema": 1, "role": "security-reviewer", "reviewer_executed": True, "reviewer_session_id": "sec-rev-1", "builder_session_id": "builder-session-1",
+        "schema": 1, "role": "security-reviewer", "round": 1, "reviewer_executed": True, "reviewer_session_id": "sec-rev-1", "builder_session_id": "builder-session-1",
         "role_separation_verified": True, "role_issues": [], "reviewer_stdout_path": str(out_p), "reviewed_revision": candidate_sha, "base_sha": base_sha, "policy_sha": base_sha,
         "inspected_scope": {"changed_paths": ["src/chat_bridge/auth.py", "tests/test_auth.py"], "deterministic_ok": True},
         "applicable_policies": [{"id": "SEC-POL-01", "name": "no-hardcoded-secrets"}], "findings": [], "blocking_findings": [], "non_blocking_suggestions": [], "previous_findings_resolution": [],
@@ -84,7 +97,7 @@ class IndependentReviewTest(unittest.TestCase):
         (repo / "tests/test_auth.py").write_text((repo / "tests/test_auth.py").read_text(encoding="utf-8") + EXPIRED_TEST_APPEND, encoding="utf-8")
         git(repo, "add", "."); git(repo, "commit", "-q", "-m", "feat: validate expired token")
         cand_sha = git(repo, "rev-parse", "HEAD")
-        qa_rec, sec_rec = _valid_qa_record(cand_sha, base_sha), _valid_security_record(cand_sha, base_sha, home)
+        qa_rec, sec_rec = _valid_qa_record(cand_sha, base_sha, home=home), _valid_security_record(cand_sha, base_sha, home)
         good_agy = _make_fake_agy(root, "agy-good", _make_staged_reviewer_script(session_id="fresh-reviewer-99"))
         def run_rev(**overrides):
             kwargs = {"repo": repo, "home": home, "child_dir": child_dir, "child": PARSED_CHILD, "conf": conf, "base_sha": base_sha, "candidate_sha": cand_sha, "builder_session_id": "builder-session-1", "builder_summary": "All checks passed and requirements met.", "qa_record": qa_rec, "security_record": sec_rec, "agy_bin": str(good_agy), "deadline": time.monotonic() + 30.0, "limit_s": 30}
@@ -690,7 +703,7 @@ def run_disposable_demo(tmp: Path) -> dict:
     (repo / "tests/test_auth.py").write_text((repo / "tests/test_auth.py").read_text(encoding="utf-8") + EXPIRED_TEST_APPEND, encoding="utf-8")
     git(repo, "add", "."); git(repo, "commit", "-q", "-m", "feat: validate expired token")
     cand_sha = git(repo, "rev-parse", "HEAD")
-    qa_rec, sec_rec = _valid_qa_record(cand_sha, base_sha), _valid_security_record(cand_sha, base_sha, home)
+    qa_rec, sec_rec = _valid_qa_record(cand_sha, base_sha, home=home), _valid_security_record(cand_sha, base_sha, home)
     good_agy = _make_fake_agy(tmp, "agy-demo-good", _make_staged_reviewer_script(session_id="fresh-reviewer-demo"))
     reused_agy = _make_fake_agy(tmp, "agy-demo-reused", _make_staged_reviewer_script(session_id="builder-demo-1"))
     mut_agy = _make_fake_agy(tmp, "agy-demo-mut", _make_staged_reviewer_script(session_id="fresh-reviewer-mut", mutate_in_phase=2, mutate_kind="unstaged"))
@@ -713,8 +726,20 @@ def run_disposable_demo(tmp: Path) -> dict:
     d2 = _call(2, child_dir=rec_dir, candidate_sha=cand_d2, qa_record=_valid_qa_record(cand_d2, base_sha), security_record=_valid_security_record(cand_d2, base_sha, home), agy_bin=str(agy_d2))
     (repo / "src/chat_bridge/auth.py").write_text(CLEAN_AUTH_PY + "# reconciled-fix\n", encoding="utf-8"); git(repo, "add", "."); git(repo, "commit", "-q", "-m", "demo r3 verified fix")
     cand_d3 = git(repo, "rev-parse", "HEAD")
+    qa_d3, sec_d3 = _valid_qa_record(cand_d3, base_sha), _valid_security_record(cand_d3, base_sha, home)
     agy_d3 = _make_fake_agy(tmp, "agy-d3", _make_staged_reviewer_script(session_id="rev-d3", outcome="review-passed", reconciliations=[{"finding_id": fid_demo, "resolution": "fixed", "evidence": "r3-verified-claim"}]))
-    d3 = _call(3, child_dir=rec_dir, candidate_sha=cand_d3, qa_record=_valid_qa_record(cand_d3, base_sha), security_record=_valid_security_record(cand_d3, base_sha, home), agy_bin=str(agy_d3))
+    d3 = _call(3, child_dir=rec_dir, candidate_sha=cand_d3, qa_record=qa_d3, security_record=sec_d3, agy_bin=str(agy_d3))
+    from tests.independent_review.test_approval_gate import _valid_ci_record
+    ci_d3 = _valid_ci_record(cand_d3, base_sha, home, conf=conf)
+    gate_ok = independent_review.evaluate_approval_gate(candidate_sha=cand_d3, base_sha=base_sha, ci_record=ci_d3, qa_record=qa_d3, security_record=sec_d3, review_record=d3, repo=repo, home=home, child_dir=rec_dir, child=PARSED_CHILD, conf=conf)
+    gate_missing_ci = independent_review.evaluate_approval_gate(candidate_sha=cand_d3, base_sha=base_sha, ci_record=None, qa_record=qa_d3, security_record=sec_d3, review_record=d3, repo=repo, home=home, child_dir=rec_dir, child=PARSED_CHILD, conf=conf)
+    gate_stale_qa = independent_review.evaluate_approval_gate(candidate_sha=cand_d3, base_sha=base_sha, ci_record=ci_d3, qa_record=_valid_qa_record(cand_d2, base_sha), security_record=sec_d3, review_record=d3, repo=repo, home=home, child_dir=rec_dir, child=PARSED_CHILD, conf=conf)
+    (repo / "src/chat_bridge/auth.py").write_text(CLEAN_AUTH_PY + "# reconciled-fix\n# candidate d4\n", encoding="utf-8"); git(repo, "add", "."); git(repo, "commit", "-q", "-m", "demo r4 subsequent candidate")
+    cand_d4 = git(repo, "rev-parse", "HEAD")
+    gate_later_cand = independent_review.verify_candidate_approval(cand_d4, base_sha, gate_ok, repo=repo, home=home)
+    ci_c1 = _valid_ci_record(cand_sha, base_sha, home, conf=conf)
+    gate_part1_mut = independent_review.evaluate_approval_gate(candidate_sha=cand_sha, base_sha=base_sha, ci_record=ci_c1, qa_record=qa_rec, security_record=sec_rec, review_record=r_mutated, repo=repo, home=home, child_dir=child_dir / "gate-mut", child=PARSED_CHILD, conf=conf)
+    gate_part1_self = independent_review.evaluate_approval_gate(candidate_sha=cand_sha, base_sha=base_sha, ci_record=ci_c1, qa_record=qa_rec, security_record=sec_rec, review_record=r_self, repo=repo, home=home, child_dir=child_dir / "gate-self", child=PARSED_CHILD, conf=conf)
     summary = {
         "valid_review": {"outcome": r_valid["outcome"], "review_verified": r_valid["review_verified"], "delivery_approved": r_valid["delivery_approved"], "verification_scope": r_valid["verification_scope"], "ordering_enforced": r_valid["protocol_ordering"]["enforced"], "hypotheses_count": len(r_valid["failure_hypotheses"]), "record_path": str(child_dir / "independent-review-round-1" / "record.json")},
         "self_approval_rejected": {"outcome": r_self["outcome"], "review_verified": r_self["review_verified"]},
@@ -723,6 +748,12 @@ def run_disposable_demo(tmp: Path) -> dict:
         "stale_upstream_rejected": {"outcome": r_stale_up["outcome"], "review_verified": r_stale_up["review_verified"]},
         "reviewer_mutation_rejected": {"outcome": r_mutated["outcome"], "review_verified": r_mutated["review_verified"], "candidate_modified_by_reviewer": r_mutated["worktree_integrity"]["candidate_modified_by_reviewer"], "mutation_evidence_retained": Path(r_mutated["worktree_integrity"]["mutation_evidence_path"]).is_file()},
         "reconciliation_lifecycle": {"round_1_outcome": d1["outcome"], "round_2_ineffective_rejected": d2["outcome"], "round_2_blocker": d2["blocking_findings"][0]["resolution_blocker"], "round_3_reconciled_outcome": d3["outcome"], "round_3_review_verified": d3["review_verified"], "delivery_approved": d3["delivery_approved"], "history_rounds": len(d3["findings"][0]["history"])},
+        "approval_gate": {
+            "qualified_candidate_approved": {"delivery_approved": gate_ok["delivery_approved"], "status": gate_ok["status"], "approved_revision": gate_ok["approved_revision"], "tested_sha": gate_ok["tested_sha"], "revision_kind": gate_ok["revision_kind"], "record_path": str(rec_dir / "approval-gate.json")},
+            "missing_or_stale_prerequisite_rejected": {"ci_missing": {"delivery_approved": gate_missing_ci["delivery_approved"], "status": gate_missing_ci["status"]}, "qa_stale": {"delivery_approved": gate_stale_qa["delivery_approved"], "status": gate_stale_qa["status"]}},
+            "later_candidate_rejects_prior_approval": {"candidate_sha": cand_d4, "prior_approved_revision": gate_Later["stale_approved_revision"] if (gate_Later := gate_later_cand) else None, "delivery_approved": gate_later_cand["delivery_approved"], "approved_revision": gate_later_cand["approved_revision"], "status": gate_later_cand["status"]},
+            "part1_rejection_survives_integrated_gate": {"reviewer_mutation": {"delivery_approved": gate_part1_mut["delivery_approved"], "status": gate_part1_mut["status"]}, "reused_builder_identity": {"delivery_approved": gate_part1_self["delivery_approved"], "status": gate_part1_self["status"]}},
+        },
     }
     assert summary["valid_review"]["outcome"] == "review-passed" and summary["valid_review"]["review_verified"] is True and summary["valid_review"]["delivery_approved"] is False
     assert summary["self_approval_rejected"] == {"outcome": "invalid-review", "review_verified": False}
@@ -731,6 +762,7 @@ def run_disposable_demo(tmp: Path) -> dict:
     assert summary["stale_upstream_rejected"] == {"outcome": "changes-requested", "review_verified": False}
     assert summary["reviewer_mutation_rejected"] == {"outcome": "invalid-review", "review_verified": False, "candidate_modified_by_reviewer": True, "mutation_evidence_retained": True}
     assert summary["reconciliation_lifecycle"] == {"round_1_outcome": "changes-requested", "round_2_ineffective_rejected": "changes-requested", "round_2_blocker": "check-failed", "round_3_reconciled_outcome": "review-passed", "round_3_review_verified": True, "delivery_approved": False, "history_rounds": 3}
+    assert gate_ok["delivery_approved"] is True and gate_ok["approved_revision"] == cand_d3 and not gate_missing_ci["delivery_approved"] and not gate_stale_qa["delivery_approved"] and not gate_later_cand["delivery_approved"] and not gate_part1_mut["delivery_approved"] and not gate_part1_self["delivery_approved"]
     return summary
 
 if __name__ == "__main__":
