@@ -11,8 +11,9 @@ import unittest
 
 from factory.errors import UsageError
 from factory.improvement import (
-    AUTHORITY_NOTE, create_proposal, evaluate_proposal, main as improvement_main,
-    proposal_digest, validate_proposal, validate_report_for_review,
+    AUTHORITY_NOTE, canonicalize_draft_references, create_proposal, evaluate_proposal,
+    main as improvement_main, proposal_digest, validate_proposal, validate_proposal_structure,
+    validate_report_for_review,
 )
 from factory.worker import RateCard
 
@@ -364,6 +365,355 @@ class ImprovementWorkflowTest(unittest.TestCase):
             )
             report = evaluate_proposal(prop, root / "ev_nested")
             self.assertEqual(report["eligibility"], "improvement-eligible")
+
+    def test_group2_draft_references_canonicalized_before_persistence(self) -> None:
+        import subprocess, sys
+        from factory.improvement import FACTORY_ROOT
+        env = dict(os.environ)
+        env["PYTHONPATH"] = str(FACTORY_ROOT)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            draft_dir = root / "draft_dir"
+            draft_dir.mkdir()
+            obs = _write_file(draft_dir / "evidence" / "failure.txt", "failure\n")
+            cand = _write_file(draft_dir / "content" / "cand.py", "def check(): return 'improved'\n")
+            inp_file = _write_file(draft_dir / "inputs" / "data.txt", "payload\n")
+
+            f_sha = hashlib.sha256(obs.read_bytes()).hexdigest()
+            c_sha = hashlib.sha256(cand.read_bytes()).hexdigest()
+            i_sha = hashlib.sha256(inp_file.read_bytes()).hexdigest()
+
+            imp_case = {
+                "case_id": "IMP-01",
+                "command": "python3 -c \"import sys, pathlib; p = pathlib.Path('target.py'); sys.exit(0 if (p.exists() and 'improved' in p.read_text()) else 1)\"",
+                "rubric": {"rubric_id": "R1", "expected_exit_code": 0, "required_output_tokens": [], "forbidden_output_tokens": []},
+                "inputs": [{"path": "inputs/data.txt", "target_path": "staged/data.txt", "sha256": i_sha}],
+            }
+            reg_case = {
+                "case_id": "REG-01",
+                "command": "python3 -c \"import sys; sys.exit(0)\"",
+                "rubric": {"rubric_id": "R2", "expected_exit_code": 0, "required_output_tokens": [], "forbidden_output_tokens": []},
+            }
+            draft = {
+                "schema_version": 1, "proposal_id": "prop-group2",
+                "observed_failure": {"description": "f", "artifacts": [{"path": "evidence/failure.txt", "sha256": f_sha}]},
+                "proposed_change": {"kind": "check", "target_path": "target.py", "content_path": "content/cand.py", "content_sha256": c_sha},
+                "baseline": {"identity": "b1"}, "candidate": {"identity": "c1", "content_sha256": c_sha},
+                "expected_improvement": {"description": "exp", "rule": "baseline-failed-candidate-passed"},
+                "improvement_cases": [imp_case], "regression_cases": [reg_case],
+                "execution_conditions": {
+                    "time_limit_seconds": 30, "allow_network": False, "env_sanitized": True,
+                    "permitted_substitution": {"target_path": "target.py", "content_sha256": c_sha},
+                },
+            }
+            draft_p = _write_file(draft_dir / "draft.json", json.dumps(draft))
+
+            out_proposal = root / "elsewhere" / "proposal.json"
+            outside_dir = root / "outside"
+            outside_dir.mkdir()
+
+            res = subprocess.run(
+                [sys.executable, "-m", "factory.improvement", "create-proposal", "--out", str(out_proposal), "--from-file", str(draft_p)],
+                cwd=outside_dir, capture_output=True, text=True, env=env,
+            )
+            self.assertEqual(res.returncode, 0, res.stderr)
+            saved = json.loads(out_proposal.read_text(encoding="utf-8"))
+            self.assertEqual(saved["proposed_change"]["content_path"], str(cand.resolve()))
+            self.assertEqual(saved["observed_failure"]["artifacts"][0]["path"], str(obs.resolve()))
+            self.assertEqual(saved["improvement_cases"][0]["inputs"][0]["path"], str(inp_file.resolve()))
+            self.assertEqual(saved["improvement_cases"][0]["inputs"][0]["target_path"], "staged/data.txt")
+
+            third_dir = root / "third"
+            third_dir.mkdir()
+            eval_res = subprocess.run(
+                [sys.executable, "-m", "factory.improvement", "evaluate", "--proposal", str(out_proposal), "--evidence-dir", str(root / "ev")],
+                cwd=third_dir, capture_output=True, text=True, env=env,
+            )
+            self.assertEqual(eval_res.returncode, 0, eval_res.stderr)
+
+    def test_group2_rejects_wrong_hashes_without_recomputing(self) -> None:
+        import subprocess, sys
+        from factory.improvement import FACTORY_ROOT
+        env = dict(os.environ)
+        env["PYTHONPATH"] = str(FACTORY_ROOT)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            draft_dir = root / "draft_dir"
+            draft_dir.mkdir()
+            obs = _write_file(draft_dir / "evidence" / "failure.txt", "failure\n")
+            cand = _write_file(draft_dir / "content" / "cand.py", "cand\n")
+            inp_file = _write_file(draft_dir / "inputs" / "data.txt", "data\n")
+
+            f_sha = hashlib.sha256(obs.read_bytes()).hexdigest()
+            c_sha = hashlib.sha256(cand.read_bytes()).hexdigest()
+            i_sha = hashlib.sha256(inp_file.read_bytes()).hexdigest()
+
+            for bad_field in ("artifact", "content", "input"):
+                with self.subTest(bad_field=bad_field):
+                    draft = {
+                        "schema_version": 1, "proposal_id": f"prop-bad-{bad_field}",
+                        "observed_failure": {"description": "f", "artifacts": [{"path": "evidence/failure.txt", "sha256": ("badsha" if bad_field == "artifact" else f_sha)}]},
+                        "proposed_change": {"kind": "check", "target_path": "target.py", "content_path": "content/cand.py", "content_sha256": ("badsha" if bad_field == "content" else c_sha)},
+                        "baseline": {"identity": "b1"}, "candidate": {"identity": "c1", "content_sha256": ("badsha" if bad_field == "content" else c_sha)},
+                        "expected_improvement": {"description": "exp", "rule": "baseline-failed-candidate-passed"},
+                        "improvement_cases": [{
+                            "case_id": "IMP-01", "command": "python3 -c \"import sys; sys.exit(0)\"",
+                            "rubric": {"rubric_id": "R1", "expected_exit_code": 0, "required_output_tokens": [], "forbidden_output_tokens": []},
+                            "inputs": [{"path": "inputs/data.txt", "target_path": "staged/data.txt", "sha256": ("badsha" if bad_field == "input" else i_sha)}],
+                        }],
+                        "regression_cases": [{
+                            "case_id": "REG-01", "command": "python3 -c \"import sys; sys.exit(0)\"",
+                            "rubric": {"rubric_id": "R2", "expected_exit_code": 0, "required_output_tokens": [], "forbidden_output_tokens": []},
+                        }],
+                        "execution_conditions": {
+                            "time_limit_seconds": 30, "allow_network": False, "env_sanitized": True,
+                            "permitted_substitution": {"target_path": "target.py", "content_sha256": ("badsha" if bad_field == "content" else c_sha)},
+                        },
+                    }
+                    draft_p = _write_file(draft_dir / f"draft_{bad_field}.json", json.dumps(draft))
+                    out_p = root / f"out_{bad_field}.json"
+                    res = subprocess.run(
+                        [sys.executable, "-m", "factory.improvement", "create-proposal", "--out", str(out_p), "--from-file", str(draft_p)],
+                        cwd=root, capture_output=True, text=True, env=env,
+                    )
+                    self.assertEqual(res.returncode, 1)
+                    self.assertFalse(out_p.exists())
+
+    def test_group3_report_validation_acceptance_and_mutations(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            obs, cand, imp, reg = _sample_fixtures(root)
+            prop = create_proposal(
+                proposal_id="prop-g3", failure_description="f", failure_artifacts=[{"path": str(obs)}],
+                kind="check", target_path="target.py", content_path=cand, baseline_identity="b1",
+                candidate_identity="c1", expected_improvement_description="exp",
+                improvement_cases=[imp], regression_cases=[reg],
+            )
+            report = evaluate_proposal(prop, root / "ev_g3")
+
+            # 1. Genuine eligible report accepted
+            self.assertEqual(validate_report_for_review(report), [])
+            prop_str = json.dumps(prop, indent=2, sort_keys=True) + "\n"
+            self.assertEqual(validate_report_for_review(report, proposal_json=prop_str), [])
+
+            # 2. Retained-report validation passes without external files
+            obs.unlink()
+            cand.unlink()
+            self.assertFalse(obs.exists())
+            self.assertFalse(cand.exists())
+            self.assertEqual(validate_report_for_review(report), [])
+
+            # 3. Genuine ineligible record accepted as valid record
+            cand_inel = _write_file(root / "cand_inel.py", "def check(): return 'improved'\n")
+            obs_inel = _write_file(root / "obs_inel.txt", "err\n")
+            failing_reg = {
+                "case_id": "REG-FAIL", "description": "Fails", "command": "python3 -c \"import sys; sys.exit(1)\"",
+                "rubric": {"rubric_id": "R-FAIL", "expected_exit_code": 0, "required_output_tokens": [], "forbidden_output_tokens": []},
+            }
+            prop_inel = create_proposal(
+                proposal_id="prop-inel", failure_description="f", failure_artifacts=[{"path": str(obs_inel)}],
+                kind="check", target_path="target.py", content_path=cand_inel, baseline_identity="b1",
+                candidate_identity="c1", expected_improvement_description="exp",
+                improvement_cases=[imp], regression_cases=[failing_reg],
+            )
+            rep_inel = evaluate_proposal(prop_inel, root / "ev_inel")
+            self.assertEqual(rep_inel["eligibility"], "ineligible")
+            self.assertEqual(validate_report_for_review(rep_inel), [])
+
+            # 4. Table-driven mutations rejected
+            def mut_cand_digest(r: dict) -> tuple[dict, str | None]:
+                r["candidate_content_digest"] = "bad" * 8
+                return r, None
+
+            def mut_embedded_prop(r: dict) -> tuple[dict, str | None]:
+                r["proposal"]["proposal_id"] = "tampered"
+                return r, None
+
+            def mut_ext_binding(r: dict) -> tuple[dict, str | None]:
+                return r, json.dumps({"schema_version": 1, "proposal_id": "different"}, indent=2) + "\n"
+
+            def mut_unknown_eligibility(r: dict) -> tuple[dict, str | None]:
+                r["eligibility"] = "approved"
+                return r, None
+
+            def mut_empty_regressions(r: dict) -> tuple[dict, str | None]:
+                r["candidate_results"]["regression_cases"] = []
+                return r, None
+
+            def mut_mismatched_case_id(r: dict) -> tuple[dict, str | None]:
+                r["candidate_results"]["improvement_cases"][0]["case_id"] = "OTHER-01"
+                return r, None
+
+            def mut_mismatched_rubric(r: dict) -> tuple[dict, str | None]:
+                r["candidate_results"]["improvement_cases"][0]["rubric"]["expected_exit_code"] = 99
+                return r, None
+
+            def mut_contradicting_outcomes(r: dict) -> tuple[dict, str | None]:
+                r["candidate_results"]["improvement_cases"][0]["rubric_passed"] = False
+                r["candidate_results"]["improvement_cases"][0]["rubric_failures"] = ["failed"]
+                return r, None
+
+            def mut_malformed_comp(r: dict) -> tuple[dict, str | None]:
+                r["comparison"] = "not_a_dict"
+                return r, None
+
+            def mut_malformed_results(r: dict) -> tuple[dict, str | None]:
+                r["baseline_results"] = None
+                return r, None
+
+            def mut_malformed_prop(r: dict) -> tuple[dict, str | None]:
+                r["proposal"] = 123
+                return r, None
+
+            mutations = [
+                ("candidate_digest", mut_cand_digest),
+                ("embedded_prop_without_digest", mut_embedded_prop),
+                ("ext_proposal_binding", mut_ext_binding),
+                ("unknown_eligibility", mut_unknown_eligibility),
+                ("empty_regressions", mut_empty_regressions),
+                ("mismatched_case_id", mut_mismatched_case_id),
+                ("mismatched_rubric", mut_mismatched_rubric),
+                ("contradicting_raw_outcomes", mut_contradicting_outcomes),
+                ("malformed_comparison", mut_malformed_comp),
+                ("malformed_results", mut_malformed_results),
+                ("malformed_proposal", mut_malformed_prop),
+            ]
+
+            for label, mutator in mutations:
+                with self.subTest(mutation=label):
+                    clone = json.loads(json.dumps(report))
+                    mutated, ext_json = mutator(clone)
+                    issues = validate_report_for_review(mutated, proposal_json=ext_json)
+                    self.assertIsInstance(issues, list)
+                    self.assertGreater(len(issues), 0, f"Mutation {label!r} was unexpectedly accepted")
+
+    def test_group_a_malformed_structures_and_shared_validation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            obs, cand, imp, reg = _sample_fixtures(root)
+            prop = create_proposal(
+                proposal_id="prop-ga", failure_description="f", failure_artifacts=[{"path": str(obs)}],
+                kind="check", target_path="target.py", content_path=cand, baseline_identity="b1",
+                candidate_identity="c1", expected_improvement_description="exp",
+                improvement_cases=[imp], regression_cases=[reg],
+            )
+            report = evaluate_proposal(prop, root / "ev_ga")
+
+            # 1. Non-dict baseline/candidate mutations
+            for bad_obj in ("string", None, 123, []):
+                for key in ("baseline", "candidate"):
+                    with self.subTest(key=key, bad_obj=bad_obj):
+                        clone = json.loads(json.dumps(report))
+                        clone["proposal"][key] = bad_obj
+                        clone["proposal_digest"] = proposal_digest(clone["proposal"])
+                        issues = validate_report_for_review(clone)
+                        self.assertIsInstance(issues, list)
+                        self.assertGreater(len(issues), 0)
+
+            # 2. List/dict unhashable case_ids in results and proposal
+            for unhashable_id in (["IMP-01"], {"id": "IMP-01"}):
+                with self.subTest(unhashable_result_id=unhashable_id):
+                    clone = json.loads(json.dumps(report))
+                    clone["candidate_results"]["improvement_cases"][0]["case_id"] = unhashable_id
+                    issues = validate_report_for_review(clone)
+                    self.assertIsInstance(issues, list)
+                    self.assertGreater(len(issues), 0)
+                with self.subTest(unhashable_proposal_id=unhashable_id):
+                    clone = json.loads(json.dumps(report))
+                    clone["proposal"]["improvement_cases"][0]["case_id"] = unhashable_id
+                    clone["proposal_digest"] = proposal_digest(clone["proposal"])
+                    issues = validate_report_for_review(clone)
+                    self.assertIsInstance(issues, list)
+                    self.assertGreater(len(issues), 0)
+
+            # 3. Missing/non-list rubric_failures
+            for bad_rf in (True, 1, 0, False, None, "str", {"err": 1}):
+                with self.subTest(bad_rubric_failures=bad_rf):
+                    clone = json.loads(json.dumps(report))
+                    clone["candidate_results"]["improvement_cases"][0]["rubric_failures"] = bad_rf
+                    issues = validate_report_for_review(clone)
+                    self.assertIsInstance(issues, list)
+                    self.assertGreater(len(issues), 0)
+
+            # 4. Rebound embedded proposals with weakened/unexecutable commands, boolean exit code, non-string tokens
+            rebound_mutations = [
+                ("weakened_cmd", lambda p: p["improvement_cases"][0].update({"command": "python3 -m unittest -k 'not slow'"})),
+                ("unexecutable_cmd", lambda p: p["improvement_cases"][0].update({"command": "echo 'unclosed quote"})),
+                ("bool_exit_code", lambda p: p["improvement_cases"][0]["rubric"].update({"expected_exit_code": True})),
+                ("non_str_tokens", lambda p: p["improvement_cases"][0]["rubric"].update({"required_output_tokens": [123]})),
+            ]
+            for label, mut_fn in rebound_mutations:
+                with self.subTest(rebound_label=label):
+                    clone = json.loads(json.dumps(report))
+                    mut_fn(clone["proposal"])
+                    clone["proposal_digest"] = proposal_digest(clone["proposal"])
+                    # Keep results rubric aligned if rubric was modified
+                    clone["candidate_results"]["improvement_cases"][0]["rubric"] = dict(clone["proposal"]["improvement_cases"][0]["rubric"])
+                    clone["baseline_results"]["improvement_cases"][0]["rubric"] = dict(clone["proposal"]["improvement_cases"][0]["rubric"])
+                    issues = validate_report_for_review(clone)
+                    self.assertIsInstance(issues, list)
+                    self.assertGreater(len(issues), 0, f"Expected {label!r} to be rejected")
+
+    def test_group_b_candidate_launch_failures_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            obs, cand, imp, reg = _sample_fixtures(root)
+
+            # 1. Candidate regression commands exiting 124, 126, 127 with rubrics expecting those codes
+            for code in (124, 126, 127):
+                with self.subTest(candidate_reg_exit=code):
+                    reg_launch = {
+                        "case_id": f"REG-LAUNCH-{code}", "description": "Launch fail regression",
+                        "command": f"python3 -c \"import sys; sys.exit({code})\"",
+                        "rubric": {"rubric_id": f"R-REG-{code}", "expected_exit_code": code, "required_output_tokens": [], "forbidden_output_tokens": []},
+                    }
+                    prop = create_proposal(
+                        proposal_id=f"prop-reg-code-{code}", failure_description="f", failure_artifacts=[{"path": str(obs)}],
+                        kind="check", target_path="target.py", content_path=cand, baseline_identity="b1",
+                        candidate_identity="c1", expected_improvement_description="exp",
+                        improvement_cases=[imp], regression_cases=[reg_launch],
+                    )
+                    rep = evaluate_proposal(prop, root / f"ev_reg_{code}")
+                    self.assertEqual(rep["eligibility"], "ineligible")
+                    self.assertFalse(rep["comparison"]["candidate_regressions_passed"])
+                    self.assertFalse(rep["comparison"]["rule_satisfied"])
+                    self.assertEqual(validate_report_for_review(rep), [])
+
+                    # Forged report claiming eligibility must be rejected by review
+                    forged = json.loads(json.dumps(rep))
+                    forged["eligibility"] = "improvement-eligible"
+                    forged["comparison"]["candidate_regressions_passed"] = True
+                    forged["comparison"]["rule_satisfied"] = True
+                    forged["eligibility_reasons"] = []
+                    self.assertGreater(len(validate_report_for_review(forged)), 0)
+
+            # 2. Candidate improvement command exiting 124, 126, 127
+            for code in (124, 126, 127):
+                with self.subTest(candidate_imp_exit=code):
+                    imp_launch = {
+                        "case_id": f"IMP-LAUNCH-{code}", "description": "Candidate launch fail",
+                        "command": f"python3 -c \"import sys, pathlib; p = pathlib.Path('target.py'); sys.exit({code} if (p.exists() and 'improved' in p.read_text()) else 1)\"",
+                        "rubric": {"rubric_id": f"R-IMP-{code}", "expected_exit_code": code, "required_output_tokens": [], "forbidden_output_tokens": []},
+                    }
+                    prop = create_proposal(
+                        proposal_id=f"prop-imp-code-{code}", failure_description="f", failure_artifacts=[{"path": str(obs)}],
+                        kind="check", target_path="target.py", content_path=cand, baseline_identity="b1",
+                        candidate_identity="c1", expected_improvement_description="exp",
+                        improvement_cases=[imp_launch], regression_cases=[reg],
+                    )
+                    rep = evaluate_proposal(prop, root / f"ev_imp_{code}")
+                    self.assertEqual(rep["eligibility"], "ineligible")
+                    self.assertFalse(rep["comparison"]["candidate_demonstrated_success"])
+                    self.assertFalse(rep["comparison"]["rule_satisfied"])
+                    self.assertEqual(validate_report_for_review(rep), [])
+
+                    # Forged report claiming candidate_demonstrated_success must be rejected
+                    forged = json.loads(json.dumps(rep))
+                    forged["eligibility"] = "improvement-eligible"
+                    forged["comparison"]["candidate_demonstrated_success"] = True
+                    forged["comparison"]["rule_satisfied"] = True
+                    forged["eligibility_reasons"] = []
+                    self.assertGreater(len(validate_report_for_review(forged)), 0)
 
 
 
