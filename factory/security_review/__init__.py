@@ -528,8 +528,8 @@ def evaluate_security_review_gate(
             or not rev_out.is_file() or (home is not None and not rev_out.resolve().is_relative_to(home.resolve()))):
         return _fail("security-review-missing", list(security_review_record.get("role_issues") or ["missing actual security-reviewer execution evidence"]), raw_b, raw_s)
     if (security_review_record.get("role") != "security-reviewer" or not bool(security_review_record.get("role_separation_verified"))
-            or bool(security_review_record.get("role_issues")) or not b_sid or r_sid == b_sid
-            or (rec_bsid and r_sid == rec_bsid) or (auth_bsid and r_sid == auth_bsid)
+            or bool(security_review_record.get("role_issues")) or (b_sid and r_sid == b_sid)
+            or (rec_bsid and r_sid == rec_bsid) or (auth_bsid and r_sid == auth_bsid) or (auth_bsid and rec_bsid and auth_bsid != rec_bsid)
             or not worker_module.probes_passed(((security_review_record.get("safety") or {}).get("probes")) or [])):
         return _fail("security-review-invalid", list(security_review_record.get("role_issues") or ["security reviewer role separation or safety probes not verified"]), raw_b, raw_s)
     rev_sha, rec_base, rec_pol = (str(security_review_record.get(k) or "").strip() for k in ("reviewed_revision", "base_sha", "policy_sha"))
