@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
-import json, os, shutil, sys, time, unittest.mock
+import copy, json, os, shutil, sys, time, unittest.mock
 from pathlib import Path
 from typing import Any
 
@@ -50,8 +50,8 @@ class DeliveryContext:
             shutil.rmtree(self.child_dir)
         shutil.copytree(self.backup_child_dir, self.child_dir)
         (self.child_dir / "approval-gate.json").unlink(missing_ok=True)
-        atomic_json(self.att_dir / "record.json", self.valid_snapshots["att_record"], self.home)
-        atomic_json(self.home / "deliveries" / "900" / "record.json", self.valid_snapshots["att_record"], self.home)
+        atomic_json(self.att_dir / "record.json", copy.deepcopy(self.valid_snapshots["att_record"]), self.home)
+        atomic_json(self.home / "deliveries" / "900" / "record.json", copy.deepcopy(self.valid_snapshots["att_record"]), self.home)
 
 
 @contextmanager
@@ -120,7 +120,7 @@ def setup_disposable_delivery_context(root: Path):
             "qa_summary": read_json(child_dir / "automated-qa" / "record.json", home),
             "sec": read_json(child_dir / "security-review.json", home),
             "ir": read_json(child_dir / "independent-review.json", home),
-            "att_record": read_json(att_dir / "record.json", home),
+            "att_record": copy.deepcopy(read_json(att_dir / "record.json", home)),
         }
 
         ctx = DeliveryContext(

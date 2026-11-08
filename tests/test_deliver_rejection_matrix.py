@@ -1,7 +1,7 @@
 """Tests proving the delivery rejection matrix and exact-candidate control (Issue #62 AC1)."""
 from __future__ import annotations
 
-import json, os, shutil, tempfile, time, unittest
+import copy, json, os, shutil, tempfile, time, unittest
 from pathlib import Path
 
 from factory import deliver as deliver_module
@@ -44,19 +44,15 @@ class DeliveryRejectionMatrixTest(unittest.TestCase):
                 stale_sha = "0" * 40
 
                 matrix_cases = [
-                    # CI cases
                     ("ci-missing", "ci", "missing", "ci-missing", "missing CI verification"),
                     ("ci-failing", "ci", "failing", "ci-failed", "failed"),
                     ("ci-stale", "ci", "stale", "stale-ci-evidence", "stale CI"),
-                    # QA cases
                     ("qa-missing", "qa", "missing", "qa-missing", "missing automated QA"),
                     ("qa-failing", "qa", "failing", "qa-failed", "QA"),
                     ("qa-stale", "qa", "stale", "stale-qa-evidence", "stale"),
-                    # Security cases
                     ("security-missing", "security", "missing", "security-review-missing", "security"),
                     ("security-failing", "security", "failing", "security-blockers-unresolved", "security"),
                     ("security-stale", "security", "stale", "stale-security-review", "stale"),
-                    # Independent review cases
                     ("review-missing", "independent_review", "missing", "independent-review-missing", "independent review"),
                     ("review-failing", "independent_review", "failing", "changes-requested", "REV-1"),
                     ("review-stale", "independent_review", "stale", "stale-independent-review", "stale"),
@@ -72,7 +68,7 @@ class DeliveryRejectionMatrixTest(unittest.TestCase):
                         if prereq == "ci":
                             if mode == "missing":
                                 (ctx.child_dir / "ci-verification.json").unlink(missing_ok=True)
-                                att_rec = dict(ctx.valid_snapshots["att_record"])
+                                att_rec = copy.deepcopy(ctx.valid_snapshots["att_record"])
                                 att_rec["child"]["ci_verification"] = None
                                 atomic_json(ctx.att_dir / "record.json", att_rec, ctx.home)
                             elif mode == "failing":
@@ -151,6 +147,15 @@ class DeliveryRejectionMatrixTest(unittest.TestCase):
                         self.assertFalse(att_rec["child"].get("verified"), f"child verified should be False for {label}")
                         self.assertFalse(att_rec["child"]["pr"].get("delivery_approved"), f"PR delivery_approved should be False for {label}")
                         self.assertFalse(att_rec["child"]["pr"].get("verified"), f"PR verified should be False for {label}")
+
+                        if label == "ci-missing":
+                            self.assertIsNotNone(ctx.valid_snapshots["att_record"]["child"].get("ci_verification"))
+                            ctx.restore_valid_evidence()
+                            restored_att = json.loads((ctx.att_dir / "record.json").read_text(encoding="utf-8"))
+                            self.assertIsNotNone(restored_att["child"].get("ci_verification"))
+                            r_recheck = deliver_module.deliver_feature(ctx.paths, ctx.spec)
+                            self.assertTrue(r_recheck.delivery_approved)
+                            self.assertEqual(r_recheck.approved_revision, ctx.cand_sha)
 
 
 
