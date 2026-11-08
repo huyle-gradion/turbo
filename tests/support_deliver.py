@@ -57,6 +57,8 @@ class DeliveryContext:
         b_branch = str(self.intake_rec["parent"]["target_feature_branch"])
         git(self.bare, "branch", "-f", b_branch, self.base_sha)
         git(self.bare, "branch", "-f", self.head_branch, self.cand_sha)
+        git(self.repo, "branch", "-f", b_branch, self.base_sha)
+        git(self.repo, "branch", "-f", self.head_branch, self.cand_sha)
         git(self.repo, "fetch", "origin")
         if 1 in self.gh.pulls:
             self.gh.pulls[1]["state"] = "open"
