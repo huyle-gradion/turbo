@@ -312,8 +312,8 @@ class _DisposableGitHubServer:
                 for key, val in outer.verify_override.items():
                     if key in ("head_ref", "head_sha"):
                         pr_obj["head"][key.split("_", 1)[1]] = val
-                    elif key == "base_ref":
-                        pr_obj["base"]["ref"] = val
+                    elif key in ("base_ref", "base_sha"):
+                        pr_obj["base"][key.split("_", 1)[1]] = val
                     elif key == "repo_full_name":
                         pr_obj["base"]["repo"]["full_name"] = val
                     elif key == "head_repo_full_name":

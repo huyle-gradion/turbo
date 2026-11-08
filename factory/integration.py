@@ -112,7 +112,9 @@ def integrate_approved_child(
                 "blockers": list(blockers), "trace": trace, "recorded_at": approval_mod.now(),
             }, secrets)
             try: atomic_json(rec_p, rec_data, home); rec_path = str(rec_p)
-            except Exception: pass
+            except Exception as exc:
+                blockers.append(str(approval_mod.redact_value(f"failed to persist integration record: {exc}", secrets)))
+                rec_path = None
         return _make(st, "rejected", req_p=req_p, rec_p=rec_path)
 
     # 1. Target validation (AC7)
@@ -277,6 +279,8 @@ def integrate_approved_child(
             "blockers": list(blockers), "trace": trace, "recorded_at": approval_mod.now(),
         }, secrets)
         try: atomic_json(rec_p, rec_data, home); rec_path_str = str(rec_p)
-        except Exception: pass
+        except Exception as exc:
+            blockers.append(str(approval_mod.redact_value(f"failed to persist integration record: {exc}", secrets)))
+            rec_path_str = None
 
     return _make(status, outcome, landed=landed_sha, req_p=req_path_str, rec_p=rec_path_str)

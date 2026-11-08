@@ -213,3 +213,42 @@ class IntegrationBehaviorTest(unittest.TestCase):
                 enc_pct_url = f"{ctx.gh.base_url}/repos/example/chat-bridge/branches/{quote(pct_branch, safe='')}/protection"
                 with urllib.request.urlopen(urllib.request.Request(enc_pct_url, headers={"Authorization": "Bearer token"})) as resp:
                     self.assertEqual(resp.status, 200)
+
+    def test_result_persistence_failure_handling(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_str:
+            with setup_disposable_delivery_context(Path(tmp_str)) as ctx:
+                gate, b_branch = self._setup_ctx(ctx)
+                (ctx.child_dir / "integration-record.json").mkdir(parents=True, exist_ok=True)
+                res = self._call(ctx, gate, b_branch)
+                self.assertEqual((res.status, res.outcome), ("confirmed", "confirmed"))
+                self.assertIsNotNone(res.landed_sha)
+                self.assertIsNone(res.record_path)
+                self.assertIsNotNone(res.request_path)
+                self.assertTrue(any("failed to persist integration record" in b for b in res.blockers))
+
+                early_dir = ctx.att_dir / "children" / "early"
+                early_dir.mkdir(parents=True, exist_ok=True)
+                (early_dir / "integration-record.json").mkdir(parents=True, exist_ok=True)
+                res_e = self._call(ctx, gate, b_branch, child_dir=early_dir, pr_number=999)
+                self.assertEqual((res_e.status, res_e.outcome), ("pr-not-found", "rejected"))
+                self.assertIsNone(res_e.record_path)
+                self.assertTrue(any("failed to persist integration record" in b for b in res_e.blockers))
+
+    def test_separate_provider_and_remote_git_base_drift_with_genuine_approval(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_str:
+            with setup_disposable_delivery_context(Path(tmp_str)) as ctx:
+                gate, b_branch = self._setup_ctx(ctx)
+                drifted_sha = "d" * 40
+                ctx.gh.verify_override = {"base_sha": drifted_sha}
+                res_p = self._call(ctx, gate, b_branch)
+                self.assertEqual(res_p.status, "stale-base-revision")
+                self.assertTrue(any(f"PR #1 base SHA {drifted_sha}" in b for b in res_p.blockers))
+                self.assertEqual(len([r for r in ctx.gh.requests if r["method"] == "PUT"]), 0)
+
+                ctx.gh.verify_override = {"base_sha": ctx.base_sha}
+                new_b = git(ctx.bare, "-c", "user.name=CI", "-c", "user.email=ci@test", "commit-tree", f"{ctx.base_sha}^{{tree}}", "-p", ctx.base_sha, "-m", "Remote drift")
+                git(ctx.bare, "update-ref", f"refs/heads/{b_branch}", new_b, ctx.base_sha)
+                res_r = self._call(ctx, gate, b_branch)
+                self.assertEqual(res_r.status, "stale-base-revision")
+                self.assertTrue(any(f"remote origin/{b_branch} ({new_b})" in b for b in res_r.blockers))
+                self.assertEqual(len([r for r in ctx.gh.requests if r["method"] == "PUT"]), 0)
