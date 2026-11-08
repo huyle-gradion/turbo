@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-import json, math, os, re, shutil, time
+import hashlib, json, math, os, re, shutil, subprocess, sys, time
 from pathlib import Path
 from typing import Any
 
@@ -29,6 +29,10 @@ class DeliverSpec:
     time_limit_seconds: int
     agy_bin: str = "agy"
     rates: worker_module.RateCard | None = None
+    policy_report: str | Path | dict[str, Any] | None = None
+    policy_proof: str | Path | dict[str, Any] | None = None
+    policy_proposal: str | Path | dict[str, Any] | None = None
+    policy_repo: str | Path | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,6 +62,7 @@ class DeliverResult:
     tested_sha: str | None = None
     revision_kind: str | None = None
     approval: dict[str, Any] | None = None
+    policy_consumption: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -112,12 +117,21 @@ def _ensure_feature_branch(repo: Path, feature_branch: str, deadline: float, lim
     return base_sha, []
 
 
-def _build_worker_prompt(parent: dict[str, Any], child: dict[str, Any], feature_branch: str) -> str:
+def _build_worker_prompt(
+    parent: dict[str, Any],
+    child: dict[str, Any],
+    feature_branch: str,
+    approved_lessons: tuple[tuple[str, str], ...] = (),
+) -> str:
     criteria_lines = "\n".join(
         f"- {c['id']}: {c['description']} (Verification: {c['verification']})"
         for c in (child.get("criteria") or [])
     )
     scope = child.get("scope") or {}
+    lessons_section = ""
+    if approved_lessons:
+        lesson_blocks = [f"- {path}:\n{text.strip()}" for path, text in approved_lessons]
+        lessons_section = "\nApproved factory lessons:\n" + "\n".join(lesson_blocks) + "\n"
     return (
         f"Implement prepared Asana sub-task {child['gid']} ({child['name']}) "
         f"for parent feature {parent['gid']} ({parent['name']}).\n"
@@ -127,9 +141,71 @@ def _build_worker_prompt(parent: dict[str, Any], child: dict[str, Any], feature_
         f"Out of scope: {scope.get('out_of_scope') or 'none'}\n"
         f"Constraints: {scope.get('constraints') or 'none'}\n"
         f"Acceptance criteria:\n{criteria_lines}\n"
+        f"{lessons_section}"
         "Implement the bounded change and relevant tests within scope, run verification checks, "
         "and commit your changes to the current worktree HEAD. Do not push or touch main.\n"
     )
+
+
+def resolve_delivery_policy(spec: DeliverSpec, factory_root: Path) -> tuple[Any, list[str]]:
+    if spec.policy_report is None and spec.policy_proof is None:
+        return None, []
+    if spec.policy_report is None or spec.policy_proof is None:
+        return None, ["approved policy selection requires both policy report and approval proof"]
+    try:
+        report_data = spec.policy_report if isinstance(spec.policy_report, dict) else json.loads(Path(spec.policy_report).read_text(encoding="utf-8"))
+    except Exception as exc:
+        return None, [f"failed to read policy report: {exc}"]
+    try:
+        proof_data = spec.policy_proof if isinstance(spec.policy_proof, dict) else json.loads(Path(spec.policy_proof).read_text(encoding="utf-8"))
+    except Exception as exc:
+        return None, [f"failed to read policy proof: {exc}"]
+    prop_data = None
+    if spec.policy_proposal is not None:
+        try:
+            prop_data = spec.policy_proposal if isinstance(spec.policy_proposal, dict) else json.loads(Path(spec.policy_proposal).read_text(encoding="utf-8"))
+        except Exception as exc:
+            return None, [f"failed to read policy proposal: {exc}"]
+    repo_path = Path(spec.policy_repo).resolve() if spec.policy_repo else factory_root
+    from factory.promotion import resolve_approved_version
+    res = resolve_approved_version(
+        repo=repo_path,
+        report=report_data,
+        approval_proof=proof_data,
+        proposal=prop_data,
+    )
+    if not res.verified:
+        return res, [f"approved policy selection refused ({res.status}): {'; '.join(res.blockers)}"]
+    return res, []
+
+
+def validate_resume_policy(prev_rec: dict[str, Any], current_policy: dict[str, Any]) -> tuple[bool, str]:
+    prev_policy = prev_rec.get("policy_consumption")
+    if prev_policy is None:
+        if current_policy.get("selected"):
+            return False, "cannot reuse prior attempt: current run selected approved policy but prior attempt had none"
+        return True, ""
+    if not isinstance(prev_policy, dict):
+        return False, "cannot reuse prior attempt: corrupt prior policy consumption record"
+    if prev_policy.get("selected") != current_policy.get("selected"):
+        return False, "cannot reuse prior attempt: policy selection toggled between runs"
+    if current_policy.get("selected"):
+        for f in ("selected_version", "target_path", "kind", "content_sha256"):
+            if prev_policy.get(f) != current_policy.get(f):
+                return False, f"cannot reuse prior attempt: policy {f} changed ({prev_policy.get(f)} != {current_policy.get(f)})"
+        ret_path_str = prev_policy.get("retained_artifact_path")
+        if not ret_path_str or not Path(ret_path_str).is_file():
+            return False, "cannot reuse prior attempt: retained policy artifact missing"
+        try:
+            actual_sha = hashlib.sha256(Path(ret_path_str).read_bytes()).hexdigest()
+        except OSError:
+            return False, "cannot reuse prior attempt: retained policy artifact unreadable"
+        if actual_sha != prev_policy.get("content_sha256"):
+            return False, "cannot reuse prior attempt: retained policy artifact altered"
+    if prev_rec.get("factory_revision") and current_policy.get("factory_revision"):
+        if prev_rec.get("factory_revision") != current_policy.get("factory_revision"):
+            return False, f"cannot reuse prior attempt: factory revision changed ({prev_rec.get('factory_revision')} != {current_policy.get('factory_revision')})"
+    return True, ""
 
 
 def _latest_attempt_num(deliveries_root: Path) -> int:
@@ -310,6 +386,61 @@ def _execute_delivery(paths: RuntimePaths, spec: DeliverSpec, *, require_final_a
     factory_rev = rev_res.output if rev_res.ok and re.fullmatch(r"[0-9a-f]{40}", rev_res.output) else "unavailable"
     feature_branch = str(intake_res.parent.get("target_feature_branch") or "")
 
+    eff_factory_repo = Path(spec.policy_repo).resolve() if spec.policy_repo else FACTORY_ROOT
+    policy_res, policy_blockers = resolve_delivery_policy(spec, eff_factory_repo)
+    factory_dirty = bool(gitio.status_porcelain(eff_factory_repo))
+    if policy_blockers:
+        st = f"policy-{policy_res.status}" if policy_res is not None else "policy-selection-failed"
+        fail_policy = {
+            "selected": True, "status": policy_res.status if policy_res is not None else "unresolved",
+            "verified": False, "selected_version": None, "target_path": None, "kind": None,
+            "content_sha256": None, "provenance": {}, "factory_revision": factory_rev,
+            "factory_dirty": factory_dirty, "local_source_drift": False,
+            "retained_artifact_path": None, "retained_artifact_sha256": None, "blockers": policy_blockers,
+        }
+        attempt, attempt_dir = _next_attempt_dir(parent_root, paths.home)
+        base_ev = {
+            "attempt_dir": str(attempt_dir),
+            "intake_record_path": str(paths.home / "intake" / task_gid / "record.json"),
+            "intake_status": intake_res.status,
+            "policy_consumption": fail_policy,
+        }
+        meas = {
+            "elapsed_ms": int((time.monotonic() - started) * 1000),
+            "usage": {"state": "unavailable", "provenance": "unavailable; policy selection failed"},
+            "cost": {"state": "unavailable", "usd": None, "provenance": "unavailable; policy selection failed"},
+        }
+        res = DeliverResult(
+            schema=1, task_gid=task_gid, attempt=attempt, status=st, pr_opened=False,
+            verified=False, verification_scope=ci_gate.VERIFICATION_SCOPE_NOTE, merged=False,
+            factory_revision=factory_rev, feature_branch=feature_branch, parent=intake_res.parent,
+            child=None, blockers=policy_blockers, measurements=meas, evidence=base_ev,
+            recorded_at=now(), policy_consumption=fail_policy,
+        )
+        atomic_json(attempt_dir / "record.json", res.to_dict(), paths.home)
+        atomic_json(parent_root / "record.json", res.to_dict(), paths.home)
+        return res
+
+    if policy_res is not None:
+        local_p = eff_factory_repo / policy_res.target_path
+        local_drift = local_p.is_file() and hashlib.sha256(local_p.read_bytes()).hexdigest() != policy_res.content_sha256
+        policy_consumption = {
+            "selected": True, "status": "consumed", "verified": True,
+            "selected_version": policy_res.selected_version, "target_path": policy_res.target_path,
+            "kind": policy_res.kind, "content_sha256": policy_res.content_sha256,
+            "provenance": policy_res.provenance, "factory_revision": factory_rev,
+            "factory_dirty": factory_dirty, "local_source_drift": local_drift,
+            "retained_artifact_path": None, "retained_artifact_sha256": policy_res.content_sha256,
+        }
+    else:
+        policy_consumption = {
+            "selected": False, "status": "none", "verified": True,
+            "selected_version": None, "target_path": None, "kind": None,
+            "content_sha256": None, "provenance": {}, "factory_revision": factory_rev,
+            "factory_dirty": factory_dirty, "local_source_drift": False,
+            "retained_artifact_path": None, "retained_artifact_sha256": None,
+        }
+
     if require_final_approval and intake_res.delivery_ready and len(intake_res.children) == 1 and not intake_res.children[0].get("blocked_by"):
         child0, child0_gid = intake_res.children[0], str(intake_res.children[0]["gid"])
         if (latest_num := _latest_attempt_num(parent_root)) > 0:
@@ -332,8 +463,10 @@ def _execute_delivery(paths: RuntimePaths, spec: DeliverSpec, *, require_final_a
                 or (prev_cdir / "automated-qa").exists() or (prev_cdir / "security-review.json").is_file()
                 or (prev_cdir / "independent-review.json").is_file() or gate_changed or prev_rec.get("delivery_approved") is True
             )
+            compat, compat_msg = validate_resume_policy(prev_rec, policy_consumption)
             if (
-                isinstance(prev_child, dict) and prev_rec.get("pr_opened") is True and str(prev_child.get("gid") or "") == child0_gid
+                compat
+                and isinstance(prev_child, dict) and prev_rec.get("pr_opened") is True and str(prev_child.get("gid") or "") == child0_gid
                 and bool(prev_rec.get("ci_verified") or prev_child.get("ci_verified") or (prev_child.get("ci_verification") or {}).get("verified"))
                 and has_prereq_activity
             ):
@@ -379,6 +512,7 @@ def _execute_delivery(paths: RuntimePaths, spec: DeliverSpec, *, require_final_a
                         evidence=redact_value(upd_ev, secrets), recorded_at=now(), ci_verified=ci_ok, delivery_approved=approved,
                         approval_outcome=app_out, approved_revision=app_rev, candidate_sha=cand_sha, base_sha=base_sha,
                         tested_sha=t_sha, revision_kind=r_kind, approval=redact_value(app_rec, secrets),
+                        policy_consumption=prev_rec.get("policy_consumption") or policy_consumption,
                     )
                     atomic_json(latest_dir / "record.json", res.to_dict(), paths.home)
                     atomic_json(parent_root / "record.json", res.to_dict(), paths.home)
@@ -398,9 +532,11 @@ def _execute_delivery(paths: RuntimePaths, spec: DeliverSpec, *, require_final_a
         candidate_sha: str | None = None, base_sha: str | None = None,
         tested_sha: str | None = None, revision_kind: str | None = None,
         approval: dict[str, Any] | None = None,
+        policy_consumption: dict[str, Any] | None = None,
     ) -> DeliverResult:
         is_verified = bool(delivery_approved and status == "verified")
         v_scope = approval_mod.APPROVAL_GATE_SCOPE_NOTE if is_verified else ci_gate.VERIFICATION_SCOPE_NOTE
+        eff_policy = policy_consumption if policy_consumption is not None else evidence.get("policy_consumption")
         res = DeliverResult(
             schema=1, task_gid=task_gid, attempt=attempt, status=status,
             pr_opened=pr_opened, verified=is_verified, verification_scope=v_scope,
@@ -408,13 +544,14 @@ def _execute_delivery(paths: RuntimePaths, spec: DeliverSpec, *, require_final_a
             feature_branch=feature_branch, parent=redact_value(intake_res.parent, active_secrets),
             child=redact_value(child_payload, active_secrets) if child_payload is not None else None,
             blockers=redact_value(blockers, active_secrets), measurements=measurements,
-            evidence=redact_value(evidence, active_secrets), recorded_at=now(),
+            evidence=redact_value({**evidence, "policy_consumption": eff_policy}, active_secrets), recorded_at=now(),
             ci_verified=ci_verified, delivery_approved=is_verified,
             approval_outcome="approved" if is_verified else approval_outcome,
             approved_revision=approved_revision if is_verified else None,
             candidate_sha=candidate_sha, base_sha=base_sha,
             tested_sha=tested_sha, revision_kind=revision_kind,
             approval=redact_value(approval, active_secrets) if approval is not None else None,
+            policy_consumption=eff_policy,
         )
         atomic_json(attempt_dir / "record.json", res.to_dict(), paths.home)
         atomic_json(parent_root / "record.json", res.to_dict(), paths.home)
@@ -431,6 +568,7 @@ def _execute_delivery(paths: RuntimePaths, spec: DeliverSpec, *, require_final_a
         "attempt_dir": str(attempt_dir),
         "intake_record_path": str(intake_snap if intake_snap.exists() else intake_src),
         "intake_status": intake_res.status,
+        "policy_consumption": policy_consumption,
     }
     intake_reqs = intake_res.evidence.get("requests") if isinstance(intake_res.evidence, dict) else []
     intake_timed_out = time.monotonic() >= deadline or any(
@@ -463,6 +601,13 @@ def _execute_delivery(paths: RuntimePaths, spec: DeliverSpec, *, require_final_a
     gh_trace: list[dict[str, Any]] = []
     measurements = _default_meas()
     pr_info: dict[str, Any] | None = None
+    retained_file = None
+    if policy_res is not None:
+        retained_dir = safe_dir(child_dir / "consumed-policy", create=True, root=paths.home)
+        retained_file = retained_dir / policy_res.target_path
+        retained_file.parent.mkdir(parents=True, exist_ok=True)
+        retained_file.write_bytes(policy_res.content_bytes)
+        policy_consumption["retained_artifact_path"] = str(retained_file)
 
     try:
         repo_slug = parse_repo_slug(str(intake_res.parent.get("repository") or child.get("repository") or ""))
@@ -492,8 +637,21 @@ def _execute_delivery(paths: RuntimePaths, spec: DeliverSpec, *, require_final_a
             raise AttemptTimeoutError(f"safety probes timed out after {limit_s}s") from exc
         if time.monotonic() >= deadline:
             raise AttemptTimeoutError(f"safety probes timed out after {limit_s}s")
-        prompt_text = _build_worker_prompt(intake_res.parent, child, feature_branch)
+        approved_lessons = ()
+        if policy_res is not None and policy_res.kind == "lesson":
+            approved_lessons = ((policy_res.target_path, policy_res.content_bytes.decode("utf-8", errors="replace")),)
+        prompt_text = _build_worker_prompt(intake_res.parent, child, feature_branch, approved_lessons=approved_lessons)
         argv = (spec.agy_bin, "--print", prompt_text, "--output-format", "stream-json", "--sandbox", "--mode", "auto")
+        if policy_res is not None and policy_res.kind == "skill":
+            skill_dest = isolated_home / ".gemini" / "antigravity-cli" / policy_res.target_path
+            skill_dest.parent.mkdir(parents=True, exist_ok=True)
+            skill_dest.write_bytes(policy_res.content_bytes)
+        elif policy_res is not None and policy_res.kind == "tool":
+            tool_bin = safe_dir(isolated_home / "bin", create=True, root=paths.home)
+            tool_dest = tool_bin / Path(policy_res.target_path).name
+            tool_dest.write_bytes(policy_res.content_bytes)
+            tool_dest.chmod(0o755)
+            worker_env["PATH"] = f"{tool_bin}:{worker_env.get('PATH', '')}"
         if worker_module.probes_passed(probes):
             builder_timeout = max(1, int(math.ceil(remaining_seconds(deadline, "builder execution", limit_s))))
             try:
@@ -573,6 +731,18 @@ def _execute_delivery(paths: RuntimePaths, spec: DeliverSpec, *, require_final_a
             builder_status, blockers = "missing-implementation", ["builder committed test changes only without implementation changes"]
         elif not diff_info["has_test_changes"]:
             builder_status, blockers = "missing-tests", ["builder committed implementation changes without relevant test changes"]
+
+        if policy_res is not None and policy_res.kind == "check" and builder_status == "completed":
+            try:
+                check_cmd = [sys.executable, str(retained_file)]
+                check_res = subprocess.run(check_cmd, cwd=str(worktree_dir), capture_output=True, text=True, timeout=30)
+                if check_res.returncode != 0:
+                    builder_status = "approved-policy-check-failed"
+                    check_out = (check_res.stderr or check_res.stdout).strip()
+                    blockers.append(f"approved policy check {policy_res.target_path} failed: {check_out}")
+            except Exception as exc:
+                builder_status = "approved-policy-check-failed"
+                blockers.append(f"approved policy check {policy_res.target_path} execution error: {exc}")
 
         ci_verification: dict[str, Any] | None = None
         approval_rec: dict[str, Any] | None = None
@@ -680,6 +850,7 @@ def _execute_delivery(paths: RuntimePaths, spec: DeliverSpec, *, require_final_a
             "diff": diff_info, "scope_check": scope_detail,
             "verification_checks": ci_verification.get("checks", []) if isinstance(ci_verification, dict) else [],
             "ci_verification": ci_verification, "approval": approval_rec, "pr": pr_info,
+            "policy_consumption": policy_consumption,
             "safety": {
                 "sandbox_flag": "--sandbox", "permission_mode": "auto", "bypass_permissions_used": False,
                 "isolated_home": str(isolated_home), "stripped_env_keys": stripped_keys, "probes": probes,
@@ -693,7 +864,10 @@ def _execute_delivery(paths: RuntimePaths, spec: DeliverSpec, *, require_final_a
             "builder_stderr_sha256": runner.digest_text(stderr_text), "candidate_diff_path": str(cand_diff_path),
             "worktree_status_path": str(wt_status_path), "github_evidence_path": str(gh_evidence_path),
             "github_evidence_sha256": runner.digest_text(gh_trace_text), "github_requests": gh_trace,
+            "policy_consumption": policy_consumption,
         }
+        if retained_file is not None:
+            evidence["retained_consumed_policy_path"] = str(retained_file)
         if approval_rec is not None:
             evidence["approval_gate_path"] = str(child_dir / "approval-gate.json")
         return _finish(
@@ -701,11 +875,12 @@ def _execute_delivery(paths: RuntimePaths, spec: DeliverSpec, *, require_final_a
             pr_opened=(pr_info is not None), ci_verified=ci_ok, delivery_approved=delivery_approved,
             approval_outcome=app_out, approved_revision=app_rev, candidate_sha=candidate_sha,
             base_sha=base_sha, tested_sha=tested_sha, revision_kind=rev_kind, approval=approval_rec,
+            policy_consumption=policy_consumption,
         )
     except AttemptTimeoutError as exc:
         measurements["elapsed_ms"] = int((time.monotonic() - started) * 1000)
-        child_timeout_payload = {"gid": child_gid, "name": child["name"], "status": "timed-out", "verified": False, "pr": pr_info}
-        return _finish("timed-out", [str(exc)], child_timeout_payload, measurements, base_evidence, pr_opened=(pr_info is not None))
+        child_timeout_payload = {"gid": child_gid, "name": child["name"], "status": "timed-out", "verified": False, "pr": pr_info, "policy_consumption": policy_consumption}
+        return _finish("timed-out", [str(exc)], child_timeout_payload, measurements, base_evidence, pr_opened=(pr_info is not None), policy_consumption=policy_consumption)
     finally:
         if worktree_dir.exists():
             shutil.rmtree(worktree_dir, ignore_errors=True)
@@ -717,10 +892,25 @@ def run_from_cli(paths: RuntimePaths, args: object) -> DeliverResult:
     if (in_rate is None) != (out_rate is None):
         raise UsageError("deliver requires both --input-rate-usd-per-1m and --output-rate-usd-per-1m when estimating cost")
     rates = worker_module.RateCard(float(in_rate), float(out_rate)) if in_rate is not None and out_rate is not None else None
+    p_sel = getattr(args, "policy_selection", None)
+    p_rep = getattr(args, "policy_report", None)
+    p_prf = getattr(args, "policy_proof", None)
+    p_prp = getattr(args, "policy_proposal", None)
+    p_repo = getattr(args, "policy_repo", None)
+    if p_sel:
+        sel_data = json.loads(Path(p_sel).read_text(encoding="utf-8"))
+        p_rep = p_rep or sel_data.get("report") or sel_data.get("report_path")
+        p_prf = p_prf or sel_data.get("proof") or sel_data.get("proof_path")
+        p_prp = p_prp or sel_data.get("proposal") or sel_data.get("proposal_path")
+        p_repo = p_repo or sel_data.get("repo") or sel_data.get("repo_path")
     spec = DeliverSpec(
         task_ref=str(getattr(args, "task") or ""),
         time_limit_seconds=parse_duration(str(getattr(args, "time_limit") or "15m")),
         agy_bin=str(getattr(args, "agy_bin") or "agy"),
         rates=rates,
+        policy_report=p_rep,
+        policy_proof=p_prf,
+        policy_proposal=p_prp,
+        policy_repo=p_repo,
     )
     return deliver_feature(paths, spec)

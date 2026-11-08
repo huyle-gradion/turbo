@@ -32,6 +32,10 @@ class QADeliverySpec:
     qa_cases: tuple[QAEvaluationCase, ...] = ()
     max_correction_attempts: int = 2
     approve_parent_acceptance: bool = False
+    policy_report: str | Path | dict[str, Any] | None = None
+    policy_proof: str | Path | dict[str, Any] | None = None
+    policy_proposal: str | Path | dict[str, Any] | None = None
+    policy_repo: str | Path | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,6 +72,7 @@ class QADeliveryResult:
     tested_sha: str | None = None
     revision_kind: str | None = None
     approval: dict[str, Any] | None = None
+    policy_consumption: dict[str, Any] | None = None
 
     @property
     def verified(self) -> bool:
@@ -357,7 +362,12 @@ def run_automated_qa_delivery(paths: RuntimePaths, spec: QADeliverySpec) -> QADe
     started, limit_s = time.monotonic(), spec.time_limit_seconds
     deadline = started + limit_s
     deliver_res = deliver.deliver_ci_prerequisite(
-        paths, deliver.DeliverSpec(task_ref=spec.task_ref, time_limit_seconds=limit_s, agy_bin=spec.agy_bin, rates=spec.rates),
+        paths,
+        deliver.DeliverSpec(
+            task_ref=spec.task_ref, time_limit_seconds=limit_s, agy_bin=spec.agy_bin, rates=spec.rates,
+            policy_report=spec.policy_report, policy_proof=spec.policy_proof,
+            policy_proposal=spec.policy_proposal, policy_repo=spec.policy_repo,
+        ),
     )
     secrets = deliver_checks.collect_redaction_secrets()
     boundary = build_parent_acceptance_boundary(deliver_res.parent)
@@ -391,6 +401,7 @@ def run_automated_qa_delivery(paths: RuntimePaths, spec: QADeliverySpec) -> QADe
             approved_revision=approved_revision if delivery_approved else None,
             candidate_sha=candidate_sha, base_sha=base_sha, tested_sha=tested_sha,
             revision_kind=revision_kind, approval=intake.redact_value(approval, secrets) if approval is not None else None,
+            policy_consumption=deliver_res.policy_consumption,
         )
         payload = intake.redact_value(res.to_dict(), secrets)
         for dst in (attempt_dir / "qa-delivery-record.json", attempt_dir / "record.json", parent_root / "record.json"):

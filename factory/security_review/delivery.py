@@ -24,6 +24,10 @@ PR_SECURITY_HEADER_RE = re.compile(r"\n?## Security Review Evidence\b")
 class DeliverSecuritySpec:
     task_ref: str; time_limit_seconds: int = 900; agy_bin: str = "agy"; reviewer_agy_bin: str | None = None
     max_repair_rounds: int = 2; rates: worker_module.RateCard | None = None
+    policy_report: str | Path | dict[str, Any] | None = None
+    policy_proof: str | Path | dict[str, Any] | None = None
+    policy_proposal: str | Path | dict[str, Any] | None = None
+    policy_repo: str | Path | None = None
 
 
 def _format_security_pr_section(candidate_sha: str, base_sha: str, sec_gate: dict[str, Any], sec_record: dict[str, Any] | None) -> str:
@@ -176,7 +180,11 @@ def deliver_with_security_review(paths: RuntimePaths, spec: DeliverSecuritySpec)
     if reviewer_bin and str(reviewer_bin).strip():
         worker_module.validate_execution_options(worker_module.platform_info(), time_limit_seconds=limit_s, agy_bin=str(reviewer_bin), rates=spec.rates)
     initial_res = deliver_module.deliver_ci_prerequisite(
-        paths, deliver_module.DeliverSpec(task_ref=spec.task_ref, time_limit_seconds=limit_s, agy_bin=spec.agy_bin, rates=spec.rates),
+        paths, deliver_module.DeliverSpec(
+            task_ref=spec.task_ref, time_limit_seconds=limit_s, agy_bin=spec.agy_bin, rates=spec.rates,
+            policy_report=spec.policy_report, policy_proof=spec.policy_proof,
+            policy_proposal=spec.policy_proposal, policy_repo=spec.policy_repo,
+        ),
         pending_status="security-review-pending")
     if not (initial_res.ci_verified or initial_res.status in ("verified", "security-review-pending")) or initial_res.child is None:
         return initial_res
