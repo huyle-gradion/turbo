@@ -32,7 +32,7 @@ DEMO_KEEP_EVIDENCE_DIR="$(mktemp -d /tmp/turbo-issue-62.XXXXXX)" \
   bash scripts/demo-delivery-approval.sh
 ```
 
-> **Note**: Always use `/tmp` for the evidence directory; directories under `~/.gemini` are restricted by Landlock sandboxing.
+> **Note**: Use `/tmp` or another writable standard temporary directory for the retained evidence directory.
 
 The script demonstrates, in order:
 1. **Blocker**: Scripted reviewer records a blocking finding with an executable reproducer; delivery rejects.
