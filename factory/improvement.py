@@ -659,6 +659,10 @@ def build_parser() -> argparse.ArgumentParser:
     eval_p.add_argument("--evidence-dir", required=True, help="evidence directory path")
     eval_p.add_argument("--repo", help="base repository path")
     eval_p.add_argument("--json", action="store_true", help="output report JSON to stdout")
+    pkt_p = sub.add_parser("build-review-packet", aliases=["review-packet"], help="build an issue/PR review packet from evaluation report")
+    pkt_p.add_argument("--report", required=True, help="evaluation report JSON path")
+    pkt_p.add_argument("--out", required=True, help="output review packet JSON path")
+    pkt_p.add_argument("--proposal-json", help="optional external proposal JSON path to verify against")
     return p
 
 
@@ -706,6 +710,16 @@ def main(argv: list[str] | None = None) -> int:
         if args.json: sys.stdout.write(json.dumps(report, indent=2, sort_keys=True) + "\n")
         else: sys.stdout.write(f"Evaluation complete: {report['eligibility']}\n")
         return 0 if report["eligibility"] == "improvement-eligible" else 1
+    elif args.action in ("build-review-packet", "review-packet"):
+        report_data = json.loads(Path(args.report).read_text(encoding="utf-8"))
+        prop_json = Path(args.proposal_json).read_text(encoding="utf-8") if args.proposal_json else None
+        from factory.promotion import build_review_packet
+        packet = build_review_packet(report_data, proposal_json=prop_json)
+        out_p = Path(args.out)
+        out_p.parent.mkdir(parents=True, exist_ok=True)
+        _write_json(out_p, packet)
+        sys.stdout.write(f"Review packet written to {out_p}\n")
+        return 0
     return 1
 
 
