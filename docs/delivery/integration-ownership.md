@@ -48,7 +48,11 @@ This document specifies the execution topology, authoritative ownership model, a
   Deterministic client-side checks or provider rejections (HTTP 400, 404, 405, 409, 422) produce explicit rejection statuses (`rejected-competing-base`, `rejected-head-mismatch`, `stale-candidate-revision`, `unsupported-protection`, etc.).
 - **Denied Permissions**:
   HTTP 401 or 403 results in `denied-permissions`.
-- **Uncertain Outcomes**:
-  If the HTTP connection times out, disconnects, or returns HTTP 5xx during the merge call, the outcome is classified as `uncertain`. The primitive records the uncertain state and does NOT blindly retry mutation. (Reconciliation and recovery belong to #67).
+- **Uncertain Outcomes, Reconciliation & Recovery**:
+  If the HTTP connection times out, disconnects, or returns HTTP 5xx during the merge call, the outcome is classified as `uncertain`. The primitive records the uncertain state and does NOT blindly retry mutation.
+  Authoritative landing confirmation and safe retry reconciliation belong to **#66** (delivered by **#77**). Before retrying any previously initiated integration, Turbo reconciles authoritative remote state against retained request evidence and the original authorization tuple `(candidate_sha, base_sha)`. A positively confirmed prior landing is recovered without duplicating mutation. Unresolved remote state neither authorizes a blind retry nor claims confirmation. Changed candidate or base prevents mutation until verification and independent approval are renewed.
+  Hosted-provider qualification remains **#67**. Offline fixtures and disposable test harnesses do not establish hosted qualification.
+- **Authoritative Landing Confirmation Contract**:
+  A successful HTTP merge response alone is insufficient proof of landing. Authoritative follow-up verifies repository slug, PR state (`closed` and `merged: true`), intended feature target branch (`feature/*`), and landed git commit relationship. For the supported `"merge"` method, confirmation proves that the landed commit parents are exactly `[base_sha, candidate_sha]`, its tree matches the tested revision tree (`tested_sha^{tree}`), and it is reachable on the remote base branch. Unsupported or unverifiable relationships fail closed.
 - **Evidence Integrity & Redaction**:
-  All persisted request and result records are sanitized using `collect_redaction_secrets()` to ensure no tokens or secrets are leaked into evidence.
+  All persisted request and result records are sanitized using `collect_redaction_secrets()` to ensure no tokens or secrets are leaked into evidence. Failed result persistence blocks a usable confirmation result, while retained request evidence enables subsequent recovery.
