@@ -916,6 +916,7 @@ class DeliverChildTest(unittest.TestCase):
     def test_qa_and_security_callers_execute_prerequisites_without_bypass_and_invalidate_on_repair(self) -> None:
         import time
         from automated_qa.test_automated_qa_eval import WHITESPACE_QA_CASE, _case
+        from tests.independent_review.test_approval_gate import _valid_security_record
         from factory import automated_qa, config as config_module, deliver as deliver_module, independent_review, runner, security_review
         from factory.automated_qa.delivery import QADeliverySpec, run_automated_qa_delivery
         from factory.paths import RuntimePaths, atomic_json
@@ -957,9 +958,37 @@ class DeliverChildTest(unittest.TestCase):
             ):
                 qa_res = run_automated_qa_delivery(paths_q, QADeliverySpec(task_ref="900", time_limit_seconds=60, agy_bin=str(qa_builder), qa_cases=(WHITESPACE_QA_CASE,)))
                 self.assertEqual((qa_res.status, qa_res.ci_verified, qa_res.qa_verified, qa_res.verified, qa_res.delivery_approved), ("stale-candidate-revision", True, True, False, False))
+                self.assertEqual((qa_res.child["status"], qa_res.child["qa_status"], qa_res.child["pr"]["delivery_approved"]), ("stale-candidate-revision", "qa-verified", False))
+                disk_del_rec = json.loads(Path(qa_res.evidence["qa_delivery_record_path"]).read_text(encoding="utf-8"))
+                self.assertEqual((disk_del_rec["status"], disk_del_rec["child"]["qa_status"]), ("stale-candidate-revision", "qa-verified"))
                 r1_sha, r2_sha = qa_res.qa_rounds[0]["candidate_sha"], qa_res.qa_rounds[1]["candidate_sha"]
                 self.assertNotEqual(r1_sha, r2_sha)
                 self.assertTrue(any(r1_sha in b and r2_sha in b for b in qa_res.blockers), qa_res.blockers)
+
+                def _seed_valid_gate(**kw):
+                    res = orig_eval_qa(**kw)
+                    cdir, c_sha, b_sha = Path(kw["child_dir"]), kw["child_record"]["candidate_sha"], kw["child_record"]["base_sha"]
+                    atomic_json(cdir / "security-review.json", _valid_security_record(c_sha, b_sha, home_q), home_q)
+                    ir_agy = _make_fake_agy(qa_root, "agy-ir-q", _make_staged_reviewer_script(session_id="fresh-ir-q"))
+                    independent_review.review_candidate_independently(
+                        repo=repo_q, home=home_q, child_dir=cdir, child=kw["child"], conf=kw["conf"],
+                        base_sha=b_sha, candidate_sha=c_sha, round_num=1, agy_bin=str(ir_agy),
+                        builder_session_id="c-101", builder_summary="repair",
+                        qa_record=res, security_record=json.loads((cdir / "security-review.json").read_text(encoding="utf-8")),
+                        deadline=time.monotonic() + 30.0, limit_s=30,
+                    )
+                    independent_review.evaluate_approval_gate(
+                        candidate_sha=c_sha, base_sha=b_sha, repo=repo_q, home=home_q, child_dir=cdir,
+                        child=kw["child"], conf=kw["conf"], load_from_child_dir=True, builder_session_id="c-101",
+                    )
+                    return res
+
+                with unittest.mock.patch("factory.automated_qa.delivery.evaluate_child_qa", side_effect=_seed_valid_gate):
+                    qa_app = run_automated_qa_delivery(paths_q, QADeliverySpec(task_ref="900", time_limit_seconds=60, agy_bin=str(qa_builder), qa_cases=(_case("QA-AC-1"),)))
+                self.assertEqual((qa_app.status, qa_app.verified, qa_app.delivery_approved), ("verified", True, True))
+                self.assertEqual((qa_app.child["status"], qa_app.child["qa_status"], qa_app.child["pr"]["delivery_approved"]), ("verified", "qa-verified", True))
+                disk_app = json.loads(Path(qa_app.evidence["qa_delivery_record_path"]).read_text(encoding="utf-8"))
+                self.assertEqual((disk_app["status"], disk_app["child"]["qa_status"]), ("verified", "qa-verified"))
 
             repo_s, home_s, bare_s = _make_disposable_product_workspace(sec_root)
             paths_s = RuntimePaths(repo=repo_s, home=home_s)

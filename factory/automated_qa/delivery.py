@@ -493,9 +493,11 @@ def run_automated_qa_delivery(paths: RuntimePaths, spec: QADeliverySpec) -> QADe
     qa_summary_path = qa_root / "record.json"
     atomic_json(qa_summary_path, intake.redact_value(child_rec["automated_qa"], secrets), paths.home)
 
+    qa_exec_status = final_status
     cand_sha, base_sha = str(child_rec.get("candidate_sha") or ""), str(child_rec.get("base_sha") or "")
     approval_rec: dict[str, Any] | None = None
     delivery_approved = False
+    top_level_status = final_status
     if ci_verified and qa_verified:
         approval_rec = deliver.enforce_delivery_approval(
             candidate_sha=cand_sha, base_sha=base_sha, repo=paths.repo, home=paths.home, child_dir=child_dir,
@@ -503,10 +505,11 @@ def run_automated_qa_delivery(paths: RuntimePaths, spec: QADeliverySpec) -> QADe
             deadline=deadline, limit_s=limit_s,
         )
         delivery_approved = bool(approval_rec.get("delivery_approved") is True and approval_rec.get("status") == "approved" and approval_rec.get("outcome") == "approved" and approval_rec.get("approved_revision") == cand_sha)
-        if not delivery_approved:
-            if approval_rec.get("status") in ("stale-candidate-revision", "authority-violation", "prerequisite-unverified", "approval-missing", "invalid-candidate-revision") or approval_rec.get("prior_approval_rejected"):
-                final_status = str(approval_rec["status"])
-            final_blockers = list(dict.fromkeys([*final_blockers, *(approval_rec.get("blockers") or [])]))
+        if delivery_approved:
+            top_level_status = "verified"
+        elif approval_rec.get("status") in ("stale-candidate-revision", "authority-violation", "prerequisite-unverified", "approval-missing", "invalid-candidate-revision") or approval_rec.get("prior_approval_rejected"):
+            top_level_status = str(approval_rec["status"])
+        final_blockers = list(dict.fromkeys([*final_blockers, *(approval_rec.get("blockers") or [])]))
     app_out, app_rev = ("approved" if delivery_approved else "rejected"), (cand_sha if delivery_approved else None)
     t_sha = (approval_rec or {}).get("tested_sha") or child_rec.get("tested_sha")
     r_kind = (approval_rec or {}).get("revision_kind") or child_rec.get("revision_kind") or (child_rec.get("ci_verification") or {}).get("revision_kind")
@@ -514,8 +517,8 @@ def run_automated_qa_delivery(paths: RuntimePaths, spec: QADeliverySpec) -> QADe
     if isinstance(child_rec.get("pr"), dict):
         child_rec["pr"] = {**child_rec["pr"], "ci_verified": ci_verified, "qa_verified": qa_verified, "verified": delivery_approved, "delivery_approved": delivery_approved, "approved_revision": app_rev}
     child_rec.update(
-        status=final_status, ci_verified=ci_verified, verified=delivery_approved, delivery_approved=delivery_approved,
-        approval_outcome=app_out, approved_revision=app_rev, qa_status=final_status, qa_verified=qa_verified,
+        status=top_level_status, ci_verified=ci_verified, verified=delivery_approved, delivery_approved=delivery_approved,
+        approval_outcome=app_out, approved_revision=app_rev, qa_status=qa_exec_status, qa_verified=qa_verified,
         verification_scope=v_scope, tested_sha=t_sha, revision_kind=r_kind, approval=approval_rec,
     )
     extra_ev: dict[str, Any] = {"qa_record_path": str(qa_summary_path), "qa_delivery_record_path": str(attempt_dir / "qa-delivery-record.json")}
@@ -523,7 +526,7 @@ def run_automated_qa_delivery(paths: RuntimePaths, spec: QADeliverySpec) -> QADe
         extra_ev["approval_gate_path"] = str(child_dir / "approval-gate.json")
     measurements = _merge_measurements(deliver_res.measurements, repair_attempts, int((time.monotonic() - started) * 1000), spec.rates)
     return _finish_delivery(
-        final_status, ci_verified, qa_verified, child_rec, final_blockers, measurements, extra_ev,
+        top_level_status, ci_verified, qa_verified, child_rec, final_blockers, measurements, extra_ev,
         delivery_approved=delivery_approved, approval_outcome=app_out, approved_revision=app_rev,
         candidate_sha=cand_sha or None, base_sha=base_sha or None, tested_sha=t_sha, revision_kind=r_kind, approval=approval_rec, verification_scope=v_scope,
     )
