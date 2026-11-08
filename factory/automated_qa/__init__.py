@@ -122,13 +122,16 @@ def _run_isolated_check(
     worktree_dir: Path, isolated_home: Path, qa_env: dict[str, str], round_dir: Path,
     home: Path, stem: str, command: str, deadline: float, limit_s: int,
     *, explicit_argv: tuple[str, ...] | None = None, secrets: tuple[str, ...] = (),
+    candidate_sha: str | None = None, base_sha: str | None = None, tested_sha: str | None = None,
 ) -> dict[str, Any]:
     argv = explicit_argv if explicit_argv is not None else deliver_checks._verification_argv(command)
     red_cmd = intake.redact_value(command, secrets)
     red_argv = list(intake.redact_value(list(argv or ()), secrets))
+    b_hdr = f"candidate_sha={candidate_sha}\nbase_sha={base_sha}\ntested_sha={tested_sha}\n" if (candidate_sha and base_sha and tested_sha) else ""
 
     def _fail_result(msg: str, *, exit_code: int | None = None, timed_out: bool = False) -> dict[str, Any]:
         red_err = intake.redact_value(msg.rstrip("\n") + "\n", secrets)
+        if b_hdr and not deliver_checks.KEY_VAL_RE.search(red_err): red_err = b_hdr + red_err
         ev_path = write_evidence(round_dir, stem, red_err, home)
         return {
             "command": red_cmd, "argv": red_argv, "executed": False, "passed": False,
@@ -148,6 +151,7 @@ def _run_isolated_check(
     except (worker_module.SandboxUnavailableError, OSError) as exc:
         return _fail_result(f"[factory] QA check execution error: {exc}")
     redacted = intake.redact_value((out_s + err_s).strip() + "\n", secrets)
+    if b_hdr and not deliver_checks.KEY_VAL_RE.search(redacted): redacted = b_hdr + redacted
     ev_path = write_evidence(round_dir, stem, redacted, home)
     return {
         "command": red_cmd, "argv": red_argv, "executed": not timed_out,
@@ -497,6 +501,7 @@ def evaluate_child_qa(
         return _run_isolated_check(
             worktree_dir, qa_home, env or qa_env, round_dir, home, stem,
             command, deadline, limit_s, explicit_argv=explicit_argv, secrets=secrets,
+            candidate_sha=candidate_sha, base_sha=base_sha, tested_sha=resolved_sha,
         )
 
     try:

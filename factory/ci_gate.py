@@ -405,7 +405,8 @@ def evaluate_child_pr_ci_gate(
             evidence_issues.append(f"check {rname!r} is missing an accessible GitHub CI log URL: {html_url!r}")
         if not artifact_url.startswith(_URL_PREFIXES):
             evidence_issues.append(f"check {rname!r} is missing an accessible GitHub CI artifact URL: {artifact_url!r}")
-        ev_path = write_evidence(child_dir, f"ci-{rname.replace('/', '-').lower()}", raw_log + "\n", home) if raw_log else None
+        ev_log = (f"candidate_sha={prov_cand}\nbase_sha={prov_base}\ntested_sha={prov_tested}\n" + raw_log + "\n") if (raw_log and not KEY_VAL_RE.search(raw_log)) else (raw_log + "\n" if raw_log else "")
+        ev_path = write_evidence(child_dir, f"ci-{rname.replace('/', '-').lower()}", ev_log, home) if ev_log else None
         if not raw_log:
             evidence_issues.append(f"check {rname!r} is missing raw CI execution output in artifact")
         if prov_tested:
@@ -438,7 +439,7 @@ def evaluate_child_pr_ci_gate(
             "tested_sha": prov_tested or None, "revision_kind": rev_kind,
             "html_url": html_url, "artifact_url": artifact_url,
             "output_path": str(ev_path) if ev_path else None,
-            "output_sha256": runner.digest_text(raw_log + "\n") if raw_log else None,
+            "output_sha256": runner.digest_text(ev_log) if ev_log else None,
             "reruns": rerun_metadata[rname],
         })
 

@@ -389,6 +389,54 @@ class ApprovalGateGroup1Test(unittest.TestCase):
             v_reused = independent_review.verify_candidate_approval(cand_sha, base_sha, forged_ap, repo=repo, home=home, child_dir=child_dir, ci_record=ci_rec, qa_record=qa_rec, security_record=sec_rec, review_record=rep_ir)
             self.assertEqual((v_reused["delivery_approved"], v_reused["status"]), (False, "reused-builder-identity"))
 
+    def test_revision_bound_evidence_without_sibling_record_trust(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo, home, base_sha, cand_a, conf, child_dir, _ = self._setup_workspace(root)
+            (repo / "src/chat_bridge/auth.py").write_text(CLEAN_AUTH_PY + "# candidate B change\n", encoding="utf-8")
+            git(repo, "add", "."); git(repo, "commit", "-q", "-m", "candidate B")
+            cand_b = git(repo, "rev-parse", "HEAD")
+            ci_a = _valid_ci_record(cand_a, base_sha, home, conf=conf)
+            qa_a = _valid_qa_record(cand_a, base_sha, home=home)
+            ci_b = _valid_ci_record(cand_b, base_sha, home, conf=conf)
+            qa_b = _valid_qa_record(cand_b, base_sha, home=home)
+            sec_b = _valid_security_record(cand_b, base_sha, home)
+            sec_b["builder_session_id"] = "builder-b"
+            ir_agy = _make_fake_agy(root, "agy-ir-g3", _make_staged_reviewer_script(session_id="rev-g3"))
+            ir_b = independent_review.review_candidate_independently(repo=repo, home=home, child_dir=child_dir, child=PARSED_CHILD, conf=conf, base_sha=base_sha, candidate_sha=cand_b, round_num=1, agy_bin=str(ir_agy), builder_session_id="builder-b", builder_summary="B passed", qa_record=qa_b, security_record=sec_b, deadline=time.monotonic() + 30.0, limit_s=30)
+
+            # Positive control: newly produced, correctly bound B evidence succeeds
+            pos = independent_review.evaluate_approval_gate(candidate_sha=cand_b, base_sha=base_sha, repo=repo, home=home, child_dir=child_dir, child=PARSED_CHILD, conf=conf, ci_record=ci_b, qa_record=qa_b, security_record=sec_b, review_record=ir_b, builder_session_id="builder-b")
+            self.assertEqual((pos["delivery_approved"], pos["status"]), (True, "approved"))
+
+            # Sibling record matching disabled: reuse A's CI log relabelled to B
+            relabelled_ci = json.loads(json.dumps(ci_a))
+            relabelled_ci["candidate_sha"], relabelled_ci["tested_sha"], relabelled_ci["pr"]["head_sha"] = cand_b, cand_b, cand_b
+            for c in relabelled_ci["checks"]: c["candidate_sha"], c["tested_sha"] = cand_b, cand_b
+            (child_dir / "ci-verification.json").write_text(json.dumps(relabelled_ci), encoding="utf-8")
+            res_ci = independent_review.evaluate_approval_gate(candidate_sha=cand_b, base_sha=base_sha, repo=repo, home=home, child_dir=child_dir, child=PARSED_CHILD, conf=conf, ci_record=relabelled_ci, qa_record=qa_b, security_record=sec_b, review_record=ir_b, builder_session_id="builder-b")
+            self.assertEqual((res_ci["delivery_approved"], res_ci["status"]), (False, "stale-ci-evidence"))
+            self.assertTrue(any("revision provenance mismatch" in b for b in res_ci["blockers"]))
+
+            # Reuse A's QA log relabelled to B
+            relabelled_qa = json.loads(json.dumps(qa_a))
+            relabelled_qa["candidate_sha"], relabelled_qa["tested_sha"], relabelled_qa["role_separation"]["head_before"], relabelled_qa["role_separation"]["head_after"] = cand_b, cand_b, cand_b, cand_b
+            relabelled_qa["ci_revalidation"]["candidate_sha"], relabelled_qa["ci_revalidation"]["tested_sha"] = cand_b, cand_b
+            (child_dir / "record.json").write_text(json.dumps(relabelled_qa), encoding="utf-8")
+            res_qa = independent_review.evaluate_approval_gate(candidate_sha=cand_b, base_sha=base_sha, repo=repo, home=home, child_dir=child_dir, child=PARSED_CHILD, conf=conf, ci_record=ci_b, qa_record=relabelled_qa, security_record=sec_b, review_record=ir_b, builder_session_id="builder-b")
+            self.assertEqual((res_qa["delivery_approved"], res_qa["status"]), (False, "stale-qa-evidence"))
+            self.assertTrue(any("revision provenance mismatch" in b for b in res_qa["blockers"]))
+
+            # Arbitrary unbound file in home rejected as check evidence
+            unbound_p = home / "arbitrary.txt"
+            unbound_p.write_text("random execution log without provenance\n", encoding="utf-8")
+            unbound_ci = json.loads(json.dumps(ci_b))
+            unbound_ci["checks"][0]["output_path"] = str(unbound_p)
+            unbound_ci["checks"][0]["output_sha256"] = runner.digest_text("random execution log without provenance\n")
+            res_unbound = independent_review.evaluate_approval_gate(candidate_sha=cand_b, base_sha=base_sha, repo=repo, home=home, child_dir=child_dir, child=PARSED_CHILD, conf=conf, ci_record=unbound_ci, qa_record=qa_b, security_record=sec_b, review_record=ir_b, builder_session_id="builder-b")
+            self.assertEqual((res_unbound["delivery_approved"], res_unbound["status"]), (False, "ci-evidence-invalid"))
+            self.assertTrue(any("missing revision provenance" in b for b in res_unbound["blockers"]))
+
 
 if __name__ == "__main__":
     unittest.main()

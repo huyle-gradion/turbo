@@ -40,16 +40,10 @@ def _verify_file_digest(path_val: Any, sha_val: Any, home: Path | None, label: s
         if runner.digest_text(txt := p.read_text(encoding="utf-8", errors="replace")) != sha_val: return f"{label} stored evidence file {p} sha256 mismatch"
         if rev_bind is not None:
             kv = dict(ci_gate.KEY_VAL_RE.findall(txt))
-            has_kv = all(ci_gate.SHA40_RE.fullmatch(str(kv.get(k) or "")) for k in ("candidate_sha", "base_sha", "tested_sha"))
-            if has_kv and (kv["candidate_sha"], kv["base_sha"], kv["tested_sha"]) != rev_bind: return f"stale:{label} stored evidence {p} revision provenance mismatch"
-            r_dirs = (p.resolve().parent, p.resolve().parent.parent) if p.resolve().parent.name == "evidence" else (p.resolve().parent,)
-            has_drec = False
-            for rp in [rp for d in r_dirs for fn in ("record.json", "ci-verification.json") if (rp := d / fn) != p.resolve() and rp.is_file() and not rp.is_symlink()]:
-                if isinstance(drec := read_json(rp, home or rp.parent), dict):
-                    if any(drec.get(k) not in (None, exp) for k, exp in zip(("candidate_sha", "base_sha", "tested_sha"), rev_bind)):
-                        return f"stale:{label} stored record {rp} revision provenance mismatch"
-                    if all(ci_gate.SHA40_RE.fullmatch(str(drec.get(k) or "")) for k in ("candidate_sha", "base_sha", "tested_sha")): has_drec = True
-            if not (has_kv or has_drec): return f"{label} stored evidence {p} is missing revision provenance"
+            if not all(ci_gate.SHA40_RE.fullmatch(str(kv.get(k) or "")) for k in ("candidate_sha", "base_sha", "tested_sha")):
+                return f"{label} stored evidence {p} is missing revision provenance"
+            if (kv["candidate_sha"], kv["base_sha"], kv["tested_sha"]) != rev_bind:
+                return f"stale:{label} stored evidence {p} revision provenance mismatch"
     except (errors_module.FactoryError, OSError): return f"{label} stored evidence file {p} is unreadable"
     return None
 
