@@ -1,0 +1,404 @@
+"""Bounded factory-improvement proposals and comparison workflow (Issue #68, Part A of #32)."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import sys
+import tempfile
+from typing import Any
+
+from factory import ci_selection, deliver_checks, gitio, runner, worker
+from factory.config import now
+from factory.errors import UsageError
+from factory.paths import safe_dir
+
+FACTORY_ROOT = Path(__file__).resolve().parents[1]
+PROPOSAL_SCHEMA_VERSION = 1
+REPORT_SCHEMA_VERSION = 1
+SUPPORTED_RULES = frozenset({"baseline-failed-candidate-passed"})
+VALID_ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+AUTHORITY_NOTE = "improvement-eligible only; not approved, installed, merged, or parent-accepted"
+
+
+def _sha256_file(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def proposal_digest(proposal: dict[str, Any]) -> str:
+    return hashlib.sha256((json.dumps(proposal, indent=2, sort_keys=True) + "\n").encode("utf-8")).hexdigest()
+
+
+def _write_json(path: Path, data: dict[str, Any]) -> None:
+    text = json.dumps(data, indent=2, sort_keys=True) + "\n"
+    tmp_fd, tmp_path = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp_path, 0o600)
+        os.replace(tmp_path, path)
+    finally:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+
+
+def _is_safe_relative_path(p_str: str) -> bool:
+    if not p_str or not isinstance(p_str, str):
+        return False
+    parts = p_str.replace("\\", "/").split("/")
+    if any(p in ("", ".", "..") for p in parts):
+        return False
+    p = Path(p_str)
+    return not p.is_absolute() and ".." not in p.parts and "." not in p.parts
+
+
+def _write_confined_file(worktree: Path, rel_path: str, content: bytes) -> Path:
+    if not _is_safe_relative_path(rel_path):
+        raise UsageError(f"unsafe or invalid target path: {rel_path!r}")
+    parts = rel_path.replace("\\", "/").split("/")
+    resolved_wt = worktree.resolve()
+    curr = worktree
+    for part in parts[:-1]:
+        curr = curr / part
+        if curr.is_symlink():
+            raise UsageError(f"target path component is a symlink: {curr}")
+        if curr.exists():
+            if not curr.is_dir():
+                raise UsageError(f"target path component exists and is not a directory: {curr}")
+        else:
+            curr.mkdir(mode=0o700)
+        if not curr.resolve().is_relative_to(resolved_wt):
+            raise UsageError(f"target path component escapes worktree: {rel_path!r}")
+    target = curr / parts[-1]
+    if target.is_symlink():
+        raise UsageError(f"target path is a symlink: {target}")
+    if target.is_dir():
+        raise UsageError(f"target path is an existing directory: {target}")
+    if not target.resolve().is_relative_to(resolved_wt):
+        raise UsageError(f"target path escapes worktree: {rel_path!r}")
+    target.write_bytes(content)
+    return target
+
+
+def _validate_case(case: dict[str, Any], seen_ids: set[str], label: str) -> list[str]:
+    if not isinstance(case, dict):
+        return [f"{label} case must be a JSON object"]
+    cid, issues = str(case.get("case_id") or "").strip(), []
+    if not cid or not VALID_ID_RE.fullmatch(cid): issues.append(f"{label} case has invalid case_id {cid!r}")
+    elif cid in seen_ids: issues.append(f"duplicate case_id {cid!r} in {label} cases")
+    seen_ids.add(cid)
+    cmd = str(case.get("command") or "").strip()
+    argv = deliver_checks._verification_argv(cmd)
+    if argv is None: issues.append(f"case {cid!r} command is unexecutable: {cmd!r}")
+    elif ci_selection.WEAKENED_CMD_RE.search(cmd): issues.append(f"case {cid!r} command weakens verification: {cmd!r}")
+    rub = case.get("rubric")
+    if not isinstance(rub, dict):
+        issues.append(f"case {cid!r} requires rubric dictionary")
+    else:
+        rid, raw_code = str(rub.get("rubric_id") or "").strip(), rub.get("expected_exit_code", 0)
+        if not rid or not VALID_ID_RE.fullmatch(rid): issues.append(f"case {cid!r} invalid rubric_id: {rid!r}")
+        if isinstance(raw_code, bool) or not isinstance(raw_code, int): issues.append(f"case {cid!r} expected_exit_code must be int")
+        for k in ("required_output_tokens", "forbidden_output_tokens"):
+            v = rub.get(k, [])
+            if not isinstance(v, (list, tuple)) or any(not isinstance(t, str) for t in v):
+                issues.append(f"case {cid!r} rubric {k} must be list of strings")
+    for inp in case.get("inputs") or ():
+        p = Path(str(inp.get("path") or "")) if isinstance(inp, dict) else Path()
+        if not p.is_file(): issues.append(f"case {cid!r} input not found: {p}")
+        elif _sha256_file(p) != str(inp.get("sha256") or ""): issues.append(f"case {cid!r} input sha mismatch: {p}")
+    return issues
+
+
+def validate_proposal(proposal: dict[str, Any], *, base_dir: Path | None = None) -> list[str]:
+    if not isinstance(proposal, dict): return ["proposal must be a JSON object"]
+    issues: list[str] = []
+    if proposal.get("schema_version") != PROPOSAL_SCHEMA_VERSION:
+        issues.append(f"unsupported schema_version: {proposal.get('schema_version')!r}")
+    pid = str(proposal.get("proposal_id") or "").strip()
+    if not pid or not VALID_ID_RE.fullmatch(pid): issues.append(f"invalid proposal_id: {pid!r}")
+    obs = proposal.get("observed_failure")
+    if not isinstance(obs, dict) or not str(obs.get("description") or "").strip():
+        issues.append("observed_failure requires non-empty description")
+    elif not isinstance(obs.get("artifacts"), list) or not obs.get("artifacts"):
+        issues.append("observed_failure requires non-empty artifacts list")
+    else:
+        for art in obs["artifacts"]:
+            p = Path(str(art.get("path") or ""))
+            if base_dir and not p.is_absolute(): p = base_dir / p
+            if not p.is_file(): issues.append(f"observed_failure artifact not found: {p}")
+            elif _sha256_file(p) != str(art.get("sha256") or ""): issues.append(f"observed_failure artifact sha mismatch: {p}")
+    prop, exp_c_sha = proposal.get("proposed_change"), ""
+    if not isinstance(prop, dict) or prop.get("kind") not in ("skill", "tool", "check"):
+        issues.append(f"proposed_change requires kind skill, tool, or check: {(prop or {}).get('kind')!r}")
+    else:
+        tgt = str(prop.get("target_path") or "").strip()
+        if not _is_safe_relative_path(tgt):
+            issues.append(f"invalid target_path: {tgt!r}")
+        cp = Path(str(prop.get("content_path") or ""))
+        if base_dir and not cp.is_absolute(): cp = base_dir / cp
+        if not cp.is_file(): issues.append(f"proposed_change content_path not found: {cp}")
+        else:
+            exp_c_sha = _sha256_file(cp)
+            if exp_c_sha != str(prop.get("content_sha256") or ""): issues.append("proposed_change content_sha256 mismatch")
+    if not str(proposal.get("baseline", {}).get("identity") or "").strip(): issues.append("baseline identity required")
+    if not str(proposal.get("candidate", {}).get("identity") or "").strip(): issues.append("candidate identity required")
+    if str(proposal.get("candidate", {}).get("content_sha256") or "") != exp_c_sha:
+        issues.append("candidate content_sha256 must match proposed_change content_sha256")
+    exp_imp = proposal.get("expected_improvement")
+    if not isinstance(exp_imp, dict) or not str(exp_imp.get("description") or "").strip():
+        issues.append("expected_improvement requires description")
+    elif exp_imp.get("rule") not in SUPPORTED_RULES: issues.append(f"unsupported rule: {exp_imp.get('rule')!r}")
+    imp_cases, reg_cases = proposal.get("improvement_cases"), proposal.get("regression_cases")
+    if not isinstance(imp_cases, list) or not imp_cases: issues.append("improvement_cases must be non-empty list")
+    if not isinstance(reg_cases, list) or not reg_cases: issues.append("regression_cases must be non-empty list")
+    seen_ids: set[str] = set()
+    for c in (imp_cases or ()): issues.extend(_validate_case(c, seen_ids, "improvement"))
+    for c in (reg_cases or ()): issues.extend(_validate_case(c, seen_ids, "regression"))
+    conds = proposal.get("execution_conditions")
+    if not isinstance(conds, dict): issues.append("execution_conditions must be a JSON object")
+    else:
+        if not isinstance(conds.get("time_limit_seconds"), int) or conds.get("time_limit_seconds", 0) <= 0:
+            issues.append("execution_conditions time_limit_seconds must be positive int")
+        if conds.get("allow_network") is not False: issues.append("execution_conditions allow_network must be False")
+        if conds.get("env_sanitized") is not True: issues.append("execution_conditions env_sanitized must be True")
+        ps = conds.get("permitted_substitution")
+        if not isinstance(ps, dict) or ps.get("target_path") != (prop or {}).get("target_path") or ps.get("content_sha256") != exp_c_sha:
+            issues.append("execution_conditions permitted_substitution must match proposed_change")
+    return issues
+
+
+def create_proposal(
+    *, proposal_id: str, failure_description: str, failure_artifacts: list[dict[str, str]],
+    kind: str, target_path: str, content_path: str | Path, baseline_identity: str, candidate_identity: str,
+    expected_improvement_description: str, improvement_cases: list[dict[str, Any]],
+    regression_cases: list[dict[str, Any]], time_limit_seconds: int = 30,
+    rule: str = "baseline-failed-candidate-passed",
+) -> dict[str, Any]:
+    cp, arts = Path(content_path).resolve(), []
+    c_sha = _sha256_file(cp)
+    for art in failure_artifacts:
+        ap = Path(art["path"]).resolve()
+        arts.append({"path": str(ap), "sha256": art.get("sha256") or _sha256_file(ap)})
+    proposal = {
+        "schema_version": PROPOSAL_SCHEMA_VERSION, "proposal_id": proposal_id,
+        "observed_failure": {"description": failure_description, "artifacts": arts},
+        "proposed_change": {"kind": kind, "target_path": target_path, "content_path": str(cp), "content_sha256": c_sha},
+        "baseline": {"identity": baseline_identity}, "candidate": {"identity": candidate_identity, "content_sha256": c_sha},
+        "expected_improvement": {"description": expected_improvement_description, "rule": rule},
+        "improvement_cases": improvement_cases, "regression_cases": regression_cases,
+        "execution_conditions": {
+            "time_limit_seconds": time_limit_seconds, "allow_network": False, "env_sanitized": True,
+            "permitted_substitution": {"target_path": target_path, "content_sha256": c_sha},
+        },
+    }
+    issues = validate_proposal(proposal)
+    if issues: raise UsageError(f"invalid proposal: {'; '.join(issues)}")
+    return proposal
+
+
+def _execute_case(worktree: Path, case: dict[str, Any], side: str, proposal: dict[str, Any], attempt_dir: Path, timeout_s: int) -> dict[str, Any]:
+    cid, argv = case["case_id"], deliver_checks._verification_argv(case["command"])
+    isolated_home = safe_dir(worktree / "_home", create=True)
+    env, _ = worker.sanitized_env(dict(os.environ), worktree, isolated_home)
+    env["TURBO_DISPOSABLE_SERVICES_ONLY"] = "1"
+    env["PYTHONPATH"] = f"{worktree}:{worktree / 'tests'}" if (worktree / "tests").is_dir() else str(worktree)
+    if argv is None:
+        exit_code, out_s, err_s, duration_ms, timed_out, exec_err, executed = 1, "", f"unexecutable: {case['command']}", 0, False, "unexecutable command", False
+    else:
+        try:
+            exit_code, out_s, err_s, duration_ms, timed_out = worker.execute_stream(worktree, argv, env, timeout_s, isolated_home=isolated_home, allow_network=False)
+            executed, exec_err = not timed_out, None
+        except Exception as exc:
+            exit_code, out_s, err_s, duration_ms, timed_out, exec_err, executed = 1, "", str(exc), 0, False, str(exc), False
+    out_text = out_s + err_s
+    out_path = safe_dir(attempt_dir / side, create=True) / f"{cid}.txt"
+    out_path.write_text(out_text, encoding="utf-8")
+    os.chmod(out_path, 0o600)
+    rub, failures = case["rubric"], []
+    if not executed: failures.append(f"command not executed: {exec_err or 'unknown'}")
+    if timed_out: failures.append("command timed out")
+    if executed and not timed_out:
+        if exit_code != rub.get("expected_exit_code", 0): failures.append(f"expected exit code {rub.get('expected_exit_code', 0)}, got {exit_code}")
+        for t in rub.get("required_output_tokens", []):
+            if t not in out_text: failures.append(f"missing required output token: {t!r}")
+        for t in rub.get("forbidden_output_tokens", []):
+            if t in out_text: failures.append(f"found forbidden output token: {t!r}")
+    passed = len(failures) == 0 and executed and not timed_out
+    is_launch_failure = (not executed) or timed_out or bool(exec_err) or (exit_code in (124, 126, 127))
+    return {
+        "case_id": cid, "subject_side": side, "subject_identity": proposal[side]["identity"],
+        "command": case["command"], "argv": list(argv or ()), "executed": executed, "exit_code": exit_code,
+        "timed_out": timed_out, "execution_error": exec_err, "duration_ms": duration_ms,
+        "output_path": str(out_path), "output_sha256": runner.digest_text(out_text), "rubric": rub,
+        "rubric_passed": passed, "rubric_failures": failures, "is_behavioral_failure": (not is_launch_failure and not passed),
+    }
+
+
+def evaluate_proposal(
+    proposal: dict[str, Any], evidence_dir: Path, *, repo: Path | None = None,
+    telemetry: dict[str, Any] | None = None, rate_card: worker.RateCard | None = None,
+) -> dict[str, Any]:
+    issues = validate_proposal(proposal)
+    if issues: raise UsageError(f"invalid proposal: {'; '.join(issues)}")
+    prop_digest, factory_rev = proposal_digest(proposal), (gitio.git(FACTORY_ROOT, "rev-parse", "HEAD").output if gitio.git(FACTORY_ROOT, "rev-parse", "HEAD").ok else "unknown")
+    attempts_dir, num = safe_dir(evidence_dir / "attempts", create=True), 1
+    while True:
+        attempt_dir = attempts_dir / f"attempt-{num}"
+        try: attempt_dir.mkdir(parents=True, exist_ok=False); break
+        except FileExistsError: num += 1
+    manifest_path = attempt_dir / "attempt-manifest.json"
+    manifest: dict[str, Any] = {
+        "schema_version": PROPOSAL_SCHEMA_VERSION, "attempt_number": num, "proposal_digest": prop_digest,
+        "candidate_content_digest": proposal["proposed_change"]["content_sha256"], "factory_revision": factory_rev,
+        "status": "in-progress", "started_at": now(), "completed_at": None, "completed_cases": [], "eligibility": "ineligible",
+    }
+    _write_json(manifest_path, manifest)
+    b_cases, c_cases, timeout_s = [], [], proposal["execution_conditions"]["time_limit_seconds"]
+    try:
+        for side, store in (("baseline", b_cases), ("candidate", c_cases)):
+            for kind, case in [("improvement", c) for c in proposal["improvement_cases"]] + [("regression", c) for c in proposal["regression_cases"]]:
+                wt = attempt_dir / "worktrees" / f"{side}_{case['case_id']}"
+                if repo and (repo / ".git").is_dir(): worker.prepare_isolated_git_checkout(repo, wt, "HEAD")
+                elif repo and repo.is_dir(): shutil.copytree(repo, wt, dirs_exist_ok=True)
+                else: wt.mkdir(parents=True, exist_ok=True)
+                if side == "candidate":
+                    target_rel = str(proposal["proposed_change"]["target_path"])
+                    content_bytes = Path(proposal["proposed_change"]["content_path"]).read_bytes()
+                    _write_confined_file(wt, target_rel, content_bytes)
+                res = _execute_case(wt, case, side, proposal, attempt_dir, timeout_s)
+                res["case_kind"] = kind
+                store.append(res)
+                _write_json(attempt_dir / side / f"{case['case_id']}.json", res)
+                manifest["completed_cases"].append(f"{side}:{case['case_id']}")
+                _write_json(manifest_path, manifest)
+                shutil.rmtree(wt, ignore_errors=True)
+    except BaseException as exc:
+        manifest["status"] = "interrupted" if isinstance(exc, (KeyboardInterrupt, TimeoutError)) else "failed"
+        manifest["error"], manifest["completed_at"] = str(exc), now()
+        _write_json(manifest_path, manifest)
+        raise
+    eligibility_reasons: list[str] = []
+    b_by_id, c_by_id = {r["case_id"]: r for r in b_cases}, {r["case_id"]: r for r in c_cases}
+    for ic in proposal["improvement_cases"]:
+        cid = ic["case_id"]
+        br, cr = b_by_id[cid], c_by_id[cid]
+        if br["rubric_passed"]: eligibility_reasons.append(f"improvement case {cid!r} passed on baseline; no behavioral improvement demonstrated")
+        elif not br["is_behavioral_failure"]: eligibility_reasons.append(f"baseline had execution error or timeout on {cid!r}; launch failure is not behavioral failure")
+        if not cr["rubric_passed"]: eligibility_reasons.append(f"candidate failed improvement case {cid!r}: {'; '.join(cr['rubric_failures'])}")
+    for rc in proposal["regression_cases"]:
+        rid = rc["case_id"]
+        if not c_by_id[rid]["rubric_passed"]: eligibility_reasons.append(f"candidate failed required regression {rid!r}: {'; '.join(c_by_id[rid]['rubric_failures'])}")
+    eligible = len(eligibility_reasons) == 0
+    report = {
+        "schema_version": REPORT_SCHEMA_VERSION, "proposal_digest": prop_digest, "factory_revision": factory_rev,
+        "candidate_content_digest": proposal["proposed_change"]["content_sha256"],
+        "baseline_identity": proposal["baseline"]["identity"], "candidate_identity": proposal["candidate"]["identity"],
+        "proposal": proposal, "execution_conditions": proposal["execution_conditions"],
+        "baseline_results": {"improvement_cases": [r for r in b_cases if r["case_kind"] == "improvement"], "regression_cases": [r for r in b_cases if r["case_kind"] == "regression"]},
+        "candidate_results": {"improvement_cases": [r for r in c_cases if r["case_kind"] == "improvement"], "regression_cases": [r for r in c_cases if r["case_kind"] == "regression"]},
+        "comparison": {
+            "rule": proposal["expected_improvement"]["rule"], "rule_satisfied": eligible,
+            "baseline_demonstrated_failure": all(r["is_behavioral_failure"] for r in b_cases if r["case_kind"] == "improvement"),
+            "candidate_demonstrated_success": all(r["rubric_passed"] for r in c_cases if r["case_kind"] == "improvement"),
+            "candidate_regressions_passed": len(proposal["regression_cases"]) > 0 and all(r["rubric_passed"] for r in c_cases if r["case_kind"] == "regression"),
+            "reasons": eligibility_reasons,
+        },
+        "measurements": {
+            "baseline": worker.extract_measurements((telemetry or {}).get("baseline"), sum(r["duration_ms"] for r in b_cases), spec=rate_card),
+            "candidate": worker.extract_measurements((telemetry or {}).get("candidate"), sum(r["duration_ms"] for r in c_cases), spec=rate_card),
+        },
+        "eligibility": "improvement-eligible" if eligible else "ineligible", "eligibility_reasons": eligibility_reasons,
+        "authority_note": AUTHORITY_NOTE, "recorded_at": now(),
+    }
+    report_path = attempt_dir / "report.json"
+    _write_json(report_path, report)
+    manifest["status"], manifest["completed_at"], manifest["eligibility"], manifest["report_path"] = "completed", now(), report["eligibility"], str(report_path)
+    _write_json(manifest_path, manifest)
+    return report
+
+
+def validate_report_for_review(report: dict[str, Any], *, proposal_json: str | None = None) -> list[str]:
+    issues: list[str] = []
+    if not isinstance(report, dict): return ["report must be a JSON object"]
+    if report.get("schema_version") != REPORT_SCHEMA_VERSION: issues.append(f"unsupported schema_version: {report.get('schema_version')!r}")
+    if report.get("authority_note") != AUTHORITY_NOTE: issues.append("invalid authority note on report")
+    if proposal_json is not None:
+        expected_digest = hashlib.sha256(proposal_json.encode("utf-8")).hexdigest()
+        if report.get("proposal_digest") != expected_digest: issues.append(f"report proposal_digest mismatch")
+    if report.get("eligibility") == "improvement-eligible":
+        comp = report.get("comparison") or {}
+        if not comp.get("rule_satisfied") or not comp.get("baseline_demonstrated_failure") or not comp.get("candidate_demonstrated_success") or not comp.get("candidate_regressions_passed"):
+            issues.append("eligible report has unsatisfied comparison conditions")
+        if report.get("eligibility_reasons"): issues.append("eligible report has non-empty eligibility_reasons")
+    return issues
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="factory.improvement", description="Factory improvement proposal and comparison workflow.")
+    sub = p.add_subparsers(dest="action", required=True)
+    prop = sub.add_parser("create-proposal", aliases=["propose"], help="create and validate a proposal")
+    prop.add_argument("--out", required=True, help="output proposal JSON path")
+    prop.add_argument("--from-file", help="input draft JSON file to validate and canonicalize")
+    prop.add_argument("--proposal-id")
+    prop.add_argument("--failure-desc")
+    prop.add_argument("--failure-artifact", action="append", default=[])
+    prop.add_argument("--kind", choices=("skill", "tool", "check"))
+    prop.add_argument("--target-path")
+    prop.add_argument("--content-file")
+    prop.add_argument("--baseline-identity")
+    prop.add_argument("--candidate-identity")
+    prop.add_argument("--expected-improvement")
+    prop.add_argument("--cases-file")
+    prop.add_argument("--time-limit", type=int, default=30)
+    eval_p = sub.add_parser("evaluate", help="evaluate baseline and candidate proposals")
+    eval_p.add_argument("--proposal", required=True, help="proposal JSON path")
+    eval_p.add_argument("--evidence-dir", required=True, help="evidence directory path")
+    eval_p.add_argument("--repo", help="base repository path")
+    eval_p.add_argument("--json", action="store_true", help="output report JSON to stdout")
+    return p
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    if args.action in ("create-proposal", "propose"):
+        if args.from_file:
+            proposal = json.loads(Path(args.from_file).read_text(encoding="utf-8"))
+            issues = validate_proposal(proposal, base_dir=Path(args.from_file).parent)
+            if issues: sys.stderr.write(f"Error: {'; '.join(issues)}\n"); return 1
+        else:
+            if not all([args.proposal_id, args.failure_desc, args.kind, args.target_path, args.content_file, args.baseline_identity, args.candidate_identity, args.expected_improvement, args.cases_file]):
+                sys.stderr.write("Error: missing required arguments for proposal creation\n"); return 1
+            cases_data = json.loads(Path(args.cases_file).read_text(encoding="utf-8"))
+            proposal = create_proposal(
+                proposal_id=args.proposal_id, failure_description=args.failure_desc,
+                failure_artifacts=[{"path": a} for a in args.failure_artifact],
+                kind=args.kind, target_path=args.target_path, content_path=args.content_file,
+                baseline_identity=args.baseline_identity, candidate_identity=args.candidate_identity,
+                expected_improvement_description=args.expected_improvement,
+                improvement_cases=cases_data.get("improvement_cases", []),
+                regression_cases=cases_data.get("regression_cases", []),
+                time_limit_seconds=args.time_limit,
+            )
+        out_p = Path(args.out)
+        out_p.parent.mkdir(parents=True, exist_ok=True)
+        _write_json(out_p, proposal)
+        sys.stdout.write(f"Proposal written to {out_p} (digest: {proposal_digest(proposal)})\n")
+        return 0
+    elif args.action == "evaluate":
+        prop_data = json.loads(Path(args.proposal).read_text(encoding="utf-8"))
+        report = evaluate_proposal(prop_data, Path(args.evidence_dir).resolve(), repo=(Path(args.repo).resolve() if args.repo else None))
+        if args.json: sys.stdout.write(json.dumps(report, indent=2, sort_keys=True) + "\n")
+        else: sys.stdout.write(f"Evaluation complete: {report['eligibility']}\n")
+        return 0 if report["eligibility"] == "improvement-eligible" else 1
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
