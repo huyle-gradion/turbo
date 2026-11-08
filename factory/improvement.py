@@ -49,6 +49,44 @@ def _write_json(path: Path, data: dict[str, Any]) -> None:
             os.unlink(tmp_path)
 
 
+def _is_safe_relative_path(p_str: str) -> bool:
+    if not p_str or not isinstance(p_str, str):
+        return False
+    parts = p_str.replace("\\", "/").split("/")
+    if any(p in ("", ".", "..") for p in parts):
+        return False
+    p = Path(p_str)
+    return not p.is_absolute() and ".." not in p.parts and "." not in p.parts
+
+
+def _write_confined_file(worktree: Path, rel_path: str, content: bytes) -> Path:
+    if not _is_safe_relative_path(rel_path):
+        raise UsageError(f"unsafe or invalid target path: {rel_path!r}")
+    parts = rel_path.replace("\\", "/").split("/")
+    resolved_wt = worktree.resolve()
+    curr = worktree
+    for part in parts[:-1]:
+        curr = curr / part
+        if curr.is_symlink():
+            raise UsageError(f"target path component is a symlink: {curr}")
+        if curr.exists():
+            if not curr.is_dir():
+                raise UsageError(f"target path component exists and is not a directory: {curr}")
+        else:
+            curr.mkdir(mode=0o700)
+        if not curr.resolve().is_relative_to(resolved_wt):
+            raise UsageError(f"target path component escapes worktree: {rel_path!r}")
+    target = curr / parts[-1]
+    if target.is_symlink():
+        raise UsageError(f"target path is a symlink: {target}")
+    if target.is_dir():
+        raise UsageError(f"target path is an existing directory: {target}")
+    if not target.resolve().is_relative_to(resolved_wt):
+        raise UsageError(f"target path escapes worktree: {rel_path!r}")
+    target.write_bytes(content)
+    return target
+
+
 def _validate_case(case: dict[str, Any], seen_ids: set[str], label: str) -> list[str]:
     if not isinstance(case, dict):
         return [f"{label} case must be a JSON object"]
@@ -101,7 +139,8 @@ def validate_proposal(proposal: dict[str, Any], *, base_dir: Path | None = None)
         issues.append(f"proposed_change requires kind skill, tool, or check: {(prop or {}).get('kind')!r}")
     else:
         tgt = str(prop.get("target_path") or "").strip()
-        if not tgt or Path(tgt).is_absolute() or ".." in Path(tgt).parts: issues.append(f"invalid target_path: {tgt!r}")
+        if not _is_safe_relative_path(tgt):
+            issues.append(f"invalid target_path: {tgt!r}")
         cp = Path(str(prop.get("content_path") or ""))
         if base_dir and not cp.is_absolute(): cp = base_dir / cp
         if not cp.is_file(): issues.append(f"proposed_change content_path not found: {cp}")
@@ -230,9 +269,9 @@ def evaluate_proposal(
                 elif repo and repo.is_dir(): shutil.copytree(repo, wt, dirs_exist_ok=True)
                 else: wt.mkdir(parents=True, exist_ok=True)
                 if side == "candidate":
-                    target = wt / proposal["proposed_change"]["target_path"]
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    target.write_bytes(Path(proposal["proposed_change"]["content_path"]).read_bytes())
+                    target_rel = str(proposal["proposed_change"]["target_path"])
+                    content_bytes = Path(proposal["proposed_change"]["content_path"]).read_bytes()
+                    _write_confined_file(wt, target_rel, content_bytes)
                 res = _execute_case(wt, case, side, proposal, attempt_dir, timeout_s)
                 res["case_kind"] = kind
                 store.append(res)

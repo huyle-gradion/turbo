@@ -244,6 +244,128 @@ class ImprovementWorkflowTest(unittest.TestCase):
             after_snapshot = {p.relative_to(repo): p.read_bytes() for p in repo.rglob("*") if p.is_file()}
             self.assertEqual(before_snapshot, after_snapshot)
 
+    def test_group1_rejects_normalized_directory_target_spellings(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            obs, cand, imp, reg = _sample_fixtures(root)
+            for bad_target in (".", "./", ".//", "dir/.", "", "dir//target.py"):
+                with self.subTest(target=bad_target):
+                    with self.assertRaises(UsageError):
+                        create_proposal(
+                            proposal_id=f"prop-bad-tgt", failure_description="f", failure_artifacts=[{"path": str(obs)}],
+                            kind="check", target_path=bad_target, content_path=cand, baseline_identity="b1",
+                            candidate_identity="c1", expected_improvement_description="exp",
+                            improvement_cases=[imp], regression_cases=[reg],
+                        )
+
+    def test_group1_rejects_leaf_and_ancestor_symlinks_outside_worktree(self) -> None:
+        import subprocess
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            obs, cand, imp, reg = _sample_fixtures(root)
+
+            # 1. Tracked leaf symlink
+            repo_leaf = root / "repo_leaf"
+            repo_leaf.mkdir()
+            leaf_sentinel = root / "leaf_sentinel.txt"
+            leaf_sentinel.write_text("PRISTINE_LEAF", encoding="utf-8")
+            subprocess.run(["git", "init", "-q"], cwd=repo_leaf, check=True)
+            subprocess.run(["git", "config", "user.name", "t"], cwd=repo_leaf, check=True)
+            subprocess.run(["git", "config", "user.email", "t@example.com"], cwd=repo_leaf, check=True)
+            (repo_leaf / "target.py").symlink_to(leaf_sentinel)
+            subprocess.run(["git", "add", "target.py"], cwd=repo_leaf, check=True)
+            subprocess.run(["git", "commit", "-q", "-m", "leaf symlink"], cwd=repo_leaf, check=True)
+
+            prop_leaf = create_proposal(
+                proposal_id="prop-leaf", failure_description="f", failure_artifacts=[{"path": str(obs)}],
+                kind="check", target_path="target.py", content_path=cand, baseline_identity="b1",
+                candidate_identity="c1", expected_improvement_description="exp",
+                improvement_cases=[imp], regression_cases=[reg],
+            )
+            with self.assertRaises(UsageError):
+                evaluate_proposal(prop_leaf, root / "ev_leaf", repo=repo_leaf)
+            self.assertEqual(leaf_sentinel.read_text(encoding="utf-8"), "PRISTINE_LEAF")
+
+            # 2. Tracked ancestor symlink
+            repo_anc = root / "repo_anc"
+            repo_anc.mkdir()
+            anc_sentinel_dir = root / "anc_sentinel_dir"
+            anc_sentinel_dir.mkdir()
+            (anc_sentinel_dir / "target.py").write_text("PRISTINE_ANC", encoding="utf-8")
+            subprocess.run(["git", "init", "-q"], cwd=repo_anc, check=True)
+            subprocess.run(["git", "config", "user.name", "t"], cwd=repo_anc, check=True)
+            subprocess.run(["git", "config", "user.email", "t@example.com"], cwd=repo_anc, check=True)
+            (repo_anc / "sub").symlink_to(anc_sentinel_dir)
+            subprocess.run(["git", "add", "sub"], cwd=repo_anc, check=True)
+            subprocess.run(["git", "commit", "-q", "-m", "ancestor symlink"], cwd=repo_anc, check=True)
+
+            prop_anc = create_proposal(
+                proposal_id="prop-anc", failure_description="f", failure_artifacts=[{"path": str(obs)}],
+                kind="check", target_path="sub/target.py", content_path=cand, baseline_identity="b1",
+                candidate_identity="c1", expected_improvement_description="exp",
+                improvement_cases=[imp], regression_cases=[reg],
+            )
+            with self.assertRaises(UsageError):
+                evaluate_proposal(prop_anc, root / "ev_anc", repo=repo_anc)
+            self.assertEqual((anc_sentinel_dir / "target.py").read_text(encoding="utf-8"), "PRISTINE_ANC")
+
+    def test_group1_rejects_dangling_symlink_and_existing_directory_targets(self) -> None:
+        import subprocess
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            obs, cand, imp, reg = _sample_fixtures(root)
+
+            # Dangling symlink
+            repo_dangle = root / "repo_dangle"
+            repo_dangle.mkdir()
+            subprocess.run(["git", "init", "-q"], cwd=repo_dangle, check=True)
+            subprocess.run(["git", "config", "user.name", "t"], cwd=repo_dangle, check=True)
+            subprocess.run(["git", "config", "user.email", "t@example.com"], cwd=repo_dangle, check=True)
+            (repo_dangle / "target.py").symlink_to(root / "nonexistent_target_file")
+            subprocess.run(["git", "add", "target.py"], cwd=repo_dangle, check=True)
+            subprocess.run(["git", "commit", "-q", "-m", "dangling symlink"], cwd=repo_dangle, check=True)
+
+            prop = create_proposal(
+                proposal_id="prop-dangle", failure_description="f", failure_artifacts=[{"path": str(obs)}],
+                kind="check", target_path="target.py", content_path=cand, baseline_identity="b1",
+                candidate_identity="c1", expected_improvement_description="exp",
+                improvement_cases=[imp], regression_cases=[reg],
+            )
+            with self.assertRaises(UsageError):
+                evaluate_proposal(prop, root / "ev_dangle", repo=repo_dangle)
+
+            # Existing directory destination
+            repo_dir = root / "repo_dir"
+            repo_dir.mkdir()
+            (repo_dir / "target.py").mkdir()
+            (repo_dir / "target.py" / "keep.txt").write_text("keep", encoding="utf-8")
+            subprocess.run(["git", "init", "-q"], cwd=repo_dir, check=True)
+            subprocess.run(["git", "config", "user.name", "t"], cwd=repo_dir, check=True)
+            subprocess.run(["git", "config", "user.email", "t@example.com"], cwd=repo_dir, check=True)
+            subprocess.run(["git", "add", "."], cwd=repo_dir, check=True)
+            subprocess.run(["git", "commit", "-q", "-m", "target is dir"], cwd=repo_dir, check=True)
+            with self.assertRaises(UsageError):
+                evaluate_proposal(prop, root / "ev_dir", repo=repo_dir)
+
+    def test_group1_normal_nested_target_succeeds(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            obs, cand, imp, reg = _sample_fixtures(root)
+            nested_imp = {
+                "case_id": "IMP-NESTED", "description": "Candidate nested target",
+                "command": "python3 -c \"import sys, pathlib; p = pathlib.Path('a/b/c/target.py'); sys.exit(0 if (p.exists() and 'improved' in p.read_text()) else 1)\"",
+                "rubric": {"rubric_id": "R-NESTED", "summary": "exits 0", "expected_exit_code": 0, "required_output_tokens": [], "forbidden_output_tokens": []},
+            }
+            prop = create_proposal(
+                proposal_id="prop-nested", failure_description="f", failure_artifacts=[{"path": str(obs)}],
+                kind="check", target_path="a/b/c/target.py", content_path=cand, baseline_identity="b1",
+                candidate_identity="c1", expected_improvement_description="exp",
+                improvement_cases=[nested_imp], regression_cases=[reg],
+            )
+            report = evaluate_proposal(prop, root / "ev_nested")
+            self.assertEqual(report["eligibility"], "improvement-eligible")
+
+
 
 
 if __name__ == "__main__":
