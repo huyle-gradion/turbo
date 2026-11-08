@@ -484,7 +484,20 @@ def _execute_delivery(paths: RuntimePaths, spec: DeliverSpec, *, require_final_a
                     loc_cand = gitio.commit_sha(paths.repo, f"refs/heads/{head_branch}") if (head_branch and gitio.branch_exists(paths.repo, head_branch)) else None
                     cand_sha = rem_cand or loc_cand or prev_cand
                     orig_base = str(prev_child.get("base_sha") or prev_rec.get("base_sha") or "")
-                    auth_base_sha = orig_base if (orig_base and SHA40_RE.fullmatch(orig_base)) else live_feat_sha
+                    is_recovering = False
+                    if (prev_cdir / "integration-record.json").is_file():
+                        try:
+                            _pr_rec = json.loads((prev_cdir / "integration-record.json").read_text(encoding="utf-8"))
+                            is_recovering = bool(_pr_rec.get("candidate_sha") == cand_sha and _pr_rec.get("status") in ("confirmed", "uncertain"))
+                        except Exception:
+                            is_recovering = False
+                    elif (prev_cdir / "integration-request.json").is_file():
+                        try:
+                            _pr_req = json.loads((prev_cdir / "integration-request.json").read_text(encoding="utf-8"))
+                            is_recovering = bool(_pr_req.get("candidate_sha") == cand_sha)
+                        except Exception:
+                            is_recovering = False
+                    auth_base_sha = (orig_base if (orig_base and SHA40_RE.fullmatch(orig_base)) else live_feat_sha) if is_recovering else live_feat_sha
                     try:
                         app_rec = enforce_delivery_approval(
                             candidate_sha=cand_sha, base_sha=auth_base_sha, repo=paths.repo, home=paths.home,
