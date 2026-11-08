@@ -271,7 +271,7 @@ def run_delivery_lifecycle_demo(evidence_dir: Path) -> dict[str, Any]:
             txt = f"candidate_sha={cand_2}\nbase_sha={base_sha}\ntested_sha={cand_2}\nrevision_kind=fast-forward-head\ncheck ok\n"
             lp = child_dir / f"ci-cand2-{idx}.log"
             lp.write_text(txt, encoding="utf-8")
-            b_checks.append({**c, "candidate_sha": cand_2, "tested_sha": cand_2, "output_path": str(lp), "output_sha256": runner.digest_text(txt)})
+            b_checks.append({**c, "candidate_sha": cand_2, "tested_sha": cand_2, "revision_kind": "fast-forward-head", "output_path": str(lp), "output_sha256": runner.digest_text(txt)})
         ci_cand2 = {**ci_b, "candidate_sha": cand_2, "tested_sha": cand_2, "revision_kind": "fast-forward-head", "checks": b_checks, "pr": {**ci_b["pr"], "head_sha": cand_2}}
         atomic_json(child_dir / "ci-verification.json", ci_cand2, home)
 

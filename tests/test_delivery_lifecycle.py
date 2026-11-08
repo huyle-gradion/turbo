@@ -32,8 +32,13 @@ class DeliveryApprovalLifecycleTest(unittest.TestCase):
             # 2. Ineffective correction: reviewer claims fix, but reproducer executes and fails; delivery rejects
             self.assertFalse(s2.get("delivery_approved"))
             self.assertIsNone(s2.get("approved_revision"))
+            self.assertTrue(s2.get("reproducer_executed"))
             self.assertFalse(s2.get("reproducer_ok"))
+            self.assertEqual(s2.get("finding_status"), "open")
             self.assertEqual(s2.get("resolution_blocker"), "check-failed")
+            self.assertFalse(any("revision binding" in b or "CI check" in b for b in s2.get("blockers", [])))
+            s2_deliv = json.loads((evidence_dir / "stages" / "stage-2-ineffective" / "delivery-result.json").read_text(encoding="utf-8"))
+            self.assertTrue(s2_deliv.get("ci_verified"))
 
             # 3. Verified correction: actual correction passes reproducer and checks; delivery APPROVES
             self.assertTrue(s3.get("delivery_approved"))
