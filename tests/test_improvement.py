@@ -654,6 +654,67 @@ class ImprovementWorkflowTest(unittest.TestCase):
                     self.assertIsInstance(issues, list)
                     self.assertGreater(len(issues), 0, f"Expected {label!r} to be rejected")
 
+    def test_group_b_candidate_launch_failures_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            obs, cand, imp, reg = _sample_fixtures(root)
+
+            # 1. Candidate regression commands exiting 124, 126, 127 with rubrics expecting those codes
+            for code in (124, 126, 127):
+                with self.subTest(candidate_reg_exit=code):
+                    reg_launch = {
+                        "case_id": f"REG-LAUNCH-{code}", "description": "Launch fail regression",
+                        "command": f"python3 -c \"import sys; sys.exit({code})\"",
+                        "rubric": {"rubric_id": f"R-REG-{code}", "expected_exit_code": code, "required_output_tokens": [], "forbidden_output_tokens": []},
+                    }
+                    prop = create_proposal(
+                        proposal_id=f"prop-reg-code-{code}", failure_description="f", failure_artifacts=[{"path": str(obs)}],
+                        kind="check", target_path="target.py", content_path=cand, baseline_identity="b1",
+                        candidate_identity="c1", expected_improvement_description="exp",
+                        improvement_cases=[imp], regression_cases=[reg_launch],
+                    )
+                    rep = evaluate_proposal(prop, root / f"ev_reg_{code}")
+                    self.assertEqual(rep["eligibility"], "ineligible")
+                    self.assertFalse(rep["comparison"]["candidate_regressions_passed"])
+                    self.assertFalse(rep["comparison"]["rule_satisfied"])
+                    self.assertEqual(validate_report_for_review(rep), [])
+
+                    # Forged report claiming eligibility must be rejected by review
+                    forged = json.loads(json.dumps(rep))
+                    forged["eligibility"] = "improvement-eligible"
+                    forged["comparison"]["candidate_regressions_passed"] = True
+                    forged["comparison"]["rule_satisfied"] = True
+                    forged["eligibility_reasons"] = []
+                    self.assertGreater(len(validate_report_for_review(forged)), 0)
+
+            # 2. Candidate improvement command exiting 124, 126, 127
+            for code in (124, 126, 127):
+                with self.subTest(candidate_imp_exit=code):
+                    imp_launch = {
+                        "case_id": f"IMP-LAUNCH-{code}", "description": "Candidate launch fail",
+                        "command": f"python3 -c \"import sys, pathlib; p = pathlib.Path('target.py'); sys.exit({code} if (p.exists() and 'improved' in p.read_text()) else 1)\"",
+                        "rubric": {"rubric_id": f"R-IMP-{code}", "expected_exit_code": code, "required_output_tokens": [], "forbidden_output_tokens": []},
+                    }
+                    prop = create_proposal(
+                        proposal_id=f"prop-imp-code-{code}", failure_description="f", failure_artifacts=[{"path": str(obs)}],
+                        kind="check", target_path="target.py", content_path=cand, baseline_identity="b1",
+                        candidate_identity="c1", expected_improvement_description="exp",
+                        improvement_cases=[imp_launch], regression_cases=[reg],
+                    )
+                    rep = evaluate_proposal(prop, root / f"ev_imp_{code}")
+                    self.assertEqual(rep["eligibility"], "ineligible")
+                    self.assertFalse(rep["comparison"]["candidate_demonstrated_success"])
+                    self.assertFalse(rep["comparison"]["rule_satisfied"])
+                    self.assertEqual(validate_report_for_review(rep), [])
+
+                    # Forged report claiming candidate_demonstrated_success must be rejected
+                    forged = json.loads(json.dumps(rep))
+                    forged["eligibility"] = "improvement-eligible"
+                    forged["comparison"]["candidate_demonstrated_success"] = True
+                    forged["comparison"]["rule_satisfied"] = True
+                    forged["eligibility_reasons"] = []
+                    self.assertGreater(len(validate_report_for_review(forged)), 0)
+
 
 
 

@@ -328,6 +328,21 @@ def _execute_case(worktree: Path, case: dict[str, Any], side: str, proposal: dic
     }
 
 
+def _is_launch_failure(r: Any) -> bool:
+    if not isinstance(r, dict):
+        return True
+    return (not r.get("executed")) or bool(r.get("timed_out")) or bool(r.get("execution_error")) or (r.get("exit_code") in (124, 126, 127))
+
+
+def _candidate_case_success(r: Any) -> bool:
+    if not isinstance(r, dict):
+        return False
+    rf = r.get("rubric_failures")
+    if not isinstance(rf, list) or len(rf) != 0:
+        return False
+    return bool(r.get("rubric_passed")) and not _is_launch_failure(r)
+
+
 def evaluate_proposal(
     proposal: dict[str, Any], evidence_dir: Path, *, repo: Path | None = None,
     telemetry: dict[str, Any] | None = None, rate_card: worker.RateCard | None = None,
@@ -376,12 +391,21 @@ def evaluate_proposal(
     for ic in proposal["improvement_cases"]:
         cid = ic["case_id"]
         br, cr = b_by_id[cid], c_by_id[cid]
-        if br["rubric_passed"]: eligibility_reasons.append(f"improvement case {cid!r} passed on baseline; no behavioral improvement demonstrated")
-        elif not br["is_behavioral_failure"]: eligibility_reasons.append(f"baseline had execution error or timeout on {cid!r}; launch failure is not behavioral failure")
-        if not cr["rubric_passed"]: eligibility_reasons.append(f"candidate failed improvement case {cid!r}: {'; '.join(cr['rubric_failures'])}")
+        if br["rubric_passed"]:
+            eligibility_reasons.append(f"improvement case {cid!r} passed on baseline; no behavioral improvement demonstrated")
+        elif not br["is_behavioral_failure"]:
+            eligibility_reasons.append(f"baseline had execution error or timeout on {cid!r}; launch failure is not behavioral failure")
+        if _is_launch_failure(cr):
+            eligibility_reasons.append(f"candidate had launch failure or timeout on {cid!r}; launch failure cannot establish success")
+        elif not cr["rubric_passed"]:
+            eligibility_reasons.append(f"candidate failed improvement case {cid!r}: {'; '.join(cr['rubric_failures'])}")
     for rc in proposal["regression_cases"]:
         rid = rc["case_id"]
-        if not c_by_id[rid]["rubric_passed"]: eligibility_reasons.append(f"candidate failed required regression {rid!r}: {'; '.join(c_by_id[rid]['rubric_failures'])}")
+        cr = c_by_id[rid]
+        if _is_launch_failure(cr):
+            eligibility_reasons.append(f"candidate had launch failure or timeout on regression {rid!r}; launch failure cannot establish regression pass")
+        elif not cr["rubric_passed"]:
+            eligibility_reasons.append(f"candidate failed required regression {rid!r}: {'; '.join(cr['rubric_failures'])}")
     eligible = len(eligibility_reasons) == 0
     report = {
         "schema_version": REPORT_SCHEMA_VERSION, "proposal_digest": prop_digest, "factory_revision": factory_rev,
@@ -393,8 +417,8 @@ def evaluate_proposal(
         "comparison": {
             "rule": proposal["expected_improvement"]["rule"], "rule_satisfied": eligible,
             "baseline_demonstrated_failure": all(r["is_behavioral_failure"] for r in b_cases if r["case_kind"] == "improvement"),
-            "candidate_demonstrated_success": all(r["rubric_passed"] for r in c_cases if r["case_kind"] == "improvement"),
-            "candidate_regressions_passed": len(proposal["regression_cases"]) > 0 and all(r["rubric_passed"] for r in c_cases if r["case_kind"] == "regression"),
+            "candidate_demonstrated_success": all(_candidate_case_success(r) for r in c_cases if r["case_kind"] == "improvement"),
+            "candidate_regressions_passed": len(proposal["regression_cases"]) > 0 and all(_candidate_case_success(r) for r in c_cases if r["case_kind"] == "regression"),
             "reasons": eligibility_reasons,
         },
         "measurements": {
@@ -502,25 +526,14 @@ def validate_report_for_review(report: dict[str, Any], *, proposal_json: str | N
     def _is_behavioral_failure(r: Any) -> bool:
         if not isinstance(r, dict):
             return False
-        exec_err = r.get("execution_error")
         rf = r.get("rubric_failures")
         if not isinstance(rf, list):
             return False
-        is_launch = (not r.get("executed")) or r.get("timed_out") or bool(exec_err) or (r.get("exit_code") in (124, 126, 127))
-        return (not is_launch) and (not r.get("rubric_passed", False)) and bool(r.get("is_behavioral_failure"))
-
-    def _passed_rubric(r: Any) -> bool:
-        if not isinstance(r, dict):
-            return False
-        exec_err = r.get("execution_error")
-        rf = r.get("rubric_failures")
-        if not isinstance(rf, list) or len(rf) != 0:
-            return False
-        return bool(r.get("executed")) and (not r.get("timed_out")) and (not exec_err) and bool(r.get("rubric_passed"))
+        return (not _is_launch_failure(r)) and (not r.get("rubric_passed", False)) and bool(r.get("is_behavioral_failure"))
 
     raw_base_fail = bool(b_imp) and all(_is_behavioral_failure(r) for r in b_imp)
-    raw_cand_succ = bool(c_imp) and all(_passed_rubric(r) for r in c_imp)
-    raw_cand_reg_pass = bool(c_reg) and all(_passed_rubric(r) for r in c_reg)
+    raw_cand_succ = bool(c_imp) and all(_candidate_case_success(r) for r in c_imp)
+    raw_cand_reg_pass = bool(c_reg) and all(_candidate_case_success(r) for r in c_reg)
     raw_rule_satisfied = raw_base_fail and raw_cand_succ and raw_cand_reg_pass
 
     comp = report.get("comparison")
