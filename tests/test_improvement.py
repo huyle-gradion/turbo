@@ -6,9 +6,12 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import subprocess
 import tempfile
 import unittest
+import unittest.mock
 
+import factory.improvement
 from factory.errors import UsageError
 from factory.improvement import (
     AUTHORITY_NOTE, canonicalize_draft_references, create_proposal, evaluate_proposal,
@@ -845,6 +848,148 @@ class ImprovementWorkflowTest(unittest.TestCase):
             input_file2.write_text("mutated-content\n")
             with self.assertRaises(UsageError):
                 evaluate_proposal(prop_mismatch, root / "ev_mismatch")
+
+    def test_group5_guaranteed_cleanup_and_external_homes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            obs = _write_file(root / "obs.txt", "err\n")
+            cand = _write_file(root / "cand.py", "def check(): return 'improved'\n")
+            imp = {
+                "case_id": "IMP-01", "description": "imp",
+                "command": "python3 -c \"import sys; sys.exit(0)\"",
+                "rubric": {"rubric_id": "R1", "expected_exit_code": 0, "required_output_tokens": [], "forbidden_output_tokens": []},
+            }
+            reg = {
+                "case_id": "REG-01", "description": "reg",
+                "command": "python3 -c \"import sys; sys.exit(0)\"",
+                "rubric": {"rubric_id": "R2", "expected_exit_code": 0, "required_output_tokens": [], "forbidden_output_tokens": []},
+            }
+            prop = create_proposal(
+                proposal_id="prop-g5", failure_description="f", failure_artifacts=[{"path": str(obs)}],
+                kind="check", target_path="target.py", content_path=cand, baseline_identity="b1",
+                candidate_identity="c1", expected_improvement_description="exp",
+                improvement_cases=[imp], regression_cases=[reg],
+            )
+
+            # 1. Status-sensitive case in git repo: no _home artifact, no false regression
+            repo_dir = root / "git_repo"
+            repo_dir.mkdir(parents=True, exist_ok=True)
+            subprocess.run(["git", "init", "-q"], cwd=repo_dir, check=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=repo_dir, check=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo_dir, check=True)
+            _write_file(repo_dir / "target.py", "def check(): return 'base'\n")
+            subprocess.run(["git", "add", "."], cwd=repo_dir, check=True)
+            subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=repo_dir, check=True)
+
+            status_imp = {
+                "case_id": "IMP-GIT", "description": "Candidate improves target and introduces no untracked _home",
+                "command": "python3 -c \"import sys, subprocess, pathlib; out = subprocess.check_output(['git', 'status', '--porcelain'], text=True); p = pathlib.Path('target.py'); has_untracked = any(line.startswith('??') for line in out.splitlines()); sys.exit(0 if (not has_untracked and 'improved' in p.read_text()) else 1)\"",
+                "rubric": {"rubric_id": "R-GIT", "expected_exit_code": 0, "required_output_tokens": [], "forbidden_output_tokens": []},
+            }
+            status_reg = {
+                "case_id": "REG-GIT", "description": "No untracked files introduced by evaluation on baseline or candidate",
+                "command": "python3 -c \"import sys, subprocess; out = subprocess.check_output(['git', 'status', '--porcelain'], text=True); sys.exit(0 if not any(line.startswith('??') for line in out.splitlines()) else 1)\"",
+                "rubric": {"rubric_id": "R-GIT-REG", "expected_exit_code": 0, "required_output_tokens": [], "forbidden_output_tokens": []},
+            }
+            prop_git = create_proposal(
+                proposal_id="prop-git", failure_description="f", failure_artifacts=[{"path": str(obs)}],
+                kind="check", target_path="target.py", content_path=cand, baseline_identity="b1",
+                candidate_identity="c1", expected_improvement_description="exp",
+                improvement_cases=[status_imp], regression_cases=[status_reg],
+            )
+            ev_git = root / "ev_git"
+            rep_git = evaluate_proposal(prop_git, ev_git, repo=repo_dir)
+            self.assertEqual(rep_git["eligibility"], "improvement-eligible")
+
+            # Check homes location and distinctness across sides/cases
+            homes_dir = ev_git / "attempts" / "attempt-1" / "homes"
+            self.assertTrue(homes_dir.is_dir())
+            b_imp_home = homes_dir / "baseline" / "IMP-GIT"
+            c_imp_home = homes_dir / "candidate" / "IMP-GIT"
+            c_reg_home = homes_dir / "candidate" / "REG-GIT"
+            self.assertTrue(b_imp_home.is_dir())
+            self.assertTrue(c_imp_home.is_dir())
+            self.assertTrue(c_reg_home.is_dir())
+            self.assertNotEqual(b_imp_home, c_imp_home)
+            self.assertNotEqual(c_imp_home, c_reg_home)
+
+            # Ensure no worktrees remain orphaned after successful run
+            wt_dir = ev_git / "attempts" / "attempt-1" / "worktrees"
+            self.assertTrue(not wt_dir.exists() or len(list(wt_dir.iterdir())) == 0)
+
+            # 2. Preparation failure after directory creation cleans up worktree
+            def fail_prep(src_repo, dest_worktree, ref):
+                dest_worktree.mkdir(parents=True, exist_ok=True)
+                (dest_worktree / "leak.txt").write_text("partial")
+                raise RuntimeError("simulated prep failure")
+
+            with unittest.mock.patch("factory.worker.prepare_isolated_git_checkout", side_effect=fail_prep):
+                ev_prep = root / "ev_prep"
+                with self.assertRaises(RuntimeError):
+                    evaluate_proposal(prop, ev_prep, repo=repo_dir)
+                prep_manifest = json.loads((ev_prep / "attempts" / "attempt-1" / "attempt-manifest.json").read_text())
+                self.assertEqual(prep_manifest["status"], "failed")
+                prep_wt_dir = ev_prep / "attempts" / "attempt-1" / "worktrees"
+                self.assertTrue(not prep_wt_dir.exists() or len(list(prep_wt_dir.iterdir())) == 0)
+
+            # 3. Execution interruption cleans up worktree and preserves interrupted evidence
+            with unittest.mock.patch("factory.improvement._execute_case", side_effect=KeyboardInterrupt("simulated interrupt")):
+                ev_intr = root / "ev_intr"
+                with self.assertRaises(KeyboardInterrupt):
+                    evaluate_proposal(prop, ev_intr)
+                intr_manifest = json.loads((ev_intr / "attempts" / "attempt-1" / "attempt-manifest.json").read_text())
+                self.assertEqual(intr_manifest["status"], "interrupted")
+                intr_wt_dir = ev_intr / "attempts" / "attempt-1" / "worktrees"
+                self.assertTrue(not intr_wt_dir.exists() or len(list(intr_wt_dir.iterdir())) == 0)
+
+            # 4. Per-case persistence failure cleans up worktree and propagates original failure
+            orig_write_json = factory.improvement._write_json
+            def fail_per_case(path, data):
+                if path.name == "IMP-01.json":
+                    raise OSError("simulated per-case persistence error")
+                return orig_write_json(path, data)
+
+            with unittest.mock.patch("factory.improvement._write_json", side_effect=fail_per_case):
+                ev_pers = root / "ev_pers"
+                with self.assertRaises(OSError):
+                    evaluate_proposal(prop, ev_pers)
+                pers_wt_dir = ev_pers / "attempts" / "attempt-1" / "worktrees"
+                self.assertTrue(not pers_wt_dir.exists() or len(list(pers_wt_dir.iterdir())) == 0)
+
+            # 5. Substitution or staging failure cleanup
+            with unittest.mock.patch("factory.improvement._write_confined_file", side_effect=UsageError("staging fail")):
+                ev_sub = root / "ev_sub"
+                prop_with_inp = create_proposal(
+                    proposal_id="prop-sub-fail", failure_description="f", failure_artifacts=[{"path": str(obs)}],
+                    kind="check", target_path="target.py", content_path=cand, baseline_identity="b1",
+                    candidate_identity="c1", expected_improvement_description="exp",
+                    improvement_cases=[{
+                        "case_id": "IMP-01", "command": "python3 -c \"import sys; sys.exit(0)\"",
+                        "rubric": {"rubric_id": "R1", "expected_exit_code": 0, "required_output_tokens": [], "forbidden_output_tokens": []},
+                        "inputs": [{"path": str(obs), "target_path": "staged.txt", "sha256": hashlib.sha256(b"err\n").hexdigest()}],
+                    }],
+                    regression_cases=[reg],
+                )
+                with self.assertRaises(UsageError):
+                    evaluate_proposal(prop_with_inp, ev_sub)
+                sub_wt_dir = ev_sub / "attempts" / "attempt-1" / "worktrees"
+                self.assertTrue(not sub_wt_dir.exists() or len(list(sub_wt_dir.iterdir())) == 0)
+
+            # 6. Secondary failure in failure recording does not replace original exception
+            sec_calls = [0]
+            def fail_secondary_json(path, data):
+                sec_calls[0] += 1
+                if sec_calls[0] > 1:
+                    raise OSError("simulated secondary write failure")
+                return orig_write_json(path, data)
+
+            with unittest.mock.patch("factory.improvement._execute_case", side_effect=KeyError("original-error")):
+                with unittest.mock.patch("factory.improvement._write_json", side_effect=fail_secondary_json):
+                    ev_sec = root / "ev_sec"
+                    with self.assertRaises(KeyError) as cm:
+                        evaluate_proposal(prop, ev_sec)
+                    self.assertEqual(str(cm.exception), "'original-error'")
+
 
 
 if __name__ == "__main__":

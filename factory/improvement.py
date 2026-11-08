@@ -330,7 +330,7 @@ def create_proposal(
 
 def _execute_case(worktree: Path, case: dict[str, Any], side: str, proposal: dict[str, Any], attempt_dir: Path, timeout_s: int) -> dict[str, Any]:
     cid, argv = case["case_id"], deliver_checks._verification_argv(case["command"])
-    isolated_home = safe_dir(worktree / "_home", create=True)
+    isolated_home = safe_dir(attempt_dir / "homes" / side / cid, create=True)
     env, _ = worker.sanitized_env(dict(os.environ), worktree, isolated_home)
     env["TURBO_DISPOSABLE_SERVICES_ONLY"] = "1"
     env["PYTHONPATH"] = f"{worktree}:{worktree / 'tests'}" if (worktree / "tests").is_dir() else str(worktree)
@@ -424,26 +424,36 @@ def evaluate_proposal(
         for side, store in (("baseline", b_cases), ("candidate", c_cases)):
             for kind, case in [("improvement", c) for c in proposal["improvement_cases"]] + [("regression", c) for c in proposal["regression_cases"]]:
                 wt = attempt_dir / "worktrees" / f"{side}_{case['case_id']}"
-                if repo and (repo / ".git").is_dir(): worker.prepare_isolated_git_checkout(repo, wt, "HEAD")
-                elif repo and repo.is_dir(): shutil.copytree(repo, wt, dirs_exist_ok=True)
-                else: wt.mkdir(parents=True, exist_ok=True)
-                for target_rel, inp_bytes in staged_inputs.get(case["case_id"], []):
-                    _write_confined_file(wt, target_rel, inp_bytes)
-                if side == "candidate":
-                    target_rel = str(proposal["proposed_change"]["target_path"])
-                    _write_confined_file(wt, target_rel, cand_bytes)
-                res = _execute_case(wt, case, side, proposal, attempt_dir, timeout_s)
-                res["case_kind"] = kind
-                store.append(res)
-                _write_json(attempt_dir / side / f"{case['case_id']}.json", res)
-                manifest["completed_cases"].append(f"{side}:{case['case_id']}")
-                _write_json(manifest_path, manifest)
-                shutil.rmtree(wt, ignore_errors=True)
+                try:
+                    if repo and (repo / ".git").is_dir(): worker.prepare_isolated_git_checkout(repo, wt, "HEAD")
+                    elif repo and repo.is_dir(): shutil.copytree(repo, wt, dirs_exist_ok=True)
+                    else: wt.mkdir(parents=True, exist_ok=True)
+                    for target_rel, inp_bytes in staged_inputs.get(case["case_id"], []):
+                        _write_confined_file(wt, target_rel, inp_bytes)
+                    if side == "candidate":
+                        target_rel = str(proposal["proposed_change"]["target_path"])
+                        _write_confined_file(wt, target_rel, cand_bytes)
+                    res = _execute_case(wt, case, side, proposal, attempt_dir, timeout_s)
+                    res["case_kind"] = kind
+                    store.append(res)
+                    _write_json(attempt_dir / side / f"{case['case_id']}.json", res)
+                    manifest["completed_cases"].append(f"{side}:{case['case_id']}")
+                    _write_json(manifest_path, manifest)
+                finally:
+                    if wt.exists() or wt.is_symlink():
+                        shutil.rmtree(wt, ignore_errors=True)
     except BaseException as exc:
         manifest["status"] = "interrupted" if isinstance(exc, (KeyboardInterrupt, TimeoutError)) else "failed"
         manifest["error"], manifest["completed_at"] = str(exc), now()
-        _write_json(manifest_path, manifest)
+        try:
+            _write_json(manifest_path, manifest)
+        except Exception:
+            pass
         raise
+    finally:
+        worktrees_dir = attempt_dir / "worktrees"
+        if worktrees_dir.exists():
+            shutil.rmtree(worktrees_dir, ignore_errors=True)
     eligibility_reasons: list[str] = []
     b_by_id, c_by_id = {r["case_id"]: r for r in b_cases}, {r["case_id"]: r for r in c_cases}
     for ic in proposal["improvement_cases"]:
