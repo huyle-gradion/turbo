@@ -119,10 +119,9 @@ def evaluate_ci_prerequisite(candidate_sha: str, base_sha: str, ci_record: Any, 
         if (err := _verify_file_digest(c.get("output_path"), c.get("output_sha256"), home, f"CI check {cname!r}", rev_bind=(candidate_sha, base_sha, rec_tested))) is not None:
             return _fail("stale-ci-evidence" if err.startswith("stale:") else "ci-evidence-invalid", err.removeprefix("stale:"))
     if (missing_req := sorted(req_names - {str(c.get("name") or "").strip() for c in checks})): return _fail("ci-missing", f"missing required CI checks on {candidate_sha}: {', '.join(missing_req)}")
-    if (pr := ci_record.get("pr")) is not None:
-        if not isinstance(pr, dict): return _fail("ci-evidence-invalid", "CI record pr field must be an object")
-        if pr.get("state") != "open" or pr.get("merged") is not False or pr.get("head_sha") != candidate_sha or pr.get("base_sha") != base_sha: return _fail("stale-ci-evidence", f"PR state or revision drifted from candidate {candidate_sha}")
-        if pr.get("pr_confirmed") is not True or pr.get("ci_verified") is not True or pr.get("verified") is not True: return _fail("ci-failed", "CI record PR verification flags are not True")
+    if not isinstance(pr := ci_record.get("pr"), dict): return _fail("ci-evidence-invalid", "CI record pr field must be an object")
+    if pr.get("state") != "open" or pr.get("merged") is not False or pr.get("head_sha") != candidate_sha or pr.get("base_sha") != base_sha: return _fail("stale-ci-evidence", f"PR state or revision drifted from candidate {candidate_sha}")
+    if pr.get("pr_confirmed") is not True or pr.get("ci_verified") is not True or pr.get("verified") is not True: return _fail("ci-failed", "CI record PR verification flags are not True")
     if repo is not None and (head_branch := str(ci_record.get("head_branch") or "").strip()):
         if (br_res := gitio.git(repo, "rev-parse", "--verify", f"refs/heads/{head_branch}")).ok and br_res.output.strip() != candidate_sha: return _fail("stale-ci-evidence", f"branch {head_branch} head {br_res.output.strip()} drifted from CI candidate {candidate_sha}")
     if ci_record.get("status") != "verified" or ci_record.get("verified") is not True or not isinstance(ci_record.get("blockers", []), list) or bool(ci_record.get("blockers")): return _fail("ci-failed", list(ci_record.get("blockers") or ["CI record is not verified"]))

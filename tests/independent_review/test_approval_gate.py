@@ -137,6 +137,8 @@ class ApprovalGateGroup1Test(unittest.TestCase):
                 ("ci-stale-policy", {"ci_record": {**ci3, "policy_sha": cand1}}, "stale-ci-evidence"),
                 ("ci-cached-result", {"ci_record": {**ci3, "checks": [{**ci3["checks"][0], "cached_result": True}, *ci3["checks"][1:]]}}, "stale-ci-evidence"),
                 ("ci-closed-pr", {"ci_record": {**ci3, "pr": {**ci3["pr"], "state": "closed"}}}, "stale-ci-evidence"),
+                ("ci-pr-missing", {"ci_record": {k: v for k, v in ci3.items() if k != "pr"}}, "ci-evidence-invalid"),
+                ("ci-pr-null", {"ci_record": {**ci3, "pr": None}}, "ci-evidence-invalid"),
                 ("ci-pr-no-state", {"ci_record": {**ci3, "pr": {k: v for k, v in ci3["pr"].items() if k != "state"}}}, "stale-ci-evidence"),
                 ("ci-pr-no-merged", {"ci_record": {**ci3, "pr": {k: v for k, v in ci3["pr"].items() if k != "merged"}}}, "stale-ci-evidence"),
                 ("ci-pr-no-head", {"ci_record": {**ci3, "pr": {k: v for k, v in ci3["pr"].items() if k != "head_sha"}}}, "stale-ci-evidence"),
