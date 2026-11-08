@@ -847,13 +847,19 @@ class DeliverChildTest(unittest.TestCase):
                 git(repo, "push", "-q", "origin", f"{cand_b}:refs/heads/{head_branch}")
                 git(repo, "checkout", "-q", "main")
 
-                r_stale_cand = deliver_module.deliver_feature(paths, spec)
-                self.assertEqual((r_stale_cand.status, r_stale_cand.verified, r_stale_cand.delivery_approved, r_stale_cand.approved_revision), ("stale-candidate-revision", False, False, None))
-                self.assertTrue(any(cand_a in b and cand_b in b for b in r_stale_cand.blockers), r_stale_cand.blockers)
-                gate_stale = json.loads((child_dir / "approval-gate.json").read_text(encoding="utf-8"))
-                for rec_map in (json.loads((att_dir / "record.json").read_text(encoding="utf-8")), json.loads((home / "deliveries" / "900" / "record.json").read_text(encoding="utf-8"))):
-                    self.assertEqual((rec_map["status"], rec_map["verified"], rec_map["delivery_approved"], rec_map["approved_revision"]), ("stale-candidate-revision", False, False, None))
-                self.assertEqual((gate_stale["status"], gate_stale["delivery_approved"], gate_stale["approved_revision"], gate_stale.get("superseded_approved_revision")), ("stale-candidate-revision", False, None, cand_a))
+                for resume_idx in (1, 2):
+                    r_stale_cand = deliver_module.deliver_feature(paths, spec)
+                    self.assertIn(r_stale_cand.status, ("stale-candidate-revision", "stale-ci-evidence"), f"resume {resume_idx}")
+                    self.assertEqual((r_stale_cand.candidate_sha, r_stale_cand.base_sha, r_stale_cand.verified, r_stale_cand.delivery_approved, r_stale_cand.approved_revision, r_stale_cand.ci_verified), (cand_b, base_1, False, False, None, False), f"resume {resume_idx}")
+                    self.assertNotEqual(r_stale_cand.tested_sha, cand_a)
+                    self.assertTrue(r_stale_cand.blockers)
+                    gate_stale = json.loads((child_dir / "approval-gate.json").read_text(encoding="utf-8"))
+                    for rec_map in (json.loads((att_dir / "record.json").read_text(encoding="utf-8")), json.loads((home / "deliveries" / "900" / "record.json").read_text(encoding="utf-8"))):
+                        self.assertEqual(rec_map["status"], r_stale_cand.status, f"resume {resume_idx} rec_map status")
+                        self.assertEqual((rec_map["candidate_sha"], rec_map["base_sha"], rec_map["verified"], rec_map["delivery_approved"], rec_map["approved_revision"], rec_map.get("ci_verified")), (cand_b, base_1, False, False, None, False), f"resume {resume_idx} rec_map")
+                        self.assertNotEqual(rec_map.get("tested_sha"), cand_a)
+                    self.assertEqual((gate_stale["delivery_approved"], gate_stale["approved_revision"]), (False, None))
+                    self.assertIn(gate_stale["status"], ("stale-candidate-revision", "stale-ci-evidence"))
 
                 b_child_contract = {**child_contract, "candidate_sha": cand_b}
                 gh.pulls[1]["head"]["sha"] = cand_b

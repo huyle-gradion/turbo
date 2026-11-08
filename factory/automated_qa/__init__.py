@@ -501,7 +501,7 @@ def evaluate_child_qa(
         return _run_isolated_check(
             worktree_dir, qa_home, env or qa_env, round_dir, home, stem,
             command, deadline, limit_s, explicit_argv=explicit_argv, secrets=secrets,
-            candidate_sha=candidate_sha, base_sha=base_sha, tested_sha=resolved_sha,
+            candidate_sha=candidate_sha, base_sha=base_sha, tested_sha=tested_sha or resolved_sha,
         )
 
     try:

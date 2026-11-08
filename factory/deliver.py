@@ -344,7 +344,7 @@ def _execute_delivery(paths: RuntimePaths, spec: DeliverSpec, *, require_final_a
                     head_branch, prev_cand = str(prev_child.get("head_branch") or ""), str(prev_child.get("candidate_sha") or "")
                     rem_cand = gitio.remote_ref(paths.repo, head_branch) if head_branch else None
                     loc_cand = gitio.commit_sha(paths.repo, f"refs/heads/{head_branch}") if (head_branch and gitio.branch_exists(paths.repo, head_branch)) else None
-                    cand_sha = rem_cand if (rem_cand and rem_cand != prev_cand) else (loc_cand if (loc_cand and loc_cand != prev_cand) else (rem_cand or loc_cand or prev_cand))
+                    cand_sha = rem_cand or loc_cand or prev_cand
                     app_rec = enforce_delivery_approval(
                         candidate_sha=cand_sha, base_sha=base_sha, repo=paths.repo, home=paths.home,
                         child_dir=prev_cdir, child=child0, conf=conf, deadline=deadline, limit_s=limit_s,
@@ -353,12 +353,14 @@ def _execute_delivery(paths: RuntimePaths, spec: DeliverSpec, *, require_final_a
                     st = "verified" if approved else str(app_rec.get("status") or "approval-rejected")
                     v_scope = approval_mod.APPROVAL_GATE_SCOPE_NOTE if approved else ci_gate.VERIFICATION_SCOPE_NOTE
                     blks = [] if approved else list(dict.fromkeys(app_rec.get("blockers") or []))
-                    t_sha = app_rec.get("tested_sha") or prev_child.get("tested_sha")
-                    r_kind = app_rec.get("revision_kind") or prev_child.get("revision_kind") or (prev_child.get("ci_verification") or {}).get("revision_kind")
+                    ci_eval = (app_rec.get("prerequisites") or {}).get("ci") or {}
+                    ci_ok = bool(ci_eval.get("verified") is True)
+                    t_sha = app_rec.get("tested_sha") or (ci_eval.get("tested_sha") if ci_ok else None)
+                    r_kind = app_rec.get("revision_kind") or (ci_eval.get("revision_kind") if ci_ok else None)
                     app_rev, app_out = (app_rec.get("approved_revision") if approved else None), ("approved" if approved else "rejected")
-                    upd_pr = {**(prev_child.get("pr") or {}), "verified": approved, "delivery_approved": approved, "approved_revision": app_rev}
+                    upd_pr = {**(prev_child.get("pr") or {}), "head_sha": cand_sha, "base_sha": base_sha, "ci_verified": ci_ok, "verified": approved, "delivery_approved": approved, "approved_revision": app_rev}
                     upd_child = {
-                        **prev_child, "status": st, "ci_verified": True, "verified": approved, "delivery_approved": approved,
+                        **prev_child, "status": st, "ci_verified": ci_ok, "verified": approved, "delivery_approved": approved,
                         "approval_outcome": app_out, "approved_revision": app_rev, "verification_scope": v_scope,
                         "base_sha": base_sha, "candidate_sha": cand_sha, "tested_sha": t_sha, "revision_kind": r_kind,
                         "approval": app_rec, "pr": upd_pr,
@@ -369,7 +371,7 @@ def _execute_delivery(paths: RuntimePaths, spec: DeliverSpec, *, require_final_a
                         verification_scope=v_scope, merged=False, factory_revision=factory_rev, feature_branch=feature_branch,
                         parent=redact_value(intake_res.parent, secrets), child=redact_value(upd_child, secrets),
                         blockers=redact_value(blks, secrets), measurements=prev_rec.get("measurements") or {},
-                        evidence=redact_value(upd_ev, secrets), recorded_at=now(), ci_verified=True, delivery_approved=approved,
+                        evidence=redact_value(upd_ev, secrets), recorded_at=now(), ci_verified=ci_ok, delivery_approved=approved,
                         approval_outcome=app_out, approved_revision=app_rev, candidate_sha=cand_sha, base_sha=base_sha,
                         tested_sha=t_sha, revision_kind=r_kind, approval=redact_value(app_rec, secrets),
                     )
