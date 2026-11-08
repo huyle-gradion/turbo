@@ -149,17 +149,17 @@ class DeliverChildTest(unittest.TestCase):
                     repo, home, asana.base_url, gh.base_url,
                     task="https://app.asana.com/0/12345/900", agy_bin=str(fake_wrapper),
                 )
-                self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+                self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
                 self.assertEqual(
-                    (payload["status"], payload["pr_opened"], payload["verified"], payload["merged"]),
-                    ("verified", True, True, False),
+                    (payload["status"], payload["pr_opened"], payload["ci_verified"], payload["verified"], payload["delivery_approved"], payload["merged"]),
+                    ("qa-missing", True, True, False, False, False),
                 )
                 self.assertIn("not independently reviewed", payload["verification_scope"])
-                self.assertNotIn(payload["status"], ("completed", "merged", "accepted"))
+                self.assertNotIn(payload["status"], ("completed", "merged", "accepted", "verified"))
                 child_rec = payload["child"]
                 self.assertEqual(
-                    (child_rec["gid"], child_rec["status"], child_rec["verified"], child_rec["base_branch"], child_rec["base_sha"]),
-                    ("101", "verified", True, "feature/chat-auth", main_sha_before),
+                    (child_rec["gid"], child_rec["status"], child_rec["ci_verified"], child_rec["verified"], child_rec["delivery_approved"], child_rec["base_branch"], child_rec["base_sha"]),
+                    ("101", "qa-missing", True, False, False, "feature/chat-auth", main_sha_before),
                 )
                 self.assertEqual(child_rec["scope_check"]["status"], "deterministic-only-semantic-unverified")
                 self.assertFalse(child_rec["scope_check"]["semantic_verified"])
@@ -168,8 +168,8 @@ class DeliverChildTest(unittest.TestCase):
                 self.assertEqual(ci_ver["revision_kind"], "integration-merge")
                 pr_info = child_rec["pr"]
                 self.assertEqual(
-                    (pr_info["number"], pr_info["base_ref"], pr_info["head_ref"], pr_info["head_sha"], pr_info["verified"], pr_info["ci_verified"]),
-                    (1, "feature/chat-auth", child_rec["head_branch"], child_rec["candidate_sha"], True, True),
+                    (pr_info["number"], pr_info["base_ref"], pr_info["head_ref"], pr_info["head_sha"], pr_info["verified"], pr_info["delivery_approved"], pr_info["ci_verified"]),
+                    (1, "feature/chat-auth", child_rec["head_branch"], child_rec["candidate_sha"], False, False, True),
                 )
                 for token in (
                     "900", "101", child_rec["candidate_sha"], main_sha_before, ci_ver["tested_sha"],
@@ -527,7 +527,10 @@ class DeliverChildTest(unittest.TestCase):
                 git(repo, "branch", f"{base_child_branch}-attempt-2", main_sha)
                 git(repo, "push", "-q", "origin", base_child_branch, f"{base_child_branch}-attempt-2")
                 res_ok, rec_ok = _run_deliver(repo, home, asana.base_url, gh.base_url, agy_bin=str(good_wrapper))
-                self.assertEqual((res_ok.returncode, rec_ok["status"], rec_ok["verified"], rec_ok["attempt"]), (0, "verified", True, 2))
+                self.assertEqual(
+                    (res_ok.returncode, rec_ok["status"], rec_ok["ci_verified"], rec_ok["verified"], rec_ok["delivery_approved"], rec_ok["attempt"]),
+                    (1, "qa-missing", True, False, False, 2),
+                )
                 self.assertEqual(rec_ok["child"]["head_branch"], f"{base_child_branch}-attempt-3")
                 self.assertEqual(git(bare, "rev-parse", f"refs/heads/{base_child_branch}"), main_sha)
                 self.assertEqual(git(bare, "rev-parse", f"refs/heads/{base_child_branch}-attempt-2"), main_sha)
@@ -563,8 +566,11 @@ class DeliverChildTest(unittest.TestCase):
                 self.assertTrue(any("criterion/AC-1 (failure)" in b for b in rec_brk["blockers"]))
                 self.assertIn("criterion/AC-1`: **FAILURE**", rec_brk["child"]["pr"]["body"])
                 res_fix, rec_fix = _run_deliver(repo, home, asana.base_url, gh.base_url, agy_bin=str(fixed_wrapper))
-                self.assertEqual((res_fix.returncode, rec_fix["status"], rec_fix["pr_opened"], rec_fix["verified"], rec_fix["merged"]), (0, "verified", True, True, False))
-                self.assertEqual((rec_fix["child"]["pr"]["pr_confirmed"], rec_fix["child"]["pr"]["ci_verified"]), (True, True))
+                self.assertEqual(
+                    (res_fix.returncode, rec_fix["status"], rec_fix["pr_opened"], rec_fix["ci_verified"], rec_fix["verified"], rec_fix["delivery_approved"], rec_fix["merged"]),
+                    (1, "qa-missing", True, True, False, False, False),
+                )
+                self.assertEqual((rec_fix["child"]["pr"]["pr_confirmed"], rec_fix["child"]["pr"]["ci_verified"], rec_fix["child"]["pr"]["verified"]), (True, True, False))
                 self.assertIn("criterion/AC-1`: **SUCCESS**", rec_fix["child"]["pr"]["body"])
             with (
                 _DisposableAsanaServer(PARENT_TASK, [{"data": [READY_CHILD], "next_page": None}]) as asana_pend,
@@ -759,6 +765,278 @@ class DeliverChildTest(unittest.TestCase):
                     )
         finally:
             subprocess.run(["gh", "api", "-X", "DELETE", f"repos/{repo_slug}"], check=False, capture_output=True)
+
+    def test_delivery_enforcement_requires_exact_candidate_approval_and_rejects_missing_forged_or_stale(self) -> None:
+        import time
+        from automated_qa.test_automated_qa_eval import _case
+        from factory import automated_qa, config as config_module, deliver as deliver_module, independent_review, runner, security_review
+        from factory.paths import RuntimePaths, atomic_json
+        from tests.independent_review.test_independent_review import _make_staged_reviewer_script
+        from tests.security_review.test_reviewer import REVIEWER_SCRIPT as SEC_REVIEWER_SCRIPT
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo, home, bare = _make_disposable_product_workspace(root)
+            paths = RuntimePaths(repo=repo, home=home)
+            conf = config_module.load(paths)
+            builder_agy = _make_fake_agy(root, "agy-builder", GOOD_BUILDER_SCRIPT)
+            sec_agy = _make_fake_agy(root, "agy-sec", SEC_REVIEWER_SCRIPT)
+            ir_agy = _make_fake_agy(root, "agy-ir", _make_staged_reviewer_script())
+            spec = deliver_module.DeliverSpec(task_ref="900", time_limit_seconds=60, agy_bin=str(builder_agy))
+
+            with (
+                _DisposableAsanaServer(PARENT_TASK, [{"data": [READY_CHILD], "next_page": None}]) as asana,
+                _DisposableGitHubServer(bare_repo=bare) as gh,
+                unittest.mock.patch.dict(os.environ, {
+                    "TURBO_ASANA_API_URL": asana.base_url, "ASANA_ACCESS_TOKEN": "disposable-asana-token",
+                    "TURBO_GITHUB_API_URL": gh.base_url, "TURBO_GITHUB_TOKEN": "disposable-gh-token",
+                }),
+            ):
+                r_ci = deliver_module.deliver_feature(paths, spec)
+                self.assertEqual((r_ci.status, r_ci.ci_verified, r_ci.verified, r_ci.delivery_approved, r_ci.approval_outcome, r_ci.approved_revision), ("qa-missing", True, False, False, "rejected", None))
+                self.assertTrue(any("automated QA" in b or "security" in b or "independent review" in b for b in r_ci.blockers))
+                cand_a, base_1, head_branch = str(r_ci.candidate_sha), str(r_ci.base_sha), str(r_ci.child["head_branch"])
+                att_dir = Path(r_ci.evidence["attempt_dir"])
+                child_dir = att_dir / "children" / "101"
+                intake_rec = json.loads(Path(r_ci.evidence["intake_record_path"]).read_text(encoding="utf-8"))
+                child_contract = intake_rec["children"][0]
+
+                atomic_json(child_dir / "approval-gate.json", {"schema": 1, "role": "delivery-approval-gate", "status": "approved", "outcome": "approved", "delivery_approved": True, "approved_revision": cand_a, "candidate_sha": cand_a, "base_sha": base_1, "tested_sha": r_ci.tested_sha, "revision_kind": r_ci.revision_kind, "verification_scope": independent_review.APPROVAL_GATE_SCOPE_NOTE, "round": 1, "blockers": []}, home)
+                r_forged = deliver_module.deliver_feature(paths, spec)
+                self.assertEqual((r_forged.verified, r_forged.delivery_approved, r_forged.approved_revision), (False, False, None))
+                self.assertTrue(r_forged.blockers)
+                (child_dir / "approval-gate.json").unlink(missing_ok=True)
+
+                qa_rec = automated_qa.evaluate_child_qa(repo=repo, home=home, child_dir=child_dir, base_url=gh.base_url, token="disposable-gh-token", repo_slug="example/chat-bridge", parent=intake_rec["parent"], child=child_contract, child_record=r_ci.child, conf=conf, qa_cases=(_case("QA-AC-1"),), round_number=1, deadline=time.monotonic() + 30.0, limit_s=30)
+                self.assertTrue(qa_rec["qa_verified"])
+                sec_rec = security_review.review_candidate_security(repo=repo, home=home, child_dir=child_dir, child=child_contract, conf=conf, base_sha=base_1, candidate_sha=cand_a, round_num=1, agy_bin=str(sec_agy), builder_session_id="c-101", deadline=time.monotonic() + 30.0, limit_s=30)
+                self.assertTrue(sec_rec["ready"])
+                ir_rec = independent_review.review_candidate_independently(repo=repo, home=home, child_dir=child_dir, child=child_contract, conf=conf, base_sha=base_1, candidate_sha=cand_a, round_num=1, agy_bin=str(ir_agy), builder_session_id="c-101", builder_summary="Implemented expired token check and test.", qa_record=qa_rec, security_record=sec_rec, deadline=time.monotonic() + 30.0, limit_s=30)
+                self.assertTrue(ir_rec["review_verified"])
+
+                cli_ok, payload_ok = _run_deliver(repo, home, asana.base_url, gh.base_url, agy_bin=str(builder_agy))
+                self.assertEqual(cli_ok.returncode, 0, cli_ok.stdout + cli_ok.stderr)
+                for p_rec in (payload_ok, json.loads((att_dir / "record.json").read_text(encoding="utf-8")), json.loads((home / "deliveries" / "900" / "record.json").read_text(encoding="utf-8"))):
+                    self.assertEqual((p_rec["status"], p_rec["verified"], p_rec["delivery_approved"], p_rec["approval_outcome"], p_rec["approved_revision"], p_rec["candidate_sha"], p_rec["base_sha"], p_rec["child"]["verified"], p_rec["child"]["delivery_approved"], p_rec["child"]["pr"]["verified"]), ("verified", True, True, "approved", cand_a, cand_a, base_1, True, True, True))
+
+                git(repo, "checkout", "-q", head_branch)
+                (repo / "src" / "chat_bridge" / "auth.py").write_text((repo / "src" / "chat_bridge" / "auth.py").read_text(encoding="utf-8") + "# candidate B\n", encoding="utf-8")
+                git(repo, "add", "src/chat_bridge/auth.py")
+                git(repo, "commit", "-q", "-m", "feat(auth): candidate B")
+                cand_b = git(repo, "rev-parse", "HEAD")
+                git(repo, "push", "-q", "origin", f"{cand_b}:refs/heads/{head_branch}")
+                git(repo, "checkout", "-q", "main")
+
+                for resume_idx in (1, 2):
+                    r_stale_cand = deliver_module.deliver_feature(paths, spec)
+                    self.assertIn(r_stale_cand.status, ("stale-candidate-revision", "stale-ci-evidence"), f"resume {resume_idx}")
+                    self.assertEqual((r_stale_cand.candidate_sha, r_stale_cand.base_sha, r_stale_cand.verified, r_stale_cand.delivery_approved, r_stale_cand.approved_revision, r_stale_cand.ci_verified), (cand_b, base_1, False, False, None, False), f"resume {resume_idx}")
+                    self.assertNotEqual(r_stale_cand.tested_sha, cand_a)
+                    self.assertTrue(r_stale_cand.blockers)
+                    gate_stale = json.loads((child_dir / "approval-gate.json").read_text(encoding="utf-8"))
+                    for rec_map in (json.loads((att_dir / "record.json").read_text(encoding="utf-8")), json.loads((home / "deliveries" / "900" / "record.json").read_text(encoding="utf-8"))):
+                        self.assertEqual((rec_map["status"], rec_map["candidate_sha"], rec_map["base_sha"], rec_map["verified"], rec_map["delivery_approved"], rec_map["approved_revision"], rec_map.get("ci_verified")), (r_stale_cand.status, cand_b, base_1, False, False, None, False))
+                        self.assertNotEqual(rec_map.get("tested_sha"), cand_a)
+                    self.assertEqual((gate_stale["delivery_approved"], gate_stale["approved_revision"]), (False, None))
+                    self.assertIn(gate_stale["status"], ("stale-candidate-revision", "stale-ci-evidence"))
+
+                b_child_contract = {**child_contract, "candidate_sha": cand_b}
+                gh.pulls[1]["head"]["sha"] = cand_b
+                ci_b = json.loads((child_dir / "ci-verification.json").read_text(encoding="utf-8"))
+                b_checks = []
+                for idx, c in enumerate(ci_b.get("checks", [])):
+                    txt = f"candidate_sha={cand_b}\nbase_sha={base_1}\ntested_sha={cand_b}\nrevision_kind=fast-forward-head\ncheck ok\n"
+                    lp = child_dir / f"ci-b-{idx}.log"
+                    lp.write_text(txt, encoding="utf-8")
+                    b_checks.append({**c, "candidate_sha": cand_b, "tested_sha": cand_b, "revision_kind": "fast-forward-head", "output_path": str(lp), "output_sha256": runner.digest_text(txt)})
+                ci_b_upd = {**ci_b, "candidate_sha": cand_b, "tested_sha": cand_b, "revision_kind": "fast-forward-head", "checks": b_checks, "pr": {**ci_b["pr"], "head_sha": cand_b}}
+                atomic_json(child_dir / "ci-verification.json", ci_b_upd, home)
+
+                child_rec_b = {**r_ci.child, "status": "verified", "verified": True, "candidate_sha": cand_b, "tested_sha": cand_b, "revision_kind": "fast-forward-head", "ci_verification": ci_b_upd, "pr": {**r_ci.child["pr"], "head_sha": cand_b}}
+                qa_rec_b = automated_qa.evaluate_child_qa(
+                    repo=repo, home=home, child_dir=child_dir, base_url=gh.base_url, token="disposable-gh-token",
+                    repo_slug="example/chat-bridge", parent=intake_rec["parent"], child=b_child_contract,
+                    child_record=child_rec_b, conf=conf,
+                    qa_cases=(_case("QA-AC-1"),), round_number=2, deadline=time.monotonic() + 30.0, limit_s=30,
+                )
+                atomic_json(child_dir / "automated-qa" / "record.json", {"status": "qa-verified", "qa_verified": True, "rounds": 2, "open_finding_ids": [], "findings": []}, home)
+                sec_rec_b = security_review.review_candidate_security(
+                    repo=repo, home=home, child_dir=child_dir, child=b_child_contract, conf=conf,
+                    base_sha=base_1, candidate_sha=cand_b, round_num=2, agy_bin=str(sec_agy),
+                    builder_session_id="c-101", deadline=time.monotonic() + 30.0, limit_s=30,
+                )
+                independent_review.review_candidate_independently(
+                    repo=repo, home=home, child_dir=child_dir, child=b_child_contract,
+                    conf=conf, base_sha=base_1, candidate_sha=cand_b, round_num=2, agy_bin=str(ir_agy),
+                    builder_session_id="c-101", builder_summary="Implemented expired token check and test on candidate B.",
+                    qa_record=qa_rec_b, security_record=sec_rec_b, deadline=time.monotonic() + 30.0, limit_s=30,
+                )
+                r_b = deliver_module.deliver_feature(paths, spec)
+                self.assertEqual((r_b.status, r_b.verified, r_b.delivery_approved, r_b.approved_revision), ("verified", True, True, cand_b))
+                gate_b = json.loads((child_dir / "approval-gate.json").read_text(encoding="utf-8"))
+                for rec_map in (json.loads((att_dir / "record.json").read_text(encoding="utf-8")), json.loads((home / "deliveries" / "900" / "record.json").read_text(encoding="utf-8"))):
+                    self.assertEqual((rec_map["status"], rec_map["verified"], rec_map["delivery_approved"], rec_map["approved_revision"]), ("verified", True, True, cand_b))
+                self.assertEqual((gate_b["status"], gate_b["delivery_approved"], gate_b["approved_revision"], gate_b.get("superseded_approved_revision")), ("approved", True, cand_b, None))
+
+                git(repo, "branch", "-f", head_branch, cand_a)
+                git(repo, "push", "-q", "-f", "origin", f"{cand_a}:refs/heads/{head_branch}")
+                git(repo, "checkout", "-q", "feature/chat-auth")
+                (repo / "README_BASE.md").write_text("base advance\n", encoding="utf-8")
+                git(repo, "add", "README_BASE.md")
+                git(repo, "commit", "-q", "-m", "chore: advance feature base")
+                base_2 = git(repo, "rev-parse", "HEAD")
+                git(repo, "push", "-q", "origin", f"{base_2}:refs/heads/feature/chat-auth")
+                git(repo, "checkout", "-q", "main")
+
+                r_stale_base = deliver_module.deliver_feature(paths, spec)
+                self.assertEqual((r_stale_base.status, r_stale_base.verified, r_stale_base.delivery_approved, r_stale_base.approved_revision), ("stale-candidate-revision", False, False, None))
+                self.assertTrue(any(base_1 in b and base_2 in b for b in r_stale_base.blockers), r_stale_base.blockers)
+
+    def test_qa_and_security_callers_execute_prerequisites_without_bypass_and_invalidate_on_repair(self) -> None:
+        import time
+        from automated_qa.test_automated_qa_eval import WHITESPACE_QA_CASE, _case
+        from tests.independent_review.test_approval_gate import _valid_security_record
+        from factory import automated_qa, config as config_module, deliver as deliver_module, independent_review, runner, security_review
+        from factory.automated_qa.delivery import QADeliverySpec, run_automated_qa_delivery
+        from factory.paths import RuntimePaths, atomic_json
+        from tests.automated_qa.test_automated_qa import DEMO_REPAIR_BUILDER_SCRIPT
+        from tests.independent_review.test_independent_review import _make_staged_reviewer_script
+        from tests.security_review.test_reviewer import REVIEWER_SCRIPT as SEC_REVIEWER_SCRIPT
+        from tests.security_review.test_security_review import _SyncingGitHubServer, _make_builder_script
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            qa_root, sec_root = root / "qa", root / "sec"
+            qa_root.mkdir()
+            sec_root.mkdir()
+            repo_q, home_q, bare_q = _make_disposable_product_workspace(qa_root)
+            paths_q = RuntimePaths(repo=repo_q, home=home_q)
+            qa_builder = _make_fake_agy(qa_root, "agy-qa-repair", DEMO_REPAIR_BUILDER_SCRIPT)
+            orig_eval_qa = automated_qa.delivery.evaluate_child_qa
+
+            def _seed_prior_approval_on_round1(**kw):
+                res = orig_eval_qa(**kw)
+                if kw.get("round_number") == 1:
+                    c_sha, b_sha = kw["child_record"]["candidate_sha"], kw["child_record"]["base_sha"]
+                    atomic_json(Path(kw["child_dir"]) / "approval-gate.json", {"schema": 1, "role": "delivery-approval-gate", "status": "approved", "outcome": "approved", "delivery_approved": True, "approved_revision": c_sha, "candidate_sha": c_sha, "base_sha": b_sha, "tested_sha": kw["child_record"]["tested_sha"], "revision_kind": "integration-merge", "verification_scope": independent_review.APPROVAL_GATE_SCOPE_NOTE, "round": 1, "blockers": []}, home_q)
+                return res
+
+            with (
+                _DisposableAsanaServer(PARENT_TASK, [{"data": [READY_CHILD], "next_page": None}]) as asana_q,
+                _SyncingGitHubServer(bare_repo=bare_q) as gh_q,
+                unittest.mock.patch.dict(os.environ, {
+                    "TURBO_ASANA_API_URL": asana_q.base_url, "ASANA_ACCESS_TOKEN": "disposable-asana-token",
+                    "TURBO_GITHUB_API_URL": gh_q.base_url, "TURBO_GITHUB_TOKEN": "disposable-gh-token",
+                }),
+                unittest.mock.patch("factory.automated_qa.delivery.evaluate_child_qa", side_effect=_seed_prior_approval_on_round1),
+            ):
+                qa_res = run_automated_qa_delivery(paths_q, QADeliverySpec(task_ref="900", time_limit_seconds=60, agy_bin=str(qa_builder), qa_cases=(WHITESPACE_QA_CASE,)))
+                self.assertEqual((qa_res.status, qa_res.ci_verified, qa_res.qa_verified, qa_res.verified, qa_res.delivery_approved), ("stale-candidate-revision", True, True, False, False))
+                self.assertEqual((qa_res.child["status"], qa_res.child["qa_status"], qa_res.child["pr"]["delivery_approved"]), ("stale-candidate-revision", "qa-verified", False))
+                disk_del_rec = json.loads(Path(qa_res.evidence["qa_delivery_record_path"]).read_text(encoding="utf-8"))
+                self.assertEqual((disk_del_rec["status"], disk_del_rec["child"]["qa_status"]), ("stale-candidate-revision", "qa-verified"))
+                r1_sha, r2_sha = qa_res.qa_rounds[0]["candidate_sha"], qa_res.qa_rounds[1]["candidate_sha"]
+                self.assertNotEqual(r1_sha, r2_sha)
+                self.assertTrue(any(r1_sha in b and r2_sha in b for b in qa_res.blockers), qa_res.blockers)
+
+                def _seed_valid_gate(**kw):
+                    res = orig_eval_qa(**kw)
+                    cdir, c_sha, b_sha = Path(kw["child_dir"]), kw["child_record"]["candidate_sha"], kw["child_record"]["base_sha"]
+                    atomic_json(cdir / "security-review.json", _valid_security_record(c_sha, b_sha, home_q), home_q)
+                    ir_agy = _make_fake_agy(qa_root, "agy-ir-q", _make_staged_reviewer_script(session_id="fresh-ir-q"))
+                    independent_review.review_candidate_independently(repo=repo_q, home=home_q, child_dir=cdir, child=kw["child"], conf=kw["conf"], base_sha=b_sha, candidate_sha=c_sha, round_num=1, agy_bin=str(ir_agy), builder_session_id="c-101", builder_summary="repair", qa_record=res, security_record=json.loads((cdir / "security-review.json").read_text(encoding="utf-8")), deadline=time.monotonic() + 30.0, limit_s=30)
+                    independent_review.evaluate_approval_gate(candidate_sha=c_sha, base_sha=b_sha, repo=repo_q, home=home_q, child_dir=cdir, child=kw["child"], conf=kw["conf"], load_from_child_dir=True, builder_session_id="c-101")
+                    return res
+
+                with unittest.mock.patch("factory.automated_qa.delivery.evaluate_child_qa", side_effect=_seed_valid_gate):
+                    qa_app = run_automated_qa_delivery(paths_q, QADeliverySpec(task_ref="900", time_limit_seconds=60, agy_bin=str(qa_builder), qa_cases=(_case("QA-AC-1"),)))
+                self.assertEqual((qa_app.status, qa_app.verified, qa_app.delivery_approved), ("verified", True, True))
+                self.assertEqual((qa_app.child["status"], qa_app.child["qa_status"], qa_app.child["pr"]["delivery_approved"]), ("verified", "qa-verified", True))
+                disk_app = json.loads(Path(qa_app.evidence["qa_delivery_record_path"]).read_text(encoding="utf-8"))
+                self.assertEqual((disk_app["status"], disk_app["child"]["qa_status"]), ("verified", "qa-verified"))
+
+            repo_s, home_s, bare_s = _make_disposable_product_workspace(sec_root)
+            paths_s = RuntimePaths(repo=repo_s, home=home_s)
+            conf_s = config_module.load(paths_s)
+            sec_builder = _make_fake_agy(sec_root, "agy-sec-repair", _make_builder_script("fix"))
+            sec_rev_bin = _make_fake_agy(sec_root, "agy-sec-rev", SEC_REVIEWER_SCRIPT)
+            ir_bin = _make_fake_agy(sec_root, "agy-ir-rev", _make_staged_reviewer_script())
+
+            with (
+                _DisposableAsanaServer(PARENT_TASK, [{"data": [READY_CHILD], "next_page": None}]) as asana_s,
+                _SyncingGitHubServer(bare_repo=bare_s) as gh_s,
+                unittest.mock.patch.dict(os.environ, {
+                    "TURBO_ASANA_API_URL": asana_s.base_url, "ASANA_ACCESS_TOKEN": "disposable-asana-token",
+                    "TURBO_GITHUB_API_URL": gh_s.base_url, "TURBO_GITHUB_TOKEN": "disposable-gh-token",
+                }),
+            ):
+                sec_res = security_review.deliver_with_security_review(
+                    paths_s, security_review.DeliverSecuritySpec(task_ref="900", time_limit_seconds=60, agy_bin=str(sec_builder), reviewer_agy_bin=str(sec_rev_bin), max_repair_rounds=2),
+                )
+                self.assertEqual((sec_res.status, sec_res.ci_verified, sec_res.child["security_verified"], sec_res.verified, sec_res.delivery_approved), ("security-verified", True, True, False, False))
+                repaired_sha, base_sha = str(sec_res.candidate_sha), str(sec_res.base_sha)
+                child_dir_s = Path(sec_res.evidence["attempt_dir"]) / "children" / "101"
+                intake_s = json.loads(Path(sec_res.evidence["intake_record_path"]).read_text(encoding="utf-8"))
+                child_contract_s = intake_s["children"][0]
+
+                qa_rec_s = automated_qa.evaluate_child_qa(
+                    repo=repo_s, home=home_s, child_dir=child_dir_s, base_url=gh_s.base_url, token="disposable-gh-token",
+                    repo_slug="example/chat-bridge", parent=intake_s["parent"], child=child_contract_s,
+                    child_record=sec_res.child, conf=conf_s, qa_cases=(_case("QA-AC-1"),), round_number=1,
+                    deadline=time.monotonic() + 30.0, limit_s=30,
+                )
+                self.assertTrue(qa_rec_s["qa_verified"])
+                ir_rec_s = independent_review.review_candidate_independently(
+                    repo=repo_s, home=home_s, child_dir=child_dir_s, child=child_contract_s,
+                    conf=conf_s, base_sha=base_sha, candidate_sha=repaired_sha, round_num=1, agy_bin=str(ir_bin),
+                    builder_session_id="builder-repair-1", builder_summary="Repaired security finding.",
+                    qa_record=qa_rec_s, security_record=sec_res.child["security_review"], deadline=time.monotonic() + 30.0, limit_s=30,
+                )
+                self.assertTrue(ir_rec_s["review_verified"])
+                final_res = deliver_module.deliver_feature(paths_s, deliver_module.DeliverSpec(task_ref="900", time_limit_seconds=60, agy_bin=str(sec_builder)))
+                self.assertEqual((final_res.status, final_res.verified, final_res.delivery_approved, final_res.approved_revision), ("verified", True, True, repaired_sha))
+
+    def test_approval_timeout_closure_across_callers(self) -> None:
+        from factory import automated_qa, deliver as deliver_module, security_review
+        from factory.automated_qa.delivery import QADeliverySpec, run_automated_qa_delivery
+        from factory.deliver_checks import AttemptTimeoutError
+        from factory.paths import RuntimePaths
+        from tests.automated_qa.test_automated_qa import DEMO_REPAIR_BUILDER_SCRIPT
+        from tests.automated_qa.test_automated_qa_eval import _case
+        from tests.security_review.test_reviewer import REVIEWER_SCRIPT as SEC_REV_SCRIPT
+        from tests.security_review.test_security_review import _SyncingGitHubServer, _make_builder_script
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo, home, bare = _make_disposable_product_workspace(root)
+            paths = RuntimePaths(repo=repo, home=home)
+            b_agy = _make_fake_agy(root, "agy-b", DEMO_REPAIR_BUILDER_SCRIPT)
+            sec_b = _make_fake_agy(root, "agy-sb", _make_builder_script("fix"))
+            sec_r = _make_fake_agy(root, "agy-sr", SEC_REV_SCRIPT)
+            spec = deliver_module.DeliverSpec(task_ref="900", time_limit_seconds=60, agy_bin=str(b_agy))
+            with (
+                _DisposableAsanaServer(PARENT_TASK, [{"data": [READY_CHILD], "next_page": None}]) as asana,
+                _SyncingGitHubServer(bare_repo=bare) as gh,
+                unittest.mock.patch.dict(os.environ, {"TURBO_ASANA_API_URL": asana.base_url, "ASANA_ACCESS_TOKEN": "tok", "TURBO_GITHUB_API_URL": gh.base_url, "TURBO_GITHUB_TOKEN": "tok"}),
+                unittest.mock.patch("factory.deliver.enforce_delivery_approval", side_effect=AttemptTimeoutError("approval timed out")),
+            ):
+                r_fresh = deliver_module.deliver_feature(paths, spec)
+                self.assertEqual((r_fresh.status, r_fresh.ci_verified, r_fresh.verified, r_fresh.delivery_approved, r_fresh.approved_revision), ("timed-out", True, False, False, None))
+                self.assertTrue(any("delivery approval timed out" in b for b in r_fresh.blockers))
+                c_dir = Path(r_fresh.evidence["attempt_dir"]) / "children" / "101"
+                self.assertEqual(json.loads((c_dir / "approval-gate.json").read_text(encoding="utf-8"))["status"], "timed-out")
+
+                r_res = deliver_module.deliver_feature(paths, spec)
+                self.assertEqual((r_res.status, r_res.ci_verified, r_res.verified, r_res.delivery_approved, r_res.approved_revision), ("timed-out", True, False, False, None))
+                for p in (Path(r_res.evidence["attempt_dir"]) / "record.json", home / "deliveries" / "900" / "record.json"):
+                    self.assertEqual(json.loads(p.read_text(encoding="utf-8"))["status"], "timed-out")
+
+                r_qa = run_automated_qa_delivery(paths, QADeliverySpec(task_ref="900", time_limit_seconds=60, agy_bin=str(b_agy), qa_cases=(_case("QA-AC-1"),)))
+                self.assertEqual((r_qa.status, r_qa.ci_verified, r_qa.qa_verified, r_qa.verified, r_qa.delivery_approved, r_qa.approved_revision), ("timed-out", True, True, False, False, None))
+                self.assertEqual(r_qa.child["qa_status"], "qa-verified")
+
+                r_sec = security_review.deliver_with_security_review(paths, security_review.DeliverSecuritySpec(task_ref="900", time_limit_seconds=60, agy_bin=str(sec_b), reviewer_agy_bin=str(sec_r), max_repair_rounds=1))
+                self.assertEqual((r_sec.status, r_sec.ci_verified, r_sec.child["security_verified"], r_sec.verified, r_sec.delivery_approved, r_sec.approved_revision), ("timed-out", True, True, False, False, None))
 
 
 if __name__ == "__main__":

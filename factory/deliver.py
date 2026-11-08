@@ -29,7 +29,6 @@ class DeliverSpec:
     time_limit_seconds: int
     agy_bin: str = "agy"
     rates: worker_module.RateCard | None = None
-    verified_status: str = "verified"
 
 
 @dataclass(frozen=True, slots=True)
@@ -50,6 +49,15 @@ class DeliverResult:
     measurements: dict[str, Any]
     evidence: dict[str, Any]
     recorded_at: str
+    ci_verified: bool = False
+    delivery_approved: bool = False
+    approval_outcome: str = "rejected"
+    approved_revision: str | None = None
+    candidate_sha: str | None = None
+    base_sha: str | None = None
+    tested_sha: str | None = None
+    revision_kind: str | None = None
+    approval: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -124,6 +132,11 @@ def _build_worker_prompt(parent: dict[str, Any], child: dict[str, Any], feature_
     )
 
 
+def _latest_attempt_num(deliveries_root: Path) -> int:
+    safe_dir(deliveries_root, create=True)
+    return max((int(m.group(1)) for p in deliveries_root.iterdir() if p.is_dir() and (m := re.fullmatch(r"attempt-(\d+)", p.name)) and (p / "record.json").is_file()), default=0)
+
+
 def _next_attempt_dir(deliveries_root: Path, home: Path) -> tuple[int, Path]:
     safe_dir(deliveries_root, create=True, root=home)
     attempt = 1
@@ -132,14 +145,159 @@ def _next_attempt_dir(deliveries_root: Path, home: Path) -> tuple[int, Path]:
     return attempt, safe_dir(deliveries_root / f"attempt-{attempt}", create=True, root=home)
 
 
+def _session_id_from_file(p: Path) -> str | None:
+    if not p.is_file():
+        return None
+    try:
+        _, final_res, _ = worker_module.parse_stream_events(p.read_text(encoding="utf-8", errors="replace"))
+        return (str(final_res.get("conversation_id") or final_res.get("session_id") or "").strip() if isinstance(final_res, dict) else "") or None
+    except Exception:
+        return None
+
+
+def detect_candidate_builder_session_id(child_dir: Path, candidate_sha: str | None = None) -> str | None:
+    if not child_dir.is_dir():
+        return None
+    sec_dirs = sorted([d for d in child_dir.iterdir() if d.is_dir() and d.name.startswith("security-repair-")],
+                      key=lambda d: int(d.name.split("-")[-1]) if d.name.split("-")[-1].isdigit() else 0, reverse=True)
+    for sd in sec_dirs:
+        for fn in ("repair-stdout.txt", "repair-stdout-1.txt"):
+            if (sid := _session_id_from_file(sd / fn)):
+                if candidate_sha is not None:
+                    rec_p = sd / "record.json"
+                    if rec_p.is_file():
+                        try:
+                            rec = json.loads(rec_p.read_text(encoding="utf-8"))
+                            if rec.get("to_sha") and rec.get("to_sha") != candidate_sha:
+                                continue
+                        except Exception:
+                            pass
+                return sid
+
+    qa_root = child_dir / "automated-qa"
+    if qa_root.is_dir():
+        qa_rep_dirs = sorted([d for d in qa_root.iterdir() if d.is_dir() and (d.name.startswith("repair-") or d.name.startswith("round-"))],
+                             key=lambda d: int(d.name.split("-")[-1]) if d.name.split("-")[-1].isdigit() else 0, reverse=True)
+        for qd in qa_rep_dirs:
+            target_dirs = [qd / "repair", qd] if (qd / "repair").is_dir() else [qd]
+            for td in target_dirs:
+                for fn in ("repair-stdout.txt", "repair-stdout-1.txt"):
+                    if (sid := _session_id_from_file(td / fn)):
+                        if candidate_sha is not None:
+                            rec_p = td / "record.json"
+                            if rec_p.is_file():
+                                try:
+                                    rec = json.loads(rec_p.read_text(encoding="utf-8"))
+                                    if rec.get("candidate_sha") and rec.get("candidate_sha") != candidate_sha:
+                                        continue
+                                except Exception:
+                                    pass
+                        return sid
+
+    for p in (
+        child_dir / "builder-stdout.txt", child_dir / "builder-stdout-1.txt",
+        child_dir / "evidence" / "builder-stdout.txt",
+    ):
+        if (sid := _session_id_from_file(p)):
+            return sid
+    if child_dir.parent.name == "children":
+        att_dir = child_dir.parent.parent
+        for p in (att_dir / "evidence" / "builder-stdout.txt", att_dir / "builder-stdout.txt"):
+            if (sid := _session_id_from_file(p)):
+                return sid
+    return None
+
+
+_detect_builder_session_id = detect_candidate_builder_session_id
+
+
+def enforce_delivery_approval(
+    *, candidate_sha: str, base_sha: str, repo: Path, home: Path, child_dir: Path,
+    child: dict[str, Any], conf: config_module.Config, ci_record: Any = None, qa_record: Any = None,
+    security_record: Any = None, review_record: Any = None, approval_record: Any = None,
+    builder_session_id: str | None = None, builder_summary: str = "",
+    deadline: float | None = None, limit_s: int = 30,
+) -> dict[str, Any]:
+    from factory.independent_review import approval as approval_mod
+    att_dir = child_dir.parent.parent if child_dir.parent.name == "children" else None
+    loaded = approval_mod.load_prerequisite_evidence(child_dir, home, attempt_dir=att_dir)
+    eff_ci = ci_record if ci_record is not None else loaded["ci_record"]
+    eff_qa = qa_record if qa_record is not None else loaded["qa_record"]
+    eff_sec = security_record if security_record is not None else loaded["security_record"]
+    eff_rev = review_record if review_record is not None else loaded["review_record"]
+    actual_bsid = detect_candidate_builder_session_id(child_dir, candidate_sha)
+    b_sid = actual_bsid or builder_session_id
+    gate_p = child_dir / "approval-gate.json"
+    disk_gate, corrupt_gate = approval_record, False
+    if disk_gate is None and gate_p.is_file():
+        try:
+            disk_gate = approval_mod.read_json(gate_p, home)
+        except Exception:
+            disk_gate, corrupt_gate = {}, True
+    if approval_record is not None or corrupt_gate or (disk_gate is not None and not isinstance(disk_gate, dict)):
+        ver_res = approval_mod.verify_candidate_approval(
+            candidate_sha, base_sha, disk_gate if disk_gate is not None else approval_record,
+            repo=repo, home=home, child_dir=child_dir, child=child, conf=conf,
+            ci_record=eff_ci or {}, qa_record=eff_qa or {}, security_record=eff_sec or {}, review_record=eff_rev or {},
+            deadline=deadline, limit_s=limit_s,
+        )
+        if gate_p.parent.exists():
+            atomic_json(gate_p, ver_res, home)
+        return ver_res
+
+    is_same_cand_approval = (
+        isinstance(disk_gate, dict)
+        and disk_gate.get("delivery_approved") is True
+        and disk_gate.get("candidate_sha") == candidate_sha
+        and disk_gate.get("base_sha") == base_sha
+    )
+    if is_same_cand_approval:
+        ver_res = approval_mod.verify_candidate_approval(
+            candidate_sha, base_sha, disk_gate, repo=repo, home=home, child_dir=child_dir, child=child, conf=conf,
+            ci_record=eff_ci or {}, qa_record=eff_qa or {}, security_record=eff_sec or {}, review_record=eff_rev or {},
+            deadline=deadline, limit_s=limit_s,
+        )
+        if ver_res.get("delivery_approved") is True:
+            return ver_res
+        if gate_p.parent.exists():
+            atomic_json(gate_p, ver_res, home)
+        return ver_res
+
+    eval_res = approval_mod.evaluate_approval_gate(
+        candidate_sha=candidate_sha, base_sha=base_sha, repo=repo, home=home, child_dir=child_dir, child=child, conf=conf,
+        ci_record=eff_ci, qa_record=eff_qa, security_record=eff_sec, review_record=eff_rev,
+        prior_approval=disk_gate if isinstance(disk_gate, dict) else None, builder_session_id=b_sid,
+        builder_summary=builder_summary, deadline=deadline, limit_s=limit_s, load_from_child_dir=False, _persist=True,
+    )
+    if eval_res.get("delivery_approved") is not True:
+        return eval_res
+    ver_res = approval_mod.verify_candidate_approval(
+        candidate_sha, base_sha, eval_res, repo=repo, home=home, child_dir=child_dir, child=child, conf=conf,
+        ci_record=eff_ci or {}, qa_record=eff_qa or {}, security_record=eff_sec or {}, review_record=eff_rev or {},
+        deadline=deadline, limit_s=limit_s,
+    )
+    if ver_res.get("delivery_approved") is not True and gate_p.parent.exists():
+        atomic_json(gate_p, ver_res, home)
+    return ver_res
+
+
+def deliver_ci_prerequisite(paths: RuntimePaths, spec: DeliverSpec, *, pending_status: str = "ci-verified") -> DeliverResult:
+    if pending_status not in ("ci-verified", "security-review-pending"):
+        raise UsageError(f"unsupported prerequisite pending_status {pending_status!r}")
+    return _execute_delivery(paths, spec, require_final_approval=False, pending_status=pending_status)
+
+
 def deliver_feature(paths: RuntimePaths, spec: DeliverSpec) -> DeliverResult:
+    return _execute_delivery(paths, spec, require_final_approval=True, pending_status="ci-verified")
+
+
+def _execute_delivery(paths: RuntimePaths, spec: DeliverSpec, *, require_final_approval: bool, pending_status: str) -> DeliverResult:
+    from factory.independent_review import approval as approval_mod
     started = time.monotonic()
     limit_s = spec.time_limit_seconds
     deadline = started + limit_s
     plat = worker_module.platform_info()
-    worker_module.validate_execution_options(
-        plat, time_limit_seconds=limit_s, agy_bin=spec.agy_bin, rates=spec.rates
-    )
+    worker_module.validate_execution_options(plat, time_limit_seconds=limit_s, agy_bin=spec.agy_bin, rates=spec.rates)
     conf = config_module.load(paths)
     config_module.require_binding(conf, paths)
     secrets = collect_redaction_secrets()
@@ -148,29 +306,115 @@ def deliver_feature(paths: RuntimePaths, spec: DeliverSpec) -> DeliverResult:
     intake_res = intake_module.run_from_cli(paths, intake_args)
     task_gid = intake_res.task_gid
     parent_root = safe_dir(paths.home / "deliveries" / task_gid, create=True, root=paths.home)
+    rev_res = gitio.git(FACTORY_ROOT, "rev-parse", "HEAD")
+    factory_rev = rev_res.output if rev_res.ok and re.fullmatch(r"[0-9a-f]{40}", rev_res.output) else "unavailable"
+    feature_branch = str(intake_res.parent.get("target_feature_branch") or "")
+
+    if require_final_approval and intake_res.delivery_ready and len(intake_res.children) == 1 and not intake_res.children[0].get("blocked_by"):
+        child0, child0_gid = intake_res.children[0], str(intake_res.children[0]["gid"])
+        if (latest_num := _latest_attempt_num(parent_root)) > 0:
+            latest_dir = parent_root / f"attempt-{latest_num}"
+            try:
+                prev_rec = json.loads((latest_dir / "record.json").read_text(encoding="utf-8"))
+            except Exception:
+                prev_rec = {}
+            prev_child = prev_rec.get("child") if isinstance(prev_rec, dict) else None
+            prev_cdir = latest_dir / "children" / child0_gid
+            gate_p = prev_cdir / "approval-gate.json"
+            gate_changed = False
+            if gate_p.is_file():
+                try:
+                    gate_changed = json.loads(gate_p.read_text(encoding="utf-8")) != prev_rec.get("approval")
+                except Exception:
+                    gate_changed = True
+            has_prereq_activity = (
+                prev_rec.get("status") in ("ci-verified", "qa-verified", "security-verified", "security-review-pending")
+                or (prev_cdir / "automated-qa").exists() or (prev_cdir / "security-review.json").is_file()
+                or (prev_cdir / "independent-review.json").is_file() or gate_changed or prev_rec.get("delivery_approved") is True
+            )
+            if (
+                isinstance(prev_child, dict) and prev_rec.get("pr_opened") is True and str(prev_child.get("gid") or "") == child0_gid
+                and bool(prev_rec.get("ci_verified") or prev_child.get("ci_verified") or (prev_child.get("ci_verification") or {}).get("verified"))
+                and has_prereq_activity
+            ):
+                repo_slug = parse_repo_slug(str(intake_res.parent.get("repository") or child0.get("repository") or ""))
+                origin_issue = verify_origin_remote(paths.repo, repo_slug, deadline, limit_s)
+                base_sha, branch_issues = ("", [origin_issue]) if origin_issue else _ensure_feature_branch(paths.repo, feature_branch, deadline, limit_s)
+                if not branch_issues:
+                    head_branch, prev_cand = str(prev_child.get("head_branch") or ""), str(prev_child.get("candidate_sha") or "")
+                    rem_cand = gitio.remote_ref(paths.repo, head_branch) if head_branch else None
+                    loc_cand = gitio.commit_sha(paths.repo, f"refs/heads/{head_branch}") if (head_branch and gitio.branch_exists(paths.repo, head_branch)) else None
+                    cand_sha = rem_cand or loc_cand or prev_cand
+                    try:
+                        app_rec = enforce_delivery_approval(
+                            candidate_sha=cand_sha, base_sha=base_sha, repo=paths.repo, home=paths.home,
+                            child_dir=prev_cdir, child=child0, conf=conf, deadline=deadline, limit_s=limit_s,
+                        )
+                    except (AttemptTimeoutError, TimeoutError) as exc:
+                        t_msg = f"delivery approval timed out: {exc}"
+                        app_rec = {"schema": 1, "role": "delivery-approval-gate", "status": "timed-out", "outcome": "rejected", "delivery_approved": False, "approved_revision": None, "candidate_sha": cand_sha, "base_sha": base_sha, "blockers": [t_msg]}
+                        if prev_cdir.exists(): atomic_json(gate_p, app_rec, paths.home)
+                    approved = bool(app_rec.get("delivery_approved") is True and app_rec.get("status") == "approved" and app_rec.get("outcome") == "approved" and app_rec.get("approved_revision") == cand_sha)
+                    st = "verified" if approved else str(app_rec.get("status") or "approval-rejected")
+                    v_scope = approval_mod.APPROVAL_GATE_SCOPE_NOTE if approved else ci_gate.VERIFICATION_SCOPE_NOTE
+                    blks = [] if approved else list(dict.fromkeys(app_rec.get("blockers") or []))
+                    ci_eval = (app_rec.get("prerequisites") or {}).get("ci") or {}
+                    ci_ok = bool(ci_eval.get("verified") is True) if ci_eval else bool(prev_child.get("ci_verified"))
+                    t_sha = app_rec.get("tested_sha") or (ci_eval.get("tested_sha") if ci_ok else None)
+                    r_kind = app_rec.get("revision_kind") or (ci_eval.get("revision_kind") if ci_ok else None)
+                    app_rev, app_out = (app_rec.get("approved_revision") if approved else None), ("approved" if approved else "rejected")
+                    upd_pr = {**(prev_child.get("pr") or {}), "head_sha": cand_sha, "base_sha": base_sha, "ci_verified": ci_ok, "verified": approved, "delivery_approved": approved, "approved_revision": app_rev}
+                    upd_child = {
+                        **prev_child, "status": st, "ci_verified": ci_ok, "verified": approved, "delivery_approved": approved,
+                        "approval_outcome": app_out, "approved_revision": app_rev, "verification_scope": v_scope,
+                        "base_sha": base_sha, "candidate_sha": cand_sha, "tested_sha": t_sha, "revision_kind": r_kind,
+                        "approval": app_rec, "pr": upd_pr,
+                    }
+                    upd_ev = {**(prev_rec.get("evidence") or {}), "approval_gate_path": str(gate_p)}
+                    res = DeliverResult(
+                        schema=1, task_gid=task_gid, attempt=latest_num, status=st, pr_opened=True, verified=approved,
+                        verification_scope=v_scope, merged=False, factory_revision=factory_rev, feature_branch=feature_branch,
+                        parent=redact_value(intake_res.parent, secrets), child=redact_value(upd_child, secrets),
+                        blockers=redact_value(blks, secrets), measurements=prev_rec.get("measurements") or {},
+                        evidence=redact_value(upd_ev, secrets), recorded_at=now(), ci_verified=ci_ok, delivery_approved=approved,
+                        approval_outcome=app_out, approved_revision=app_rev, candidate_sha=cand_sha, base_sha=base_sha,
+                        tested_sha=t_sha, revision_kind=r_kind, approval=redact_value(app_rec, secrets),
+                    )
+                    atomic_json(latest_dir / "record.json", res.to_dict(), paths.home)
+                    atomic_json(parent_root / "record.json", res.to_dict(), paths.home)
+                    return res
+
     attempt, attempt_dir = _next_attempt_dir(parent_root, paths.home)
     intake_src = paths.home / "intake" / task_gid / "record.json"
     intake_snap = attempt_dir / "intake-record.json"
     if intake_src.exists():
         shutil.copy2(intake_src, intake_snap)
-    rev_res = gitio.git(FACTORY_ROOT, "rev-parse", "HEAD")
-    factory_rev = rev_res.output if rev_res.ok and re.fullmatch(r"[0-9a-f]{40}", rev_res.output) else "unavailable"
-    feature_branch = str(intake_res.parent.get("target_feature_branch") or "")
 
     def _finish(
         status: str, blockers: list[str], child_payload: dict[str, Any] | None,
         measurements: dict[str, Any], evidence: dict[str, Any], active_secrets: tuple[str, ...] = secrets,
-        *, pr_opened: bool = False,
+        *, pr_opened: bool = False, ci_verified: bool = False, delivery_approved: bool = False,
+        approval_outcome: str = "rejected", approved_revision: str | None = None,
+        candidate_sha: str | None = None, base_sha: str | None = None,
+        tested_sha: str | None = None, revision_kind: str | None = None,
+        approval: dict[str, Any] | None = None,
     ) -> DeliverResult:
-        is_verified = status == "verified"
+        is_verified = bool(delivery_approved and status == "verified")
+        v_scope = approval_mod.APPROVAL_GATE_SCOPE_NOTE if is_verified else ci_gate.VERIFICATION_SCOPE_NOTE
         res = DeliverResult(
             schema=1, task_gid=task_gid, attempt=attempt, status=status,
-            pr_opened=pr_opened, verified=is_verified, verification_scope=ci_gate.VERIFICATION_SCOPE_NOTE,
+            pr_opened=pr_opened, verified=is_verified, verification_scope=v_scope,
             merged=False, factory_revision=factory_rev,
             feature_branch=feature_branch, parent=redact_value(intake_res.parent, active_secrets),
             child=redact_value(child_payload, active_secrets) if child_payload is not None else None,
             blockers=redact_value(blockers, active_secrets), measurements=measurements,
             evidence=redact_value(evidence, active_secrets), recorded_at=now(),
+            ci_verified=ci_verified, delivery_approved=is_verified,
+            approval_outcome="approved" if is_verified else approval_outcome,
+            approved_revision=approved_revision if is_verified else None,
+            candidate_sha=candidate_sha, base_sha=base_sha,
+            tested_sha=tested_sha, revision_kind=revision_kind,
+            approval=redact_value(approval, active_secrets) if approval is not None else None,
         )
         atomic_json(attempt_dir / "record.json", res.to_dict(), paths.home)
         atomic_json(parent_root / "record.json", res.to_dict(), paths.home)
@@ -331,6 +575,9 @@ def deliver_feature(paths: RuntimePaths, spec: DeliverSpec) -> DeliverResult:
             builder_status, blockers = "missing-tests", ["builder committed implementation changes without relevant test changes"]
 
         ci_verification: dict[str, Any] | None = None
+        approval_rec: dict[str, Any] | None = None
+        ci_ok = False
+        delivery_approved = False
         if builder_status == "completed":
             try:
                 gh_token = resolve_github_token(gh_is_loopback)
@@ -364,14 +611,44 @@ def deliver_feature(paths: RuntimePaths, spec: DeliverSpec) -> DeliverResult:
                     max_missing_polls=3 if gh_is_loopback else 15,
                     artifact_retry_delay_s=0.0 if gh_is_loopback else 2.0,
                 )
-                pr_info = ci_verification.get("pr") or pr_info
-                final_status = spec.verified_status if str(ci_verification["status"]) == "verified" else str(ci_verification["status"])
-                if isinstance(pr_info, dict) and final_status != "verified":
-                    pr_info = {**pr_info, "verified": False}
+                atomic_json(child_dir / "ci-verification.json", redact_value(ci_verification, secrets), paths.home)
+                ci_ok = str(ci_verification["status"]) == "verified" and bool(ci_verification.get("verified"))
+                pr_info = dict(ci_verification.get("pr") or pr_info or {})
                 blockers.extend(ci_verification.get("blockers") or [])
+                if ci_ok and require_final_approval:
+                    try:
+                        approval_rec = enforce_delivery_approval(
+                            candidate_sha=candidate_sha, base_sha=base_sha, repo=paths.repo, home=paths.home,
+                            child_dir=child_dir, child=child, conf=conf, ci_record=ci_verification,
+                            deadline=deadline, limit_s=limit_s,
+                        )
+                        delivery_approved = bool(
+                            approval_rec.get("delivery_approved") is True
+                            and approval_rec.get("status") == "approved"
+                            and approval_rec.get("outcome") == "approved"
+                            and approval_rec.get("approved_revision") == candidate_sha
+                        )
+                        final_status = "verified" if delivery_approved else str(approval_rec.get("status") or "approval-rejected")
+                        if not delivery_approved:
+                            blockers.extend(b for b in (approval_rec.get("blockers") or []) if b not in blockers)
+                    except (AttemptTimeoutError, TimeoutError) as exc:
+                        delivery_approved, final_status = False, "timed-out"
+                        t_msg = f"delivery approval timed out: {exc}"
+                        blockers.append(t_msg)
+                        approval_rec = {"schema": 1, "role": "delivery-approval-gate", "status": "timed-out", "outcome": "rejected", "delivery_approved": False, "approved_revision": None, "candidate_sha": candidate_sha, "base_sha": base_sha, "blockers": [t_msg]}
+                        if child_dir.exists(): atomic_json(child_dir / "approval-gate.json", approval_rec, paths.home)
+                elif ci_ok:
+                    final_status = pending_status
+                else:
+                    final_status = str(ci_verification["status"])
+                pr_info = {
+                    **pr_info, "ci_verified": ci_ok, "verified": delivery_approved,
+                    "delivery_approved": delivery_approved,
+                    "approved_revision": candidate_sha if delivery_approved else None,
+                }
             except AttemptTimeoutError as exc:
                 if pr_info is not None:
-                    pr_info = {**pr_info, "pr_confirmed": True, "ci_verified": False, "verified": False}
+                    pr_info = {**pr_info, "pr_confirmed": True, "ci_verified": False, "verified": False, "delivery_approved": False}
                     final_status = "ci-pending"
                     blockers.append(f"CI verification still pending when time allowance expired: {exc}")
                 else:
@@ -388,15 +665,21 @@ def deliver_feature(paths: RuntimePaths, spec: DeliverSpec) -> DeliverResult:
             indent=2, sort_keys=True,
         ) + "\n"
         gh_evidence_path = write_evidence(child_dir, "github-pr", gh_trace_text, paths.home)
+        tested_sha = (approval_rec or {}).get("tested_sha") or (ci_verification.get("tested_sha") if isinstance(ci_verification, dict) else None)
+        rev_kind = (approval_rec or {}).get("revision_kind") or (ci_verification.get("revision_kind") if isinstance(ci_verification, dict) else None)
+        app_out = "approved" if delivery_approved else "rejected"
+        app_rev = candidate_sha if delivery_approved else None
+        v_scope = approval_mod.APPROVAL_GATE_SCOPE_NOTE if delivery_approved else ci_gate.VERIFICATION_SCOPE_NOTE
         child_payload = {
             "gid": child_gid, "name": child["name"], "status": final_status,
-            "verified": final_status == "verified", "verification_scope": ci_gate.VERIFICATION_SCOPE_NOTE,
+            "ci_verified": ci_ok, "verified": delivery_approved, "delivery_approved": delivery_approved,
+            "approval_outcome": app_out, "approved_revision": app_rev,
+            "verification_scope": v_scope,
             "base_branch": feature_branch, "base_sha": base_sha, "head_branch": head_branch,
-            "candidate_sha": candidate_sha,
-            "tested_sha": ci_verification.get("tested_sha") if isinstance(ci_verification, dict) else None,
+            "candidate_sha": candidate_sha, "tested_sha": tested_sha, "revision_kind": rev_kind,
             "diff": diff_info, "scope_check": scope_detail,
             "verification_checks": ci_verification.get("checks", []) if isinstance(ci_verification, dict) else [],
-            "ci_verification": ci_verification, "pr": pr_info,
+            "ci_verification": ci_verification, "approval": approval_rec, "pr": pr_info,
             "safety": {
                 "sandbox_flag": "--sandbox", "permission_mode": "auto", "bypass_permissions_used": False,
                 "isolated_home": str(isolated_home), "stripped_env_keys": stripped_keys, "probes": probes,
@@ -411,7 +694,14 @@ def deliver_feature(paths: RuntimePaths, spec: DeliverSpec) -> DeliverResult:
             "worktree_status_path": str(wt_status_path), "github_evidence_path": str(gh_evidence_path),
             "github_evidence_sha256": runner.digest_text(gh_trace_text), "github_requests": gh_trace,
         }
-        return _finish(final_status, blockers, child_payload, measurements, evidence, pr_opened=(pr_info is not None))
+        if approval_rec is not None:
+            evidence["approval_gate_path"] = str(child_dir / "approval-gate.json")
+        return _finish(
+            final_status, blockers, child_payload, measurements, evidence,
+            pr_opened=(pr_info is not None), ci_verified=ci_ok, delivery_approved=delivery_approved,
+            approval_outcome=app_out, approved_revision=app_rev, candidate_sha=candidate_sha,
+            base_sha=base_sha, tested_sha=tested_sha, revision_kind=rev_kind, approval=approval_rec,
+        )
     except AttemptTimeoutError as exc:
         measurements["elapsed_ms"] = int((time.monotonic() - started) * 1000)
         child_timeout_payload = {"gid": child_gid, "name": child["name"], "status": "timed-out", "verified": False, "pr": pr_info}

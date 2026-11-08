@@ -509,7 +509,8 @@ def _verify_log_record(chk: Any, candidate_sha: str, home: Path | None) -> str |
 
 
 def evaluate_security_review_gate(
-    candidate_sha: str, base_sha: str, security_review_record: dict[str, Any] | None, *, home: Path | None = None,
+    candidate_sha: str, base_sha: str, security_review_record: dict[str, Any] | None,
+    *, home: Path | None = None, builder_session_id: str | None = None,
 ) -> dict[str, Any]:
     def _fail(status: str, blockers: list[str], b_findings: list[dict[str, Any]] | None = None, suggs: list[dict[str, Any]] | None = None) -> dict[str, Any]:
         return {"status": status, "verified": False, "blockers": blockers, "blocking_findings": b_findings or [], "non_blocking_suggestions": suggs or []}
@@ -520,12 +521,15 @@ def evaluate_security_review_gate(
     raw_s = [f for f in (security_review_record.get("non_blocking_suggestions") or []) if isinstance(f, dict) and not f.get("blocking", False)]
     rev_out = Path(str(security_review_record.get("reviewer_stdout_path") or ""))
     r_sid = str(security_review_record.get("reviewer_session_id") or "").strip()
-    b_sid = str(security_review_record.get("builder_session_id") or "").strip()
+    rec_bsid = str(security_review_record.get("builder_session_id") or "").strip()
+    auth_bsid = str(builder_session_id or "").strip()
+    b_sid = auth_bsid or rec_bsid
     if (not bool(security_review_record.get("reviewer_executed")) or not r_sid or rev_out.is_symlink()
             or not rev_out.is_file() or (home is not None and not rev_out.resolve().is_relative_to(home.resolve()))):
         return _fail("security-review-missing", list(security_review_record.get("role_issues") or ["missing actual security-reviewer execution evidence"]), raw_b, raw_s)
     if (security_review_record.get("role") != "security-reviewer" or not bool(security_review_record.get("role_separation_verified"))
             or bool(security_review_record.get("role_issues")) or (b_sid and r_sid == b_sid)
+            or (rec_bsid and r_sid == rec_bsid) or (auth_bsid and r_sid == auth_bsid)
             or not worker_module.probes_passed(((security_review_record.get("safety") or {}).get("probes")) or [])):
         return _fail("security-review-invalid", list(security_review_record.get("role_issues") or ["security reviewer role separation or safety probes not verified"]), raw_b, raw_s)
     rev_sha, rec_base, rec_pol = (str(security_review_record.get(k) or "").strip() for k in ("reviewed_revision", "base_sha", "policy_sha"))

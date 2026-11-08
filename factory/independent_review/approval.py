@@ -40,11 +40,10 @@ def _verify_file_digest(path_val: Any, sha_val: Any, home: Path | None, label: s
         if runner.digest_text(txt := p.read_text(encoding="utf-8", errors="replace")) != sha_val: return f"{label} stored evidence file {p} sha256 mismatch"
         if rev_bind is not None:
             kv = dict(ci_gate.KEY_VAL_RE.findall(txt))
-            if not all(ci_gate.SHA40_RE.fullmatch(str(kv.get(k) or "")) for k in ("candidate_sha", "base_sha", "tested_sha")): return f"{label} stored evidence {p} is missing revision provenance"
-            if (kv["candidate_sha"], kv["base_sha"], kv["tested_sha"]) != rev_bind: return f"stale:{label} stored evidence {p} revision provenance mismatch"
-            if (rp := p.resolve().parent / "record.json") != p.resolve() and rp.is_file() and not rp.is_symlink():
-                if isinstance(drec := read_json(rp, home or rp.parent), dict) and any(drec.get(k) not in (None, exp) for k, exp in zip(("candidate_sha", "base_sha", "tested_sha"), rev_bind)):
-                    return f"stale:{label} stored record {rp} revision provenance mismatch"
+            if not all(ci_gate.SHA40_RE.fullmatch(str(kv.get(k) or "")) for k in ("candidate_sha", "base_sha", "tested_sha")):
+                return f"{label} stored evidence {p} is missing revision provenance"
+            if (kv["candidate_sha"], kv["base_sha"], kv["tested_sha"]) != rev_bind:
+                return f"stale:{label} stored evidence {p} revision provenance mismatch"
     except (errors_module.FactoryError, OSError): return f"{label} stored evidence file {p} is unreadable"
     return None
 
@@ -64,10 +63,12 @@ def load_prerequisite_evidence(child_dir: Path, home: Path, *, attempt_dir: Path
 
 def evaluate_ci_prerequisite(candidate_sha: str, base_sha: str, ci_record: Any, *, repo: Path | None = None, home: Path | None = None, child: dict[str, Any] | None = None, conf: config_module.Config | None = None, deadline: float | None = None, limit_s: int = 30) -> dict[str, Any]:
     if hasattr(ci_record, "to_dict"): ci_record = ci_record.to_dict()
+    if isinstance(ci_record, dict) and ci_record.get("delivery_approved") is True: return _fail("authority-violation", "non-gate wrapper record cannot issue delivery_approved=True")
     if isinstance(ci_record, dict) and isinstance(ci_record.get("child"), dict) and isinstance(ci_record["child"].get("ci_verification"), dict): ci_record = ci_record["child"]
     if isinstance(ci_record, dict) and isinstance(ci_record.get("ci_verification"), dict):
         if ci_record.get("delivery_approved") is True: return _fail("authority-violation", "non-gate wrapper record cannot issue delivery_approved=True")
-        if ci_record.get("verified") is False or ci_record.get("status") not in (None, "verified"): return _fail(str(ci_record.get("status") or "ci-failed"), "delivery wrapper marks CI as unverified")
+        if (ci_record.get("ci_verified") is not True) if "ci_verified" in ci_record else (ci_record.get("verified") is False or ci_record.get("status") not in (None, "verified")):
+            return _fail(str(ci_record.get("status") or "ci-failed"), "delivery wrapper marks CI as unverified")
         ci_record = ci_record["ci_verification"]
     if not isinstance(ci_record, dict) or not ci_record: return _fail("ci-missing", f"missing CI verification evidence for candidate {candidate_sha}")
     if ci_record.get("delivery_approved") is True: return _fail("authority-violation", "non-gate producer CI record cannot issue delivery_approved=True")
@@ -161,7 +162,7 @@ def evaluate_qa_prerequisite(candidate_sha: str, base_sha: str, qa_record: Any, 
     if expected_revision_kind and qa_kind != expected_revision_kind: return _fail("stale-qa-evidence", f"QA revision_kind {qa_kind!r} does not match CI revision_kind {expected_revision_kind!r}")
     return {"status": "qa-verified", "verified": True, "candidate_sha": candidate_sha, "base_sha": base_sha, "tested_sha": qa_tested, "revision_kind": qa_kind, "blockers": []}
 
-def evaluate_security_prerequisite(candidate_sha: str, base_sha: str, security_record: Any, *, child_dir: Path | None = None, home: Path | None = None) -> dict[str, Any]:
+def evaluate_security_prerequisite(candidate_sha: str, base_sha: str, security_record: Any, *, child_dir: Path | None = None, home: Path | None = None, builder_session_id: str | None = None) -> dict[str, Any]:
     if hasattr(security_record, "to_dict"): security_record = security_record.to_dict()
     if isinstance(security_record, dict) and isinstance(security_record.get("child"), dict) and isinstance(security_record["child"].get("security_review"), dict): security_record = security_record["child"]
     if isinstance(security_record, dict) and isinstance(security_record.get("security_review"), dict):
@@ -172,7 +173,7 @@ def evaluate_security_prerequisite(candidate_sha: str, base_sha: str, security_r
     if isinstance(security_record, dict) and security_record.get("delivery_approved") is True: return _fail("authority-violation", "non-gate producer security-reviewer cannot issue delivery_approved=True")
     cur_sec_r = _pos_int(security_record.get("round")) if isinstance(security_record, dict) else None
     if isinstance(security_record, dict) and security_record and cur_sec_r is None: return _fail("security-review-invalid", f"security review record has missing or invalid round {security_record.get('round')!r}")
-    sec_eval = security_review.evaluate_security_review_gate(candidate_sha, base_sha, security_record, home=home)
+    sec_eval = security_review.evaluate_security_review_gate(candidate_sha, base_sha, security_record, home=home, builder_session_id=builder_session_id)
     if not sec_eval["verified"]: return sec_eval
     if cur_sec_r is not None and child_dir is not None:
         scanned_sec, sec_err = _scan_rounds(child_dir, home, r"security-round-(\d+)", cur_sec_r, "security-review-invalid", "stale-security-review")
@@ -231,8 +232,9 @@ def evaluate_independent_review_prerequisite(candidate_sha: str, base_sha: str, 
         return _fail("reviewer-modified-worktree", "independent reviewer modified the candidate worktree", historical_blockers=all_hist)
     b_sid, r_sid = str(review_record.get("builder_session_id") or "").strip(), str(review_record.get("reviewer_session_id") or "").strip()
     role_iss_txt = " ".join(str(x) for x in (review_record.get("role_issues") or ()))
-    if not b_sid or r_sid == b_sid or "matches builder session" in role_iss_txt or (builder_session_id is not None and b_sid != str(builder_session_id).strip()):
-        return _fail("reused-builder-identity", f"invalid or reused session identity: builder={b_sid!r}, reviewer={r_sid!r}", historical_blockers=all_hist)
+    eff_bsid = str(builder_session_id).strip() if builder_session_id is not None else b_sid
+    if not eff_bsid or r_sid == eff_bsid or "matches builder session" in role_iss_txt or (builder_session_id is not None and b_sid and b_sid != eff_bsid):
+        return _fail("reused-builder-identity", f"invalid or reused session identity: builder={eff_bsid!r}, reviewer={r_sid!r}", historical_blockers=all_hist)
     po, hyps = review_record.get("protocol_ordering"), review_record.get("failure_hypotheses")
     if not r_sid or not isinstance(po, dict) or not (po.get("enforced") is True and po.get("phase_1_executed") is True and po.get("phase_1_omitted_builder_summary") is True and po.get("phase_1_included_exact_diff") is True and po.get("hypotheses_persisted_before_summary") is True and po.get("phase_2_executed") is True and po.get("phase_2_continued_session_id") == r_sid):
         return _fail("invalid-review-protocol", "independent review two-phase protocol ordering was not enforced", historical_blockers=all_hist)
@@ -333,6 +335,9 @@ def evaluate_approval_gate(*, candidate_sha: str, base_sha: str, ci_record: Any 
         try:
             if isinstance(loaded_ap := read_json(ap_p, home), dict): prior_approval = loaded_ap
         except errors_module.FactoryError: pass
+    if child_dir is not None and builder_session_id is None:
+        from factory import deliver as deliver_module
+        builder_session_id = deliver_module.detect_candidate_builder_session_id(child_dir, candidate_sha)
     bad_round_arg = round_num is not None and _pos_int(round_num) is None
     if not bad_round_arg and review_record is None and agy_bin is not None and repo is not None and home is not None and child_dir is not None and child is not None and conf is not None:
         review_record = ir_pkg.review_candidate_independently(repo=repo, home=home, child_dir=child_dir, child=child, conf=conf, base_sha=base_sha, candidate_sha=candidate_sha, builder_session_id=builder_session_id, builder_summary=builder_summary, qa_record=qa_record, security_record=security_record, prior_findings=prior_findings, round_num=_pos_int(round_num) or 1, agy_bin=agy_bin, deadline=deadline or (time.monotonic() + 30.0), limit_s=limit_s)
@@ -341,12 +346,18 @@ def evaluate_approval_gate(*, candidate_sha: str, base_sha: str, ci_record: Any 
     ci_eval = evaluate_ci_prerequisite(candidate_sha, base_sha, ci_record, repo=repo, home=home, child=child, conf=conf, deadline=deadline, limit_s=limit_s)
     exp_tested, exp_kind = (ci_eval.get("tested_sha"), ci_eval.get("revision_kind")) if ci_eval["verified"] else (None, None)
     qa_eval = evaluate_qa_prerequisite(candidate_sha, base_sha, qa_record, child_dir=child_dir, home=home, repo=repo, child=child, expected_tested_sha=exp_tested, expected_revision_kind=exp_kind, deadline=deadline, limit_s=limit_s)
-    sec_eval = evaluate_security_prerequisite(candidate_sha, base_sha, security_record, child_dir=child_dir, home=home)
+    sec_eval = evaluate_security_prerequisite(candidate_sha, base_sha, security_record, child_dir=child_dir, home=home, builder_session_id=builder_session_id)
     if bad_round_arg or (_pos_int(round_num) is not None and rec_r_val is not None and round_num != rec_r_val):
         rev_eval = _fail("invalid-review", f"invalid or mismatched round_num {round_num!r}", historical_blockers=[])
     else:
         rev_eval = evaluate_independent_review_prerequisite(candidate_sha, base_sha, review_record, child_dir=child_dir, home=home, repo=repo, child=child, conf=conf, builder_session_id=builder_session_id, prior_findings=prior_findings, qa_eval=qa_eval, sec_eval=sec_eval, deadline=deadline, limit_s=limit_s)
-    prior_ap_rev = str(prior_approval.get("approved_revision") or prior_approval.get("candidate_sha") or "").strip() if isinstance(prior_approval, dict) else ""
+    prior_is_approved = bool(
+        isinstance(prior_approval, dict)
+        and prior_approval.get("delivery_approved") is True
+        and prior_approval.get("status") == "approved"
+        and prior_approval.get("approved_revision")
+    )
+    prior_ap_rev = str(prior_approval["approved_revision"]).strip() if prior_is_approved else ""
     prior_ap_stale = bool(prior_ap_rev and prior_ap_rev != candidate_sha)
     all_verified = ci_eval["verified"] and qa_eval["verified"] and sec_eval["verified"] and rev_eval["verified"]
     blockers = ([f"previous approval for {prior_ap_rev} is rejected for subsequent candidate {candidate_sha}"] if (prior_ap_stale and not all_verified) else [])
@@ -355,7 +366,7 @@ def evaluate_approval_gate(*, candidate_sha: str, base_sha: str, ci_record: Any 
     if all_verified: gate_status = "approved"
     elif any(p["status"] == "authority-violation" for p in (ci_eval, qa_eval, sec_eval, rev_eval)): gate_status = "authority-violation"
     elif not rev_eval["verified"] and rev_eval["status"] in ("corrupt-prior-history", "reviewer-modified-worktree", "reused-builder-identity", "invalid-review-protocol", "unsupported-success-claim", "unresolved-historical-blockers"): gate_status = rev_eval["status"]
-    elif prior_ap_stale and (all(x is None for x in (ci_record, qa_record, security_record, review_record)) or all(not p["verified"] and "stale" in p["status"] for p in (ci_eval, qa_eval, sec_eval, rev_eval))): gate_status = "stale-candidate-revision"
+    elif prior_ap_stale: gate_status = "stale-candidate-revision"
     else: gate_status = next((p["status"] for p in (ci_eval, qa_eval, sec_eval, rev_eval) if not p["verified"]), "rejected")
     hist_list, res_list = rev_eval.get("historical_blockers") or [], rev_eval.get("resolutions") or []
     res_ids = [str(r.get("finding_id")) for r in res_list if isinstance(r, dict) and r.get("status") == "resolved"]
@@ -405,6 +416,10 @@ def verify_candidate_approval(candidate_sha: str, base_sha: str, approval_record
             ci_record, qa_record = (ci_record if ci_record is not None else inp.get("ci_record")), (qa_record if qa_record is not None else inp.get("qa_record"))
             security_record, review_record = (security_record if security_record is not None else inp.get("security_record")), (review_record if review_record is not None else inp.get("review_record"))
             prior_f, b_sid = inp.get("prior_findings"), inp.get("builder_session_id")
+    if child_dir is not None:
+        from factory import deliver as deliver_module
+        if (auth_bsid := deliver_module.detect_candidate_builder_session_id(child_dir, candidate_sha)):
+            b_sid = auth_bsid
     if conf is None and repo is not None and home is not None:
         try: conf = config_module.load(config_module.RuntimePaths(repo=repo, home=home))
         except errors_module.FactoryError: pass

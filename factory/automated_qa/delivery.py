@@ -60,9 +60,21 @@ class QADeliveryResult:
     measurements: dict[str, Any]
     evidence: dict[str, Any]
     recorded_at: str
+    delivery_approved: bool = False
+    approval_outcome: str = "rejected"
+    approved_revision: str | None = None
+    candidate_sha: str | None = None
+    base_sha: str | None = None
+    tested_sha: str | None = None
+    revision_kind: str | None = None
+    approval: dict[str, Any] | None = None
+
+    @property
+    def verified(self) -> bool:
+        return bool(self.delivery_approved)
 
     def to_dict(self) -> dict[str, Any]:
-        return {**asdict(self), "verified": bool(self.ci_verified and self.qa_verified)}
+        return {**asdict(self), "verified": bool(self.delivery_approved)}
 
 
 def _validate_max_attempts(val: Any) -> int:
@@ -185,7 +197,7 @@ def _run_repair_attempt(
     main_before = gitio.commit_sha(paths.repo, "refs/heads/main") if gitio.branch_exists(paths.repo, "main") else gitio.head(paths.repo)
     remote_main_before = gitio.remote_ref(paths.repo, "main")
     gh_trace: list[dict[str, Any]] = []
-    unverified_child = {**child_rec, "verified": False}
+    unverified_child = {**child_rec, "ci_verified": False, "verified": False, "delivery_approved": False}
     repair_record: dict[str, Any] = {
         "repair_attempt": repair_idx, "previous_candidate_sha": prev_sha, "candidate_sha": prev_sha,
         "status": "builder-failed", "blockers": [], "routed_finding_ids": [f["finding_id"] for f in open_findings],
@@ -220,7 +232,7 @@ def _run_repair_attempt(
         events, final_result, parse_error = worker_module.parse_stream_events(stdout_text)
         repair_meas = worker_module.extract_measurements(final_result, worker_ms, spec.rates)
         new_sha, dirty_after = gitio.head(worktree_dir), gitio.status_porcelain(worktree_dir)
-        unverified_child = {**child_rec, "verified": False, "candidate_sha": new_sha}
+        unverified_child = {**child_rec, "ci_verified": False, "verified": False, "delivery_approved": False, "candidate_sha": new_sha}
         repair_record.update(candidate_sha=new_sha, builder_exit=exit_code, duration_ms=worker_ms, stdout_path=str(stdout_path), stderr_path=str(stderr_path), measurements=repair_meas)
         if timed_out or time.monotonic() >= deadline:
             repair_record.update(status="timed-out", blockers=[f"QA repair builder timed out after {limit_s}s"])
@@ -305,17 +317,22 @@ def _run_repair_attempt(
         )
         if _is_expired_ci_pending(str(ci_verification.get("status") or ""), ci_verification.get("blockers") or (), deadline):
             ci_verification["status"] = "timed-out"
+        atomic_json(child_dir / "ci-verification.json", intake.redact_value(ci_verification, secrets), paths.home)
+        ci_ok = ci_verification["status"] == "verified" and bool(ci_verification.get("verified"))
+        pr_out = {**(ci_verification.get("pr") or pr_info), "ci_verified": ci_ok, "verified": False, "delivery_approved": False}
         updated_child = {
-            **child_rec, "status": str(ci_verification["status"]), "verified": ci_verification["status"] == "verified",
-            "candidate_sha": new_sha, "tested_sha": ci_verification.get("tested_sha"), "diff": cum_diff,
+            **child_rec, "status": "ci-verified" if ci_ok else str(ci_verification["status"]),
+            "ci_verified": ci_ok, "verified": False, "delivery_approved": False,
+            "candidate_sha": new_sha, "tested_sha": ci_verification.get("tested_sha"),
+            "revision_kind": ci_verification.get("revision_kind"), "diff": cum_diff,
             "scope_check": scope_detail, "verification_checks": ci_verification.get("checks", []),
-            "ci_verification": ci_verification, "pr": ci_verification.get("pr") or pr_info,
+            "ci_verification": ci_verification, "pr": pr_out,
         }
         repair_record["ci_status"] = ci_verification["status"]
-        if ci_verification["status"] != "verified":
+        if not ci_ok:
             stop_st, stop_blk = str(ci_verification["status"]), list(ci_verification.get("blockers") or [])
             repair_record.update(status=stop_st, blockers=stop_blk)
-            return repair_record, {**updated_child, "verified": False}, stop_st, stop_blk
+            return repair_record, {**updated_child, "ci_verified": False, "verified": False, "delivery_approved": False}, stop_st, stop_blk
         return repair_record, updated_child, None, []
     except (AttemptTimeoutError, TimeoutError) as exc:
         repair_record.update(status="timed-out", blockers=[str(exc)])
@@ -339,7 +356,9 @@ def run_automated_qa_delivery(paths: RuntimePaths, spec: QADeliverySpec) -> QADe
     max_attempts = _validate_max_attempts(spec.max_correction_attempts)
     started, limit_s = time.monotonic(), spec.time_limit_seconds
     deadline = started + limit_s
-    deliver_res = deliver.deliver_feature(paths, deliver.DeliverSpec(task_ref=spec.task_ref, time_limit_seconds=limit_s, agy_bin=spec.agy_bin, rates=spec.rates))
+    deliver_res = deliver.deliver_ci_prerequisite(
+        paths, deliver.DeliverSpec(task_ref=spec.task_ref, time_limit_seconds=limit_s, agy_bin=spec.agy_bin, rates=spec.rates),
+    )
     secrets = deliver_checks.collect_redaction_secrets()
     boundary = build_parent_acceptance_boundary(deliver_res.parent)
     attempt_dir = Path(deliver_res.evidence["attempt_dir"])
@@ -351,11 +370,16 @@ def run_automated_qa_delivery(paths: RuntimePaths, spec: QADeliverySpec) -> QADe
     def _finish_delivery(
         status: str, ci_verified: bool, qa_verified: bool, child_payload: dict[str, Any] | None,
         blockers: list[str], measurements: dict[str, Any], extra_evidence: dict[str, Any],
+        *, delivery_approved: bool = False, approval_outcome: str = "rejected",
+        approved_revision: str | None = None, candidate_sha: str | None = None,
+        base_sha: str | None = None, tested_sha: str | None = None,
+        revision_kind: str | None = None, approval: dict[str, Any] | None = None,
+        verification_scope: str = QA_VERIFICATION_SCOPE_NOTE,
     ) -> QADeliveryResult:
         res = QADeliveryResult(
             schema=1, task_gid=deliver_res.task_gid, attempt=deliver_res.attempt, status=status,
             pr_opened=deliver_res.pr_opened, ci_verified=ci_verified, qa_verified=qa_verified,
-            verification_scope=QA_VERIFICATION_SCOPE_NOTE, merged=False, parent_accepted=False,
+            verification_scope=verification_scope, merged=False, parent_accepted=False,
             parent_acceptance=intake.redact_value(boundary, secrets), correction_attempts_used=len(repair_attempts),
             max_correction_attempts=max_attempts, factory_revision=deliver_res.factory_revision,
             feature_branch=deliver_res.feature_branch, parent=intake.redact_value(deliver_res.parent, secrets),
@@ -363,13 +387,17 @@ def run_automated_qa_delivery(paths: RuntimePaths, spec: QADeliverySpec) -> QADe
             repair_attempts=intake.redact_value(repair_attempts, secrets), findings=intake.redact_value(findings, secrets),
             blockers=intake.redact_value(blockers, secrets), measurements=measurements,
             evidence=intake.redact_value({**deliver_res.evidence, **extra_evidence}, secrets), recorded_at=now(),
+            delivery_approved=delivery_approved, approval_outcome=approval_outcome,
+            approved_revision=approved_revision if delivery_approved else None,
+            candidate_sha=candidate_sha, base_sha=base_sha, tested_sha=tested_sha,
+            revision_kind=revision_kind, approval=intake.redact_value(approval, secrets) if approval is not None else None,
         )
         payload = intake.redact_value(res.to_dict(), secrets)
         for dst in (attempt_dir / "qa-delivery-record.json", attempt_dir / "record.json", parent_root / "record.json"):
             atomic_json(dst, payload, paths.home)
         return res
 
-    if deliver_res.status != "verified" or deliver_res.child is None:
+    if not (deliver_res.ci_verified or deliver_res.status == "verified") or deliver_res.child is None:
         init_st = "timed-out" if _is_expired_ci_pending(deliver_res.status, deliver_res.blockers, deadline) else deliver_res.status
         return _finish_delivery(
             init_st, False, False, deliver_res.child, list(deliver_res.blockers),
@@ -451,24 +479,61 @@ def run_automated_qa_delivery(paths: RuntimePaths, spec: QADeliverySpec) -> QADe
         final_blockers = [f"automated QA failed ({final_status}); open findings: {open_ids}"] if open_ids else [f"automated QA stopped with status {final_status}"]
 
     ci_verified = bool(
-        repair_stop_status is None and child_rec.get("verified")
+        repair_stop_status is None and (child_rec.get("ci_verified") or child_rec.get("verified"))
         and (current_qa.get("ci_revalidation") or {}).get("verified")
         and child_rec.get("candidate_sha") == current_qa.get("candidate_sha")
         and (child_rec.get("ci_verification") or {}).get("candidate_sha") == child_rec.get("candidate_sha")
     )
-    child_rec.update(verified=ci_verified, qa_status=final_status, qa_verified=qa_verified, verification_scope=QA_VERIFICATION_SCOPE_NOTE)
     child_rec["automated_qa"] = {
-        "status": final_status, "qa_verified": qa_verified, "rounds": len(qa_rounds),
+        "status": final_status, "qa_verified": qa_verified, "delivery_approved": False, "rounds": len(qa_rounds),
         "correction_attempts_used": attempts_used, "max_correction_attempts": max_attempts,
         "open_finding_ids": [f["finding_id"] for f in findings if f["status"] != "resolved"],
         "findings": findings, "parent_acceptance_boundary": boundary,
     }
     qa_summary_path = qa_root / "record.json"
     atomic_json(qa_summary_path, intake.redact_value(child_rec["automated_qa"], secrets), paths.home)
+
+    qa_exec_status = final_status
+    cand_sha, base_sha = str(child_rec.get("candidate_sha") or ""), str(child_rec.get("base_sha") or "")
+    approval_rec: dict[str, Any] | None = None
+    delivery_approved = False
+    top_level_status = final_status
+    if ci_verified and qa_verified:
+        try:
+            approval_rec = deliver.enforce_delivery_approval(
+                candidate_sha=cand_sha, base_sha=base_sha, repo=paths.repo, home=paths.home, child_dir=child_dir,
+                child=child_contract, conf=conf, ci_record=child_rec.get("ci_verification"), qa_record=current_qa,
+                deadline=deadline, limit_s=limit_s,
+            )
+        except (deliver_checks.AttemptTimeoutError, TimeoutError) as exc:
+            t_msg = f"delivery approval timed out: {exc}"
+            approval_rec = {"schema": 1, "role": "delivery-approval-gate", "status": "timed-out", "outcome": "rejected", "delivery_approved": False, "approved_revision": None, "candidate_sha": cand_sha, "base_sha": base_sha, "blockers": [t_msg]}
+            if child_dir.exists(): atomic_json(child_dir / "approval-gate.json", approval_rec, paths.home)
+        delivery_approved = bool(approval_rec.get("delivery_approved") is True and approval_rec.get("status") == "approved" and approval_rec.get("outcome") == "approved" and approval_rec.get("approved_revision") == cand_sha)
+        if delivery_approved:
+            top_level_status = "verified"
+        elif approval_rec.get("status") in ("timed-out", "stale-candidate-revision", "authority-violation", "prerequisite-unverified", "approval-missing", "invalid-candidate-revision") or approval_rec.get("prior_approval_rejected"):
+            top_level_status = str(approval_rec["status"])
+        final_blockers = list(dict.fromkeys([*final_blockers, *(approval_rec.get("blockers") or [])]))
+    app_out, app_rev = ("approved" if delivery_approved else "rejected"), (cand_sha if delivery_approved else None)
+    t_sha = (approval_rec or {}).get("tested_sha") or child_rec.get("tested_sha")
+    r_kind = (approval_rec or {}).get("revision_kind") or child_rec.get("revision_kind") or (child_rec.get("ci_verification") or {}).get("revision_kind")
+    v_scope = str(approval_rec["verification_scope"]) if (delivery_approved and isinstance(approval_rec, dict)) else QA_VERIFICATION_SCOPE_NOTE
+    if isinstance(child_rec.get("pr"), dict):
+        child_rec["pr"] = {**child_rec["pr"], "ci_verified": ci_verified, "qa_verified": qa_verified, "verified": delivery_approved, "delivery_approved": delivery_approved, "approved_revision": app_rev}
+    child_rec.update(
+        status=top_level_status, ci_verified=ci_verified, verified=delivery_approved, delivery_approved=delivery_approved,
+        approval_outcome=app_out, approved_revision=app_rev, qa_status=qa_exec_status, qa_verified=qa_verified,
+        verification_scope=v_scope, tested_sha=t_sha, revision_kind=r_kind, approval=approval_rec,
+    )
+    extra_ev: dict[str, Any] = {"qa_record_path": str(qa_summary_path), "qa_delivery_record_path": str(attempt_dir / "qa-delivery-record.json")}
+    if approval_rec is not None:
+        extra_ev["approval_gate_path"] = str(child_dir / "approval-gate.json")
     measurements = _merge_measurements(deliver_res.measurements, repair_attempts, int((time.monotonic() - started) * 1000), spec.rates)
     return _finish_delivery(
-        final_status, ci_verified, qa_verified, child_rec, final_blockers, measurements,
-        {"qa_record_path": str(qa_summary_path), "qa_delivery_record_path": str(attempt_dir / "qa-delivery-record.json")},
+        top_level_status, ci_verified, qa_verified, child_rec, final_blockers, measurements, extra_ev,
+        delivery_approved=delivery_approved, approval_outcome=app_out, approved_revision=app_rev,
+        candidate_sha=cand_sha or None, base_sha=base_sha or None, tested_sha=t_sha, revision_kind=r_kind, approval=approval_rec, verification_scope=v_scope,
     )
 
 
