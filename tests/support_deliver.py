@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from automated_qa.test_automated_qa_eval import _case
-from factory import automated_qa, config as config_module, deliver as deliver_module, independent_review, security_review
+from factory import automated_qa, config as config_module, deliver as deliver_module, gitio, independent_review, runner, security_review
 from factory.paths import RuntimePaths, atomic_json, read_json
 from support import git
 from test_deliver import (
@@ -128,3 +128,288 @@ def setup_disposable_delivery_context(root: Path) -> DeliveryContext:
         child_contract=child_contract, valid_snapshots=valid_snapshots,
         builder_agy=builder_agy, sec_agy=sec_agy, ir_agy=ir_agy,
     )
+
+
+PROVENANCE_NOTE = (
+    "disposable fixture run; does not establish live Antigravity or hosted-provider support, "
+    "merge approval, or parent acceptance."
+)
+
+
+def run_delivery_lifecycle_demo(evidence_dir: Path) -> dict[str, Any]:
+    """Execute four-stage disposable delivery approval demonstration and retain evidence."""
+    evidence_dir.mkdir(parents=True, exist_ok=True)
+    stages_dir = evidence_dir / "stages"
+    stages_dir.mkdir(parents=True, exist_ok=True)
+    workspace_root = evidence_dir / "workspace"
+    workspace_root.mkdir(parents=True, exist_ok=True)
+
+    factory_rev_res = gitio.git(Path(__file__).resolve().parents[1], "rev-parse", "HEAD")
+    factory_rev = factory_rev_res.output.strip() if factory_rev_res.ok else "unknown"
+
+    commands_log: list[dict[str, Any]] = []
+
+    def record_cmd(stage: int, cmd_name: str, argv: list[str], exit_code: int, ok: bool, output: str = "") -> None:
+        commands_log.append({
+            "stage": stage, "command": cmd_name, "argv": argv,
+            "exit_code": exit_code, "ok": ok, "output_preview": output[:200],
+        })
+
+    vcmd = "python3 -c \"import pathlib, sys; sys.exit(0 if '# lifecycle-token-guard' in pathlib.Path('src/chat_bridge/auth.py').read_text() else 1)\""
+    fid = independent_review.compute_review_finding_id("bug", "src/chat_bridge/auth.py", "lifecycle-token-guard")
+    finding_contract = {
+        "finding_id": fid, "category": "bug", "blocking": True,
+        "target": "src/chat_bridge/auth.py", "rule": "lifecycle-token-guard",
+        "title": "Missing token expiry guard", "evidence": "seeded lifecycle bug",
+        "actionable_correction": "Add # lifecycle-token-guard to auth.py",
+        "verification_command": vcmd,
+    }
+
+    def _snapshot_stage(stage_num: int, stage_name: str, cand_sha: str, base_sha: str,
+                        delivery_res: Any, gate_rec: dict[str, Any] | None, extra: dict[str, Any]) -> dict[str, Any]:
+        sdir = stages_dir / f"stage-{stage_num}-{stage_name}"
+        sdir.mkdir(parents=True, exist_ok=True)
+        atomic_json(sdir / "delivery-result.json", delivery_res.to_dict() if hasattr(delivery_res, "to_dict") else delivery_res, evidence_dir)
+        if gate_rec:
+            atomic_json(sdir / "approval-gate.json", gate_rec, evidence_dir)
+        summary = {
+            "stage": stage_num, "name": stage_name, "candidate_sha": cand_sha,
+            "base_sha": base_sha, "delivery_approved": getattr(delivery_res, "delivery_approved", False),
+            "status": getattr(delivery_res, "status", "unknown"),
+            "approved_revision": getattr(delivery_res, "approved_revision", None),
+            "blockers": list(getattr(delivery_res, "blockers", [])),
+            **extra,
+        }
+        atomic_json(sdir / "stage-summary.json", summary, evidence_dir)
+        return summary
+
+    repo, home, bare = _make_disposable_product_workspace(workspace_root)
+    paths = RuntimePaths(repo=repo, home=home)
+    conf = config_module.load(paths)
+    builder_agy = _make_fake_agy(workspace_root, "agy-builder", GOOD_BUILDER_SCRIPT)
+    sec_agy = _make_fake_agy(workspace_root, "agy-sec", SEC_REVIEWER_SCRIPT)
+    spec = deliver_module.DeliverSpec(task_ref="900", time_limit_seconds=60, agy_bin=str(builder_agy))
+
+    with (
+        _DisposableAsanaServer(PARENT_TASK, [{"data": [READY_CHILD], "next_page": None}]) as asana,
+        _DisposableGitHubServer(bare_repo=bare) as gh,
+    ):
+        os.environ["TURBO_ASANA_API_URL"] = asana.base_url
+        os.environ["ASANA_ACCESS_TOKEN"] = "disposable-asana-token"
+        os.environ["TURBO_GITHUB_API_URL"] = gh.base_url
+        os.environ["TURBO_GITHUB_TOKEN"] = "disposable-gh-token"
+
+        # Attempt 1: Deliver initial candidate (stops at missing QA)
+        r_init = deliver_module.deliver_feature(paths, spec)
+        cand_1, base_sha = str(r_init.candidate_sha), str(r_init.base_sha)
+        head_branch = str(r_init.child["head_branch"])
+        att_dir = Path(r_init.evidence["attempt_dir"])
+        child_dir = att_dir / "children" / "101"
+        intake_rec = json.loads(Path(r_init.evidence["intake_record_path"]).read_text(encoding="utf-8"))
+        child_contract = intake_rec["children"][0]
+        record_cmd(0, "deliver_feature_init", ["deliver", "--task", "900"], 0, True, f"cand_1={cand_1}")
+
+        # QA and Security pass for candidate 1
+        qa_rec_1 = automated_qa.evaluate_child_qa(
+            repo=repo, home=home, child_dir=child_dir, base_url=gh.base_url,
+            token="disposable-gh-token", repo_slug="example/chat-bridge",
+            parent=intake_rec["parent"], child=child_contract, child_record=r_init.child,
+            conf=conf, qa_cases=(_case("QA-AC-1"),), round_number=1,
+            deadline=time.monotonic() + 30.0, limit_s=30,
+        )
+        sec_rec_1 = security_review.review_candidate_security(
+            repo=repo, home=home, child_dir=child_dir, child=child_contract,
+            conf=conf, base_sha=base_sha, candidate_sha=cand_1, round_num=1,
+            agy_bin=str(sec_agy), builder_session_id="c-101",
+            deadline=time.monotonic() + 30.0, limit_s=30,
+        )
+
+        # STAGE 1: Blocker identified by reviewer; delivery rejects
+        script_r1 = _make_staged_reviewer_script(
+            session_id="rev-s1", outcome="changes-requested",
+            findings=[finding_contract],
+        )
+        ir_agy_1 = _make_fake_agy(workspace_root, "agy-ir-s1", script_r1)
+        r1_rev = independent_review.review_candidate_independently(
+            repo=repo, home=home, child_dir=child_dir, child=child_contract,
+            conf=conf, base_sha=base_sha, candidate_sha=cand_1, round_num=1,
+            agy_bin=str(ir_agy_1), builder_session_id="c-101",
+            builder_summary="Candidate 1 built.", qa_record=qa_rec_1,
+            security_record=sec_rec_1, deadline=time.monotonic() + 30.0, limit_s=30,
+        )
+        record_cmd(1, "independent_review_round_1", ["review_candidate_independently", "round=1"], 0, False, "changes-requested")
+
+        r_stage1 = deliver_module.deliver_feature(paths, spec)
+        record_cmd(1, "deliver_feature_stage1", ["deliver_feature"], 0, r_stage1.delivery_approved, f"status={r_stage1.status}")
+        gate_1 = json.loads((child_dir / "approval-gate.json").read_text(encoding="utf-8")) if (child_dir / "approval-gate.json").is_file() else None
+        assert not r_stage1.delivery_approved and r_stage1.status == "changes-requested" and r_stage1.approved_revision is None, r_stage1
+        stage1_summary = _snapshot_stage(1, "blocker", cand_1, base_sha, r_stage1, gate_1, {
+            "finding_id": fid, "finding_status": "open", "reproducer_command": vcmd,
+        })
+
+        # STAGE 2: Ineffective correction; reviewer claims fix but reproducer fails; delivery rejects
+        git(repo, "checkout", "-q", head_branch)
+        (repo / "src" / "chat_bridge" / "auth.py").write_text((repo / "src" / "chat_bridge" / "auth.py").read_text(encoding="utf-8") + "# ineffective attempt\n", encoding="utf-8")
+        git(repo, "add", "src/chat_bridge/auth.py")
+        git(repo, "commit", "-q", "-m", "fix: ineffective token correction")
+        cand_2 = git(repo, "rev-parse", "HEAD")
+        git(repo, "push", "-q", "origin", f"{cand_2}:refs/heads/{head_branch}")
+        git(repo, "checkout", "-q", "main")
+        gh.pulls[1]["head"]["sha"] = cand_2
+        record_cmd(2, "git_commit_ineffective", ["git", "commit", "-m", "ineffective"], 0, True, f"cand_2={cand_2}")
+
+        # Refresh CI for cand_2
+        ci_b = json.loads((child_dir / "ci-verification.json").read_text(encoding="utf-8"))
+        b_checks = []
+        for idx, c in enumerate(ci_b.get("checks", [])):
+            txt = f"candidate_sha={cand_2}\nbase_sha={base_sha}\ntested_sha={cand_2}\nrevision_kind=fast-forward-head\ncheck ok\n"
+            lp = child_dir / f"ci-cand2-{idx}.log"
+            lp.write_text(txt, encoding="utf-8")
+            b_checks.append({**c, "candidate_sha": cand_2, "tested_sha": cand_2, "output_path": str(lp), "output_sha256": runner.digest_text(txt)})
+        ci_cand2 = {**ci_b, "candidate_sha": cand_2, "tested_sha": cand_2, "revision_kind": "fast-forward-head", "checks": b_checks, "pr": {**ci_b["pr"], "head_sha": cand_2}}
+        atomic_json(child_dir / "ci-verification.json", ci_cand2, home)
+
+        contract_cand2 = {**child_contract, "candidate_sha": cand_2}
+        child_rec_cand2 = {**r_stage1.child, "status": "verified", "verified": True, "candidate_sha": cand_2, "tested_sha": cand_2, "revision_kind": "fast-forward-head", "ci_verification": ci_cand2, "pr": {**r_stage1.child["pr"], "head_sha": cand_2}}
+
+        qa_rec_2 = automated_qa.evaluate_child_qa(
+            repo=repo, home=home, child_dir=child_dir, base_url=gh.base_url,
+            token="disposable-gh-token", repo_slug="example/chat-bridge",
+            parent=intake_rec["parent"], child=contract_cand2, child_record=child_rec_cand2,
+            conf=conf, qa_cases=(_case("QA-AC-1"),), round_number=2,
+            deadline=time.monotonic() + 30.0, limit_s=30,
+        )
+        sec_rec_2 = security_review.review_candidate_security(
+            repo=repo, home=home, child_dir=child_dir, child=contract_cand2,
+            conf=conf, base_sha=base_sha, candidate_sha=cand_2, round_num=2,
+            agy_bin=str(sec_agy), builder_session_id="c-101",
+            deadline=time.monotonic() + 30.0, limit_s=30,
+        )
+
+        # Reviewer claims fix, but reproducer execution against cand_2 worktree fails
+        script_r2 = _make_staged_reviewer_script(
+            session_id="rev-s2", outcome="review-passed",
+            reconciliations=[{"finding_id": fid, "resolution": "fixed", "evidence": "claimed fix in prose"}],
+        )
+        ir_agy_2 = _make_fake_agy(workspace_root, "agy-ir-s2", script_r2)
+        r2_rev = independent_review.review_candidate_independently(
+            repo=repo, home=home, child_dir=child_dir, child=contract_cand2,
+            conf=conf, base_sha=base_sha, candidate_sha=cand_2, round_num=2,
+            agy_bin=str(ir_agy_2), builder_session_id="c-101",
+            builder_summary="Attempted fix on cand 2.", qa_record=qa_rec_2,
+            security_record=sec_rec_2, deadline=time.monotonic() + 30.0, limit_s=30,
+        )
+        record_cmd(2, "independent_review_round_2", ["review_candidate_independently", "round=2"], 0, False, "reproducer failed")
+        assert not r2_rev["review_verified"] and fid in r2_rev["open_finding_ids"], r2_rev
+
+        (child_dir / "approval-gate.json").unlink(missing_ok=True)
+        r_stage2 = deliver_module.deliver_feature(paths, spec)
+        record_cmd(2, "deliver_feature_stage2", ["deliver_feature"], 0, r_stage2.delivery_approved, f"status={r_stage2.status}")
+        gate_2 = json.loads((child_dir / "approval-gate.json").read_text(encoding="utf-8")) if (child_dir / "approval-gate.json").is_file() else None
+        assert not r_stage2.delivery_approved and r_stage2.approved_revision is None and r_stage2.candidate_sha == cand_2, r_stage2
+        stage2_summary = _snapshot_stage(2, "ineffective", cand_2, base_sha, r_stage2, gate_2, {
+            "finding_id": fid, "finding_status": "open", "resolution_blocker": "check-failed",
+            "reproducer_command": vcmd, "reproducer_executed": True, "reproducer_ok": False,
+        })
+
+        # STAGE 3: Verified correction; candidate implements fix; reproducer passes; delivery APPROVES
+        git(repo, "checkout", "-q", head_branch)
+        (repo / "src" / "chat_bridge" / "auth.py").write_text((repo / "src" / "chat_bridge" / "auth.py").read_text(encoding="utf-8") + "# lifecycle-token-guard\n", encoding="utf-8")
+        git(repo, "add", "src/chat_bridge/auth.py")
+        git(repo, "commit", "-q", "-m", "fix: genuine token guard fix")
+        cand_3 = git(repo, "rev-parse", "HEAD")
+        git(repo, "push", "-q", "origin", f"{cand_3}:refs/heads/{head_branch}")
+        git(repo, "checkout", "-q", "main")
+        gh.pulls[1]["head"]["sha"] = cand_3
+        record_cmd(3, "git_commit_genuine_fix", ["git", "commit", "-m", "genuine fix"], 0, True, f"cand_3={cand_3}")
+
+        # Refresh CI for cand_3
+        c_checks = []
+        for idx, c in enumerate(ci_b.get("checks", [])):
+            txt = f"candidate_sha={cand_3}\nbase_sha={base_sha}\ntested_sha={cand_3}\nrevision_kind=fast-forward-head\ncheck ok\n"
+            lp = child_dir / f"ci-cand3-{idx}.log"
+            lp.write_text(txt, encoding="utf-8")
+            c_checks.append({**c, "candidate_sha": cand_3, "tested_sha": cand_3, "revision_kind": "fast-forward-head", "output_path": str(lp), "output_sha256": runner.digest_text(txt)})
+        ci_cand3 = {**ci_b, "candidate_sha": cand_3, "tested_sha": cand_3, "revision_kind": "fast-forward-head", "checks": c_checks, "pr": {**ci_b["pr"], "head_sha": cand_3}}
+        atomic_json(child_dir / "ci-verification.json", ci_cand3, home)
+
+        contract_cand3 = {**child_contract, "candidate_sha": cand_3}
+        child_rec_cand3 = {**r_stage2.child, "status": "verified", "verified": True, "candidate_sha": cand_3, "tested_sha": cand_3, "revision_kind": "fast-forward-head", "ci_verification": ci_cand3, "pr": {**r_stage2.child["pr"], "head_sha": cand_3}}
+
+        qa_rec_3 = automated_qa.evaluate_child_qa(
+            repo=repo, home=home, child_dir=child_dir, base_url=gh.base_url,
+            token="disposable-gh-token", repo_slug="example/chat-bridge",
+            parent=intake_rec["parent"], child=contract_cand3, child_record=child_rec_cand3,
+            conf=conf, qa_cases=(_case("QA-AC-1"),), round_number=3,
+            deadline=time.monotonic() + 30.0, limit_s=30,
+        )
+        sec_rec_3 = security_review.review_candidate_security(
+            repo=repo, home=home, child_dir=child_dir, child=contract_cand3,
+            conf=conf, base_sha=base_sha, candidate_sha=cand_3, round_num=3,
+            agy_bin=str(sec_agy), builder_session_id="c-101",
+            deadline=time.monotonic() + 30.0, limit_s=30,
+        )
+
+        script_r3 = _make_staged_reviewer_script(
+            session_id="rev-s3", outcome="review-passed",
+            reconciliations=[{"finding_id": fid, "resolution": "fixed", "evidence": "token guard genuinely verified"}],
+        )
+        ir_agy_3 = _make_fake_agy(workspace_root, "agy-ir-s3", script_r3)
+        r3_rev = independent_review.review_candidate_independently(
+            repo=repo, home=home, child_dir=child_dir, child=contract_cand3,
+            conf=conf, base_sha=base_sha, candidate_sha=cand_3, round_num=3,
+            agy_bin=str(ir_agy_3), builder_session_id="c-101",
+            builder_summary="Genuine fix implemented.", qa_record=qa_rec_3,
+            security_record=sec_rec_3, deadline=time.monotonic() + 30.0, limit_s=30,
+        )
+        record_cmd(3, "independent_review_round_3", ["review_candidate_independently", "round=3"], 0, True, "review-passed")
+        assert r3_rev["review_verified"] and r3_rev["open_finding_ids"] == [], r3_rev
+
+        (child_dir / "approval-gate.json").unlink(missing_ok=True)
+        r_stage3 = deliver_module.deliver_feature(paths, spec)
+        record_cmd(3, "deliver_feature_stage3", ["deliver_feature"], 0, r_stage3.delivery_approved, f"status={r_stage3.status}")
+        gate_3 = json.loads((child_dir / "approval-gate.json").read_text(encoding="utf-8"))
+        assert r_stage3.delivery_approved and r_stage3.status == "verified" and r_stage3.approved_revision == cand_3 and r_stage3.candidate_sha == cand_3, r_stage3
+        stage3_summary = _snapshot_stage(3, "verified", cand_3, base_sha, r_stage3, gate_3, {
+            "finding_id": fid, "finding_status": "resolved", "reproducer_command": vcmd,
+            "reproducer_executed": True, "reproducer_ok": True, "reconciliation_history_rounds": len(r3_rev["findings"][0]["history"]),
+        })
+
+        # STAGE 4: Subsequent revision; candidate advances; stale approval reuse rejected
+        git(repo, "checkout", "-q", head_branch)
+        (repo / "src" / "chat_bridge" / "auth.py").write_text((repo / "src" / "chat_bridge" / "auth.py").read_text(encoding="utf-8") + "# subsequent revision\n", encoding="utf-8")
+        git(repo, "add", "src/chat_bridge/auth.py")
+        git(repo, "commit", "-q", "-m", "chore: subsequent post-approval modification")
+        cand_4 = git(repo, "rev-parse", "HEAD")
+        git(repo, "push", "-q", "origin", f"{cand_4}:refs/heads/{head_branch}")
+        git(repo, "checkout", "-q", "main")
+        gh.pulls[1]["head"]["sha"] = cand_4
+        record_cmd(4, "git_commit_subsequent", ["git", "commit", "-m", "subsequent"], 0, True, f"cand_4={cand_4}")
+
+        r_stage4 = deliver_module.deliver_feature(paths, spec)
+        record_cmd(4, "deliver_feature_stage4", ["deliver_feature"], 0, r_stage4.delivery_approved, f"status={r_stage4.status}")
+        gate_4 = json.loads((child_dir / "approval-gate.json").read_text(encoding="utf-8"))
+        assert not r_stage4.delivery_approved and r_stage4.approved_revision is None and r_stage4.candidate_sha == cand_4, r_stage4
+        assert r_stage4.status in ("stale-candidate-revision", "stale-ci-evidence"), r_stage4
+        stage4_summary = _snapshot_stage(4, "subsequent-stale", cand_4, base_sha, r_stage4, gate_4, {
+            "prior_approved_revision": cand_3,
+        })
+
+    summary: dict[str, Any] = {
+        "demo": "four-stage-disposable-delivery-approval",
+        "provenance": PROVENANCE_NOTE,
+        "factory_revision": factory_rev,
+        "finding_id": fid,
+        "reconciliation_history_preserved": True,
+        "stages": {
+            "stage_1_blocker": stage1_summary,
+            "stage_2_ineffective": stage2_summary,
+            "stage_3_verified": stage3_summary,
+            "stage_4_subsequent_stale": stage4_summary,
+        },
+        "commands": commands_log,
+        "success": True,
+    }
+    atomic_json(evidence_dir / "lifecycle-summary.json", summary, evidence_dir)
+    return summary
+
