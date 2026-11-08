@@ -441,6 +441,8 @@ def run_integration_demo(evidence_dir: Path) -> dict[str, Any]:
 
         def _run_stage(num: int, name: str, **kw: Any) -> Any:
             sdir = safe_dir(stages_dir / f"stage-{num}-{name}", create=True)
+            for fn in ("integration-request.json", "integration-record.json"):
+                (ctx.child_dir / fn).unlink(missing_ok=True)
             res = integrate_approved_child(
                 repo=kw.get("repo", ctx.repo), home=ctx.home, child_dir=ctx.child_dir,
                 child=ctx.child_contract, conf=ctx.conf, pr_number=1,

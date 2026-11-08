@@ -220,11 +220,23 @@ class IntegrationBehaviorTest(unittest.TestCase):
                 gate, b_branch = self._setup_ctx(ctx)
                 (ctx.child_dir / "integration-record.json").mkdir(parents=True, exist_ok=True)
                 res = self._call(ctx, gate, b_branch)
-                self.assertEqual((res.status, res.outcome), ("confirmed", "confirmed"))
-                self.assertIsNotNone(res.landed_sha)
+                self.assertEqual((res.status, res.outcome), ("persistence-failed", "rejected"))
+                self.assertIsNone(res.landed_sha)
                 self.assertIsNone(res.record_path)
                 self.assertIsNotNone(res.request_path)
+                self.assertTrue((ctx.child_dir / "integration-request.json").is_file())
                 self.assertTrue(any("failed to persist integration record" in b for b in res.blockers))
+
+                # Recover usable confirmation from retained request and authoritative remote observations
+                shutil.rmtree(ctx.child_dir / "integration-record.json")
+                res_rec = self._call(ctx, gate, b_branch)
+                self.assertEqual((res_rec.status, res_rec.outcome), ("confirmed", "confirmed"))
+                self.assertIsNotNone(res_rec.landed_sha)
+                self.assertTrue(res_rec.reconciled)
+                self.assertTrue((ctx.child_dir / "integration-record.json").is_file())
+                rec_data = json.loads((ctx.child_dir / "integration-record.json").read_text(encoding="utf-8"))
+                self.assertEqual((rec_data["status"], rec_data["mutation_outcome"]), ("confirmed", "already-merged"))
+                self.assertTrue(rec_data["reconciled"])
 
                 early_dir = ctx.att_dir / "children" / "early"
                 early_dir.mkdir(parents=True, exist_ok=True)
@@ -233,6 +245,122 @@ class IntegrationBehaviorTest(unittest.TestCase):
                 self.assertEqual((res_e.status, res_e.outcome), ("pr-not-found", "rejected"))
                 self.assertIsNone(res_e.record_path)
                 self.assertTrue(any("failed to persist integration record" in b for b in res_e.blockers))
+
+    def test_misleading_merge_response_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_str:
+            with setup_disposable_delivery_context(Path(tmp_str)) as ctx:
+                gate, b_branch = self._setup_ctx(ctx)
+
+                # 1. Provider claims merged in PUT response, but PR remains open in follow-up
+                ctx.gh.verify_override = {"merged": False, "state": "open"}
+                res1 = self._call(ctx, gate, b_branch)
+                self.assertEqual((res1.status, res1.outcome), ("misleading-merge-response", "rejected"))
+                self.assertIsNone(res1.landed_sha)
+                ctx.gh.verify_override = {}
+
+                # 2. Provider claims merged, but target branch in follow-up is not intended
+                ctx.gh.verify_override = {"base_ref": "feature/unintended-branch"}
+                res2 = self._call(ctx, gate, b_branch)
+                self.assertEqual((res2.status, res2.outcome), ("branch-ref-mismatch", "rejected"))
+                self.assertIsNone(res2.landed_sha)
+                ctx.gh.verify_override = {}
+
+                # 3. Provider claims merged, but repo slug in follow-up does not match
+                ctx.gh.verify_override = {"repo_full_name": "attacker/spoofed"}
+                res3 = self._call(ctx, gate, b_branch)
+                self.assertEqual((res3.status, res3.outcome), ("repo-slug-mismatch", "rejected"))
+                self.assertIsNone(res3.landed_sha)
+                ctx.gh.verify_override = {}
+
+                # 4. Landed commit does not exist in repository
+                ctx.gh.verify_override = {"merge_commit_sha": "0" * 40}
+                res4 = self._call(ctx, gate, b_branch)
+                self.assertEqual((res4.status, res4.outcome), ("missing-landed-commit", "rejected"))
+                self.assertIsNone(res4.landed_sha)
+                ctx.gh.verify_override = {}
+
+    def test_landing_relationship_mismatched_tree_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_str:
+            with setup_disposable_delivery_context(Path(tmp_str)) as ctx:
+                gate, b_branch = self._setup_ctx(ctx)
+                wrong_tree_commit = git(
+                    ctx.bare, "-c", "user.name=CI", "-c", "user.email=ci@test",
+                    "commit-tree", f"{ctx.base_sha}^{{tree}}", "-p", ctx.base_sha, "-p", ctx.cand_sha, "-m", "wrong tree commit",
+                )
+                git(ctx.bare, "update-ref", "refs/heads/wrong-tree-branch", wrong_tree_commit)
+                ctx.gh.verify_override = {"merge_commit_sha": wrong_tree_commit}
+                res = self._call(ctx, gate, b_branch)
+                self.assertEqual((res.status, res.outcome), ("invalid-landing-relationship", "rejected"))
+                self.assertIn("tree", " ".join(res.blockers).lower())
+
+    def test_landing_relationship_single_parent_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_str:
+            with setup_disposable_delivery_context(Path(tmp_str)) as ctx:
+                gate, b_branch = self._setup_ctx(ctx)
+                single_p = git(
+                    ctx.bare, "-c", "user.name=CI", "-c", "user.email=ci@test",
+                    "commit-tree", f"{ctx.cand_sha}^{{tree}}", "-p", ctx.cand_sha, "-m", "single parent",
+                )
+                git(ctx.bare, "update-ref", "refs/heads/single-parent-branch", single_p)
+                ctx.gh.verify_override = {"merge_commit_sha": single_p}
+                res = self._call(ctx, gate, b_branch)
+                self.assertEqual((res.status, res.outcome), ("invalid-landing-relationship", "rejected"))
+                self.assertIn("parents", " ".join(res.blockers).lower())
+
+    def test_landing_relationship_unreachable_commit_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_str:
+            with setup_disposable_delivery_context(Path(tmp_str)) as ctx:
+                gate, b_branch = self._setup_ctx(ctx)
+                unreachable = git(
+                    ctx.bare, "-c", "user.name=CI", "-c", "user.email=ci@test",
+                    "commit-tree", f"{ctx.cand_sha}^{{tree}}", "-p", ctx.base_sha, "-p", ctx.cand_sha, "-m", "unreachable",
+                )
+                git(ctx.bare, "update-ref", "refs/heads/unreachable-branch", unreachable)
+                ctx.gh.verify_override = {"merge_commit_sha": unreachable}
+                res = self._call(ctx, gate, b_branch)
+                self.assertEqual((res.status, res.outcome), ("landed-commit-not-on-base", "rejected"))
+
+    def test_retry_reconciliation_and_retained_confirmed_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_str:
+            with setup_disposable_delivery_context(Path(tmp_str)) as ctx:
+                gate, b_branch = self._setup_ctx(ctx)
+                main_sha_before = git(ctx.bare, "rev-parse", "refs/heads/main")
+
+                # Disconnect after mutation yields uncertain on first call
+                ctx.gh.disconnect_after_merge = True
+                res1 = self._call(ctx, gate, b_branch)
+                self.assertEqual((res1.status, res1.outcome), ("uncertain", "uncertain"))
+                self.assertTrue((ctx.child_dir / "integration-request.json").is_file())
+                self.assertEqual(len([r for r in ctx.gh.requests if r["method"] == "PUT"]), 1)
+
+                # Retry reconciles remote state, positively confirms landing, writes confirmed record without another mutation
+                ctx.gh.disconnect_after_merge = False
+                res2 = self._call(ctx, gate, b_branch)
+                self.assertEqual((res2.status, res2.outcome), ("confirmed", "confirmed"))
+                self.assertTrue(res2.reconciled)
+                self.assertEqual(len([r for r in ctx.gh.requests if r["method"] == "PUT"]), 1)
+
+                # Repeated call on confirmed landing does not duplicate mutation or overwrite evidence
+                res3 = self._call(ctx, gate, b_branch)
+                self.assertEqual((res3.status, res3.outcome), ("confirmed", "confirmed"))
+                self.assertTrue(res3.reconciled)
+                self.assertEqual(len([r for r in ctx.gh.requests if r["method"] == "PUT"]), 1)
+
+                # Changed candidate is rejected and does not overwrite confirmed record
+                res_c = self._call(ctx, gate, b_branch, cand_sha="f" * 40)
+                self.assertEqual((res_c.status, res_c.outcome), ("stale-candidate-revision", "rejected"))
+                rec_retained = json.loads((ctx.child_dir / "integration-record.json").read_text(encoding="utf-8"))
+                self.assertEqual(rec_retained["status"], "confirmed")
+                self.assertEqual(rec_retained["candidate_sha"], ctx.cand_sha)
+
+                # Recovery with substituted post-merge base is rejected and does not overwrite confirmed record
+                res_b = self._call(ctx, gate, b_branch, base_sha=res2.landed_sha)
+                self.assertEqual((res_b.status, res_b.outcome), ("stale-base-revision", "rejected"))
+                rec_retained2 = json.loads((ctx.child_dir / "integration-record.json").read_text(encoding="utf-8"))
+                self.assertEqual(rec_retained2["status"], "confirmed")
+
+                # Main branch remains completely unchanged
+                self.assertEqual(git(ctx.bare, "rev-parse", "refs/heads/main"), main_sha_before)
 
     def test_separate_provider_and_remote_git_base_drift_with_genuine_approval(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_str:
