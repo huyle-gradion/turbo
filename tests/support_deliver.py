@@ -425,6 +425,8 @@ def run_integration_demo(evidence_dir: Path) -> dict[str, Any]:
     from factory.integration import integrate_approved_child
     evidence_dir.mkdir(parents=True, exist_ok=True)
     stages_dir = safe_dir(evidence_dir / "stages", create=True)
+    if (evidence_dir / "workspace").exists():
+        shutil.rmtree(evidence_dir / "workspace", ignore_errors=True)
     ws_root = safe_dir(evidence_dir / "workspace", create=True)
     factory_rev_res = gitio.git(Path(__file__).resolve().parents[1], "rev-parse", "HEAD")
     factory_rev = factory_rev_res.output.strip() if factory_rev_res.ok else "unknown"
