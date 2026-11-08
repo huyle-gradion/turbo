@@ -15,8 +15,7 @@ class DeliveryRejectionMatrixTest(unittest.TestCase):
     def test_rejection_matrix_12_combinations_and_positive_control(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            ctx = setup_disposable_delivery_context(root)
-            try:
+            with setup_disposable_delivery_context(root) as ctx:
                 # 1. Fully valid positive control
                 ctx.restore_valid_evidence()
                 r_ok = deliver_module.deliver_feature(ctx.paths, ctx.spec)
@@ -152,9 +151,7 @@ class DeliveryRejectionMatrixTest(unittest.TestCase):
                         self.assertFalse(att_rec["child"].get("verified"), f"child verified should be False for {label}")
                         self.assertFalse(att_rec["child"]["pr"].get("delivery_approved"), f"PR delivery_approved should be False for {label}")
                         self.assertFalse(att_rec["child"]["pr"].get("verified"), f"PR verified should be False for {label}")
-            finally:
-                ctx.asana.__exit__(None, None, None)
-                ctx.gh.__exit__(None, None, None)
+
 
 
 class DeliveryHistoricalAndProtocolRejectionTest(unittest.TestCase):
@@ -164,8 +161,7 @@ class DeliveryHistoricalAndProtocolRejectionTest(unittest.TestCase):
         from factory import independent_review
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            ctx = setup_disposable_delivery_context(root)
-            try:
+            with setup_disposable_delivery_context(root) as ctx:
                 fid = independent_review.compute_review_finding_id("bug", "src/chat_bridge/auth.py", "hist-omitted-rule")
                 b1 = {
                     "finding_id": fid, "category": "bug", "blocking": True,
@@ -205,9 +201,7 @@ class DeliveryHistoricalAndProtocolRejectionTest(unittest.TestCase):
                 self.assertEqual(gate_rec["status"], "unresolved-historical-blockers")
                 self.assertFalse(gate_rec["delivery_approved"])
                 self.assertIn(fid, gate_rec["historical_blockers"]["unresolved_ids"])
-            finally:
-                ctx.asana.__exit__(None, None, None)
-                ctx.gh.__exit__(None, None, None)
+
 
     def test_ineffective_fixed_claim_contradicted_by_actual_reproducer_execution(self) -> None:
         from factory import independent_review
@@ -215,8 +209,7 @@ class DeliveryHistoricalAndProtocolRejectionTest(unittest.TestCase):
         from test_deliver import _make_fake_agy
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            ctx = setup_disposable_delivery_context(root)
-            try:
+            with setup_disposable_delivery_context(root) as ctx:
                 vcmd = "python3 -c \"import pathlib, sys; sys.exit(0 if '# genuine-fix-marker' in pathlib.Path('src/chat_bridge/auth.py').read_text() else 1)\""
                 fid = independent_review.compute_review_finding_id("bug", "src/chat_bridge/auth.py", "ineffective-repro-rule")
                 b1 = {
@@ -254,16 +247,13 @@ class DeliveryHistoricalAndProtocolRejectionTest(unittest.TestCase):
                 self.assertFalse(res.verified)
                 self.assertIn(res.status, ("changes-requested", "unresolved-historical-blockers"))
                 self.assertTrue(any("failed trusted execution verification" in b or fid in b or "check-failed" in b for b in res.blockers), res.blockers)
-            finally:
-                ctx.asana.__exit__(None, None, None)
-                ctx.gh.__exit__(None, None, None)
+
 
     def test_unsupported_resolution_claims_cannot_resolve_blocker(self) -> None:
         from factory import independent_review
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            ctx = setup_disposable_delivery_context(root)
-            try:
+            with setup_disposable_delivery_context(root) as ctx:
                 fid = independent_review.compute_review_finding_id("bug", "src/chat_bridge/auth.py", "unsupported-res-rule")
                 b1 = {
                     "finding_id": fid, "category": "bug", "blocking": True,
@@ -294,9 +284,7 @@ class DeliveryHistoricalAndProtocolRejectionTest(unittest.TestCase):
                         self.assertFalse(res.delivery_approved)
                         self.assertIsNone(res.approved_revision)
                         self.assertTrue(any(fid in b and "unresolved" in b for b in res.blockers), res.blockers)
-            finally:
-                ctx.asana.__exit__(None, None, None)
-                ctx.gh.__exit__(None, None, None)
+
 
     def test_reviewer_worktree_mutation_rejected_by_delivery(self) -> None:
         from factory import independent_review
@@ -304,8 +292,7 @@ class DeliveryHistoricalAndProtocolRejectionTest(unittest.TestCase):
         from test_deliver import _make_fake_agy
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            ctx = setup_disposable_delivery_context(root)
-            try:
+            with setup_disposable_delivery_context(root) as ctx:
                 script_mutating = _make_staged_reviewer_script(session_id="rev-mut", mutate_in_phase=2, mutate_kind="unstaged")
                 agy_mut = _make_fake_agy(root, "agy-mut", script_mutating)
 
@@ -325,15 +312,12 @@ class DeliveryHistoricalAndProtocolRejectionTest(unittest.TestCase):
                 self.assertFalse(res.delivery_approved)
                 self.assertIsNone(res.approved_revision)
                 self.assertTrue(any("modified the candidate worktree" in b for b in res.blockers), res.blockers)
-            finally:
-                ctx.asana.__exit__(None, None, None)
-                ctx.gh.__exit__(None, None, None)
+
 
     def test_invalid_review_identity_and_protocol_rejected_by_delivery(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            ctx = setup_disposable_delivery_context(root)
-            try:
+            with setup_disposable_delivery_context(root) as ctx:
                 # 1. Reused builder session identity
                 ctx.restore_valid_evidence()
                 rev_reused = dict(ctx.valid_snapshots["ir"])
@@ -360,9 +344,79 @@ class DeliveryHistoricalAndProtocolRejectionTest(unittest.TestCase):
                 self.assertFalse(res_proto.delivery_approved)
                 self.assertIsNone(res_proto.approved_revision)
                 self.assertTrue(any("protocol ordering" in b for b in res_proto.blockers), res_proto.blockers)
-            finally:
-                ctx.asana.__exit__(None, None, None)
-                ctx.gh.__exit__(None, None, None)
+
+
+
+class TestDisposableDeliveryContextSafety(unittest.TestCase):
+    """Verify exception safety, server termination, and environment restoration."""
+
+    def test_environment_restoration_and_server_teardown(self) -> None:
+        from support_deliver import run_delivery_lifecycle_demo
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            orig_asana = "https://orig.asana.example"
+            with unittest.mock.patch.dict(os.environ, {"TURBO_ASANA_API_URL": orig_asana}):
+                os.environ.pop("TURBO_GITHUB_TOKEN", None)
+                os.environ.pop("ASANA_ACCESS_TOKEN", None)
+                os.environ.pop("TURBO_GITHUB_API_URL", None)
+
+                with setup_disposable_delivery_context(root) as ctx:
+                    self.assertNotEqual(os.environ["TURBO_ASANA_API_URL"], orig_asana)
+                    self.assertEqual(os.environ["TURBO_GITHUB_TOKEN"], "disposable-gh-token")
+                    ctx.restore_valid_evidence()
+                    r = deliver_module.deliver_feature(ctx.paths, ctx.spec)
+                    self.assertTrue(r.delivery_approved)
+
+                self.assertEqual(os.environ.get("TURBO_ASANA_API_URL"), orig_asana)
+                self.assertNotIn("TURBO_GITHUB_TOKEN", os.environ)
+                self.assertEqual(ctx.asana._server.fileno(), -1)
+                self.assertEqual(ctx.gh._server.fileno(), -1)
+
+                demo_res = run_delivery_lifecycle_demo(root / "demo-out")
+                self.assertTrue(demo_res["stages"]["stage_3_verified"]["delivery_approved"])
+                self.assertEqual(os.environ.get("TURBO_ASANA_API_URL"), orig_asana)
+                self.assertNotIn("TURBO_GITHUB_TOKEN", os.environ)
+
+    def test_cleanup_on_partial_acquisition_and_boundary_failures(self) -> None:
+        from test_deliver import _DisposableAsanaServer, _DisposableGitHubServer
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "case-1").mkdir()
+            (root / "case-2").mkdir()
+            (root / "case-3").mkdir()
+            # Partial acquisition failure: entering second server fails
+            asana_instances = []
+            orig_asana_enter = _DisposableAsanaServer.__enter__
+
+            def track_asana_enter(srv):
+                asana_instances.append(srv)
+                return orig_asana_enter(srv)
+
+            with unittest.mock.patch.object(_DisposableAsanaServer, "__enter__", track_asana_enter):
+                with unittest.mock.patch.object(_DisposableGitHubServer, "__enter__", side_effect=RuntimeError("gh-fail")):
+                    with self.assertRaises(RuntimeError):
+                        with setup_disposable_delivery_context(root / "case-1"):
+                            pass
+            self.assertTrue(len(asana_instances) >= 1)
+            self.assertEqual(asana_instances[-1]._server.fileno(), -1)
+            self.assertNotIn("TURBO_ASANA_API_URL", os.environ)
+
+            # Boundary failure during deliver_feature in setup
+            with unittest.mock.patch("factory.deliver.deliver_feature", side_effect=RuntimeError("deliver-fail")):
+                with self.assertRaises(RuntimeError):
+                    with setup_disposable_delivery_context(root / "case-2"):
+                        pass
+            self.assertNotIn("TURBO_ASANA_API_URL", os.environ)
+
+            # Failure raised inside caller block
+            saved_ctx = []
+            with self.assertRaises(ValueError):
+                with setup_disposable_delivery_context(root / "case-3") as ctx:
+                    saved_ctx.append(ctx)
+                    raise ValueError("inside-context-error")
+            self.assertEqual(saved_ctx[0].asana._server.fileno(), -1)
+            self.assertEqual(saved_ctx[0].gh._server.fileno(), -1)
+            self.assertNotIn("TURBO_ASANA_API_URL", os.environ)
 
 
 if __name__ == "__main__":
