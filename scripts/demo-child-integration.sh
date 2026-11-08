@@ -11,10 +11,11 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 export PYTHONDONTWRITEBYTECODE=1
 export PYTHONPATH="$ROOT/tests:$ROOT:${PYTHONPATH:-}"
 
-EVIDENCE_DIR="${DEMO_KEEP_EVIDENCE_DIR:-$(mktemp -d /tmp/turbo-integration-demo.XXXXXX)}"
-if [[ -z "${DEMO_KEEP_EVIDENCE_DIR:-}" ]]; then
+EVIDENCE_DIR="${DEMO_KEEP_EVIDENCE_DIR:-${EVIDENCE:-$(mktemp -d /tmp/turbo-integration-demo.XXXXXX)}}"
+if [[ -z "${DEMO_KEEP_EVIDENCE_DIR:-}" && -z "${EVIDENCE:-}" ]]; then
   trap 'rm -rf "$EVIDENCE_DIR"' EXIT
 fi
+mkdir -p "$EVIDENCE_DIR"
 
 python3 -c '
 import json, pathlib, sys
