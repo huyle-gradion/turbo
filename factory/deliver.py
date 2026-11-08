@@ -145,11 +145,70 @@ def _next_attempt_dir(deliveries_root: Path, home: Path) -> tuple[int, Path]:
     return attempt, safe_dir(deliveries_root / f"attempt-{attempt}", create=True, root=home)
 
 
-def _detect_builder_session_id(child_dir: Path) -> str | None:
-    if not (p := child_dir / "evidence" / "builder-stdout.txt").is_file():
+def _session_id_from_file(p: Path) -> str | None:
+    if not p.is_file():
         return None
-    _, final_res, _ = worker_module.parse_stream_events(p.read_text(encoding="utf-8"))
-    return (str(final_res.get("conversation_id") or "").strip() if isinstance(final_res, dict) else "") or None
+    try:
+        _, final_res, _ = worker_module.parse_stream_events(p.read_text(encoding="utf-8", errors="replace"))
+        return (str(final_res.get("conversation_id") or final_res.get("session_id") or "").strip() if isinstance(final_res, dict) else "") or None
+    except Exception:
+        return None
+
+
+def detect_candidate_builder_session_id(child_dir: Path, candidate_sha: str | None = None) -> str | None:
+    if not child_dir.is_dir():
+        return None
+    sec_dirs = sorted([d for d in child_dir.iterdir() if d.is_dir() and d.name.startswith("security-repair-")],
+                      key=lambda d: int(d.name.split("-")[-1]) if d.name.split("-")[-1].isdigit() else 0, reverse=True)
+    for sd in sec_dirs:
+        for fn in ("repair-stdout.txt", "repair-stdout-1.txt"):
+            if (sid := _session_id_from_file(sd / fn)):
+                if candidate_sha is not None:
+                    rec_p = sd / "record.json"
+                    if rec_p.is_file():
+                        try:
+                            rec = json.loads(rec_p.read_text(encoding="utf-8"))
+                            if rec.get("to_sha") and rec.get("to_sha") != candidate_sha:
+                                continue
+                        except Exception:
+                            pass
+                return sid
+
+    qa_root = child_dir / "automated-qa"
+    if qa_root.is_dir():
+        qa_rep_dirs = sorted([d for d in qa_root.iterdir() if d.is_dir() and (d.name.startswith("repair-") or d.name.startswith("round-"))],
+                             key=lambda d: int(d.name.split("-")[-1]) if d.name.split("-")[-1].isdigit() else 0, reverse=True)
+        for qd in qa_rep_dirs:
+            target_dirs = [qd / "repair", qd] if (qd / "repair").is_dir() else [qd]
+            for td in target_dirs:
+                for fn in ("repair-stdout.txt", "repair-stdout-1.txt"):
+                    if (sid := _session_id_from_file(td / fn)):
+                        if candidate_sha is not None:
+                            rec_p = td / "record.json"
+                            if rec_p.is_file():
+                                try:
+                                    rec = json.loads(rec_p.read_text(encoding="utf-8"))
+                                    if rec.get("candidate_sha") and rec.get("candidate_sha") != candidate_sha:
+                                        continue
+                                except Exception:
+                                    pass
+                        return sid
+
+    for p in (
+        child_dir / "builder-stdout.txt", child_dir / "builder-stdout-1.txt",
+        child_dir / "evidence" / "builder-stdout.txt",
+    ):
+        if (sid := _session_id_from_file(p)):
+            return sid
+    if child_dir.parent.name == "children":
+        att_dir = child_dir.parent.parent
+        for p in (att_dir / "evidence" / "builder-stdout.txt", att_dir / "builder-stdout.txt"):
+            if (sid := _session_id_from_file(p)):
+                return sid
+    return None
+
+
+_detect_builder_session_id = detect_candidate_builder_session_id
 
 
 def enforce_delivery_approval(
@@ -166,10 +225,8 @@ def enforce_delivery_approval(
     eff_qa = qa_record if qa_record is not None else loaded["qa_record"]
     eff_sec = security_record if security_record is not None else loaded["security_record"]
     eff_rev = review_record if review_record is not None else loaded["review_record"]
-    b_sid = builder_session_id
-    if b_sid is None and isinstance(eff_rev, dict) and (actual_bsid := _detect_builder_session_id(child_dir)):
-        if str(eff_rev.get("reviewer_session_id") or "").strip() == actual_bsid:
-            b_sid = actual_bsid
+    actual_bsid = detect_candidate_builder_session_id(child_dir, candidate_sha)
+    b_sid = actual_bsid or builder_session_id
     gate_p = child_dir / "approval-gate.json"
     disk_gate, corrupt_gate = approval_record, False
     if disk_gate is None and gate_p.is_file():

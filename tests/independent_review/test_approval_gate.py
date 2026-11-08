@@ -353,6 +353,42 @@ class ApprovalGateGroup1Test(unittest.TestCase):
                 self.assertEqual((res_cl["delivery_approved"], res_cl["approved_revision"], res_cl["status"]), (False, None, "unresolved-historical-blockers"), bad_res)
                 self.assertIn(fid_ac4, res_cl["historical_blockers"]["unresolved_ids"])
 
+    def test_authoritative_builder_reviewer_separation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo, home, base_sha, cand_sha, conf, child_dir, _ = self._setup_workspace(root)
+            child_dir.mkdir(parents=True, exist_ok=True)
+            b_out = child_dir / "builder-stdout.txt"
+            b_out.write_text('{"type":"result","conversation_id":"actual-builder-sess","status":"SUCCESS"}\n', encoding="utf-8")
+            ci_rec = _valid_ci_record(cand_sha, base_sha, home, conf=conf)
+            qa_rec = _valid_qa_record(cand_sha, base_sha, home=home)
+            sec_agy = _make_fake_agy(root, "agy-sec-g2", REVIEWER_SCRIPT)
+            sec_rec = security_review.review_candidate_security(repo=repo, home=home, child_dir=child_dir, child=PARSED_CHILD, conf=conf, base_sha=base_sha, candidate_sha=cand_sha, round_num=1, agy_bin=str(sec_agy), builder_session_id="actual-builder-sess", deadline=time.monotonic() + 30.0, limit_s=30)
+            ir_pos_agy = _make_fake_agy(root, "agy-ir-pos", _make_staged_reviewer_script(session_id="distinct-reviewer-sess"))
+            ir_rec = independent_review.review_candidate_independently(repo=repo, home=home, child_dir=child_dir, child=PARSED_CHILD, conf=conf, base_sha=base_sha, candidate_sha=cand_sha, round_num=1, agy_bin=str(ir_pos_agy), builder_session_id="actual-builder-sess", builder_summary="Implemented expired token check and test.", qa_record=qa_rec, security_record=sec_rec, deadline=time.monotonic() + 30.0, limit_s=30)
+
+            pos = independent_review.evaluate_approval_gate(candidate_sha=cand_sha, base_sha=base_sha, repo=repo, home=home, child_dir=child_dir, child=PARSED_CHILD, conf=conf, ci_record=ci_rec, qa_record=qa_rec, security_record=sec_rec, review_record=ir_rec)
+            self.assertEqual((pos["delivery_approved"], pos["status"]), (True, "approved"))
+
+            reused_ir = {**ir_rec, "builder_session_id": "claimed-fake", "reviewer_session_id": "actual-builder-sess", "protocol_ordering": {**ir_rec["protocol_ordering"], "phase_2_continued_session_id": "actual-builder-sess"}}
+            reused_sec = {**sec_rec, "builder_session_id": "claimed-fake", "reviewer_session_id": "actual-builder-sess"}
+            for label, r_rec, s_rec, exp_st in (("ir-reused", reused_ir, sec_rec, "reused-builder-identity"), ("sec-reused", ir_rec, reused_sec, "security-review-invalid")):
+                res = independent_review.evaluate_approval_gate(candidate_sha=cand_sha, base_sha=base_sha, repo=repo, home=home, child_dir=child_dir, child=PARSED_CHILD, conf=conf, ci_record=ci_rec, qa_record=qa_rec, security_record=s_rec, review_record=r_rec)
+                self.assertEqual((res["delivery_approved"], res["status"]), (False, exp_st), label)
+
+            b_out.unlink()
+            rep_dir = child_dir / "security-repair-1"
+            rep_dir.mkdir(parents=True, exist_ok=True)
+            (rep_dir / "repair-stdout.txt").write_text('{"type":"result","conversation_id":"repair-builder-sess","status":"SUCCESS"}\n', encoding="utf-8")
+            (rep_dir / "record.json").write_text(json.dumps({"to_sha": cand_sha, "repair_round": 1}), encoding="utf-8")
+            rep_ir = {**ir_rec, "builder_session_id": "original-claimed", "reviewer_session_id": "repair-builder-sess", "protocol_ordering": {**ir_rec["protocol_ordering"], "phase_2_continued_session_id": "repair-builder-sess"}}
+            res_rep = independent_review.evaluate_approval_gate(candidate_sha=cand_sha, base_sha=base_sha, repo=repo, home=home, child_dir=child_dir, child=PARSED_CHILD, conf=conf, ci_record=ci_rec, qa_record=qa_rec, security_record=sec_rec, review_record=rep_ir)
+            self.assertEqual((res_rep["delivery_approved"], res_rep["status"]), (False, "reused-builder-identity"))
+
+            forged_ap = {**pos, "provenance": {"inputs_path": str(child_dir / "inputs.json"), "inputs_sha256": runner.digest_text("{}")}}
+            v_reused = independent_review.verify_candidate_approval(cand_sha, base_sha, forged_ap, repo=repo, home=home, child_dir=child_dir, ci_record=ci_rec, qa_record=qa_rec, security_record=sec_rec, review_record=rep_ir)
+            self.assertEqual((v_reused["delivery_approved"], v_reused["status"]), (False, "reused-builder-identity"))
+
 
 if __name__ == "__main__":
     unittest.main()
