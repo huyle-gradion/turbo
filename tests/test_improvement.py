@@ -715,7 +715,136 @@ class ImprovementWorkflowTest(unittest.TestCase):
                     forged["eligibility_reasons"] = []
                     self.assertGreater(len(validate_report_for_review(forged)), 0)
 
+    def test_group4_case_inputs_and_conflicts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            obs = _write_file(root / "obs.txt", "observed failure\n")
+            cand = _write_file(root / "worker.py", "def process(s):\n    return s.strip().upper()\n")
+            input_file = _write_file(root / "input.txt", "staged-input-data\n")
+            in_sha = hashlib.sha256(b"staged-input-data\n").hexdigest()
 
+            imp_case = {
+                "case_id": "IMP-INP",
+                "description": "Candidate uses staged input and succeeds where baseline fails",
+                "command": "python3 -c \"import sys; from pathlib import Path; in_p = Path('data/in.txt'); tgt = Path('lib/worker.py'); sys.exit(0 if (in_p.exists() and in_p.read_text() == 'staged-input-data\\n' and tgt.exists()) else 1)\"",
+                "rubric": {"rubric_id": "R-IMP", "expected_exit_code": 0, "required_output_tokens": [], "forbidden_output_tokens": []},
+                "inputs": [{"path": str(input_file), "target_path": "data/in.txt", "sha256": in_sha}],
+            }
+            reg_case = {
+                "case_id": "REG-INP",
+                "description": "Both consume identical staged input bytes",
+                "command": "python3 -c \"import sys; from pathlib import Path; in_p = Path('data/in.txt'); sys.exit(0 if (in_p.exists() and in_p.read_text() == 'staged-input-data\\n') else 1)\"",
+                "rubric": {"rubric_id": "R-REG", "expected_exit_code": 0, "required_output_tokens": [], "forbidden_output_tokens": []},
+                "inputs": [{"path": str(input_file), "target_path": "data/in.txt", "sha256": in_sha}],
+            }
+
+            # 1. Successful evaluation with real sandboxed input staging
+            prop = create_proposal(
+                proposal_id="prop-inp", failure_description="fail", failure_artifacts=[{"path": str(obs)}],
+                kind="check", target_path="lib/worker.py", content_path=cand, baseline_identity="b1",
+                candidate_identity="c1", expected_improvement_description="use input",
+                improvement_cases=[imp_case], regression_cases=[reg_case],
+            )
+            rep = evaluate_proposal(prop, root / "ev_inp")
+            self.assertEqual(rep["eligibility"], "improvement-eligible")
+            self.assertTrue(rep["comparison"]["rule_satisfied"])
+            self.assertTrue(rep["comparison"]["baseline_demonstrated_failure"])
+            self.assertTrue(rep["comparison"]["candidate_demonstrated_success"])
+            self.assertTrue(rep["comparison"]["candidate_regressions_passed"])
+
+            # 2. Retained report validates without external input files
+            input_file.unlink()
+            obs.unlink()
+            cand.unlink()
+            self.assertEqual(validate_report_for_review(rep), [])
+
+            # 3. Canonicalization keeps target_path relative and requires explicit target_path
+            draft = {
+                "schema_version": 1, "proposal_id": "prop-canon",
+                "observed_failure": {"description": "f", "artifacts": [{"path": "obs.txt", "sha256": in_sha}]},
+                "proposed_change": {"kind": "check", "target_path": "lib/worker.py", "content_path": "worker.py", "content_sha256": in_sha},
+                "baseline": {"identity": "b1"}, "candidate": {"identity": "c1", "content_sha256": in_sha},
+                "expected_improvement": {"description": "exp", "rule": "baseline-failed-candidate-passed"},
+                "improvement_cases": [{
+                    "case_id": "IMP-01", "command": "python3 -c \"import sys; sys.exit(0)\"",
+                    "rubric": {"rubric_id": "R1", "expected_exit_code": 0, "required_output_tokens": [], "forbidden_output_tokens": []},
+                    "inputs": [{"path": "inputs/test.txt", "target_path": "staged/test.txt", "sha256": in_sha}],
+                }],
+                "regression_cases": [{
+                    "case_id": "REG-01", "command": "python3 -c \"import sys; sys.exit(0)\"",
+                    "rubric": {"rubric_id": "R2", "expected_exit_code": 0, "required_output_tokens": [], "forbidden_output_tokens": []},
+                }],
+                "execution_conditions": {
+                    "time_limit_seconds": 30, "allow_network": False, "env_sanitized": True,
+                    "permitted_substitution": {"target_path": "lib/worker.py", "content_sha256": in_sha},
+                },
+            }
+            canonicalize_draft_references(draft, root)
+            self.assertEqual(draft["improvement_cases"][0]["inputs"][0]["target_path"], "staged/test.txt")
+            self.assertTrue(Path(draft["improvement_cases"][0]["inputs"][0]["path"]).is_absolute())
+
+            # 4. Structural validation rejects missing target_path (path does not default to target)
+            no_tgt = json.loads(json.dumps(draft))
+            del no_tgt["improvement_cases"][0]["inputs"][0]["target_path"]
+            issues = validate_proposal_structure(no_tgt)
+            self.assertTrue(any("target_path" in iss for iss in issues))
+
+            # 5. Unsafe destinations rejected
+            for bad_tgt in ("../escaped.txt", "/etc/passwd", "staged/../escape.txt", "staged/./x.txt"):
+                bad_draft = json.loads(json.dumps(draft))
+                bad_draft["improvement_cases"][0]["inputs"][0]["target_path"] = bad_tgt
+                issues = validate_proposal_structure(bad_draft)
+                self.assertTrue(any("target_path" in iss for iss in issues), f"Target {bad_tgt!r} should be rejected")
+
+            # 6. Ambiguous collisions within case inputs rejected
+            coll_draft = json.loads(json.dumps(draft))
+            coll_draft["improvement_cases"][0]["inputs"].append(
+                {"path": str(root / "other.txt"), "target_path": "staged/test.txt", "sha256": in_sha}
+            )
+            issues = validate_proposal_structure(coll_draft)
+            self.assertTrue(any("duplicate input target_path" in iss for iss in issues))
+
+            # Overlapping destinations in case inputs rejected
+            overlap_draft = json.loads(json.dumps(draft))
+            overlap_draft["improvement_cases"][0]["inputs"].append(
+                {"path": str(root / "other.txt"), "target_path": "staged/test.txt/nested.txt", "sha256": in_sha}
+            )
+            issues = validate_proposal_structure(overlap_draft)
+            self.assertTrue(any("overlapping" in iss for iss in issues))
+
+            # 7. Substitution-target conflicts rejected
+            sub_coll_draft = json.loads(json.dumps(draft))
+            sub_coll_draft["improvement_cases"][0]["inputs"][0]["target_path"] = "lib/worker.py"
+            issues = validate_proposal_structure(sub_coll_draft)
+            self.assertTrue(any("conflicts with proposed_change" in iss for iss in issues))
+
+            sub_overlap_draft = json.loads(json.dumps(draft))
+            sub_overlap_draft["improvement_cases"][0]["inputs"][0]["target_path"] = "lib"
+            issues = validate_proposal_structure(sub_overlap_draft)
+            self.assertTrue(any("overlaps with proposed_change" in iss for iss in issues))
+
+            # 8. Evaluation rejects changed/mismatched input bytes
+            input_file2 = _write_file(root / "input2.txt", "real-content\n")
+            in2_sha = hashlib.sha256(b"real-content\n").hexdigest()
+            cand2 = _write_file(root / "cand2.py", "def check(): pass\n")
+            obs2 = _write_file(root / "obs2.txt", "err\n")
+            prop_mismatch = create_proposal(
+                proposal_id="prop-mismatch", failure_description="f", failure_artifacts=[{"path": str(obs2)}],
+                kind="check", target_path="target.py", content_path=cand2, baseline_identity="b1",
+                candidate_identity="c1", expected_improvement_description="exp",
+                improvement_cases=[{
+                    "case_id": "IMP-01", "command": "python3 -c \"import sys; sys.exit(0)\"",
+                    "rubric": {"rubric_id": "R1", "expected_exit_code": 0, "required_output_tokens": [], "forbidden_output_tokens": []},
+                    "inputs": [{"path": str(input_file2), "target_path": "in.txt", "sha256": in2_sha}],
+                }],
+                regression_cases=[{
+                    "case_id": "REG-01", "command": "python3 -c \"import sys; sys.exit(0)\"",
+                    "rubric": {"rubric_id": "R2", "expected_exit_code": 0, "required_output_tokens": [], "forbidden_output_tokens": []},
+                }],
+            )
+            input_file2.write_text("mutated-content\n")
+            with self.assertRaises(UsageError):
+                evaluate_proposal(prop_mismatch, root / "ev_mismatch")
 
 
 if __name__ == "__main__":

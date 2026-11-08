@@ -59,6 +59,12 @@ def _is_safe_relative_path(p_str: str) -> bool:
     return not p.is_absolute() and ".." not in p.parts and "." not in p.parts
 
 
+def _paths_overlap(p1_str: str, p2_str: str) -> bool:
+    parts1 = Path(p1_str.replace("\\", "/")).parts
+    parts2 = Path(p2_str.replace("\\", "/")).parts
+    return parts1[:len(parts2)] == parts2 or parts2[:len(parts1)] == parts1
+
+
 def _write_confined_file(worktree: Path, rel_path: str, content: bytes) -> Path:
     if not _is_safe_relative_path(rel_path):
         raise UsageError(f"unsafe or invalid target path: {rel_path!r}")
@@ -87,7 +93,7 @@ def _write_confined_file(worktree: Path, rel_path: str, content: bytes) -> Path:
     return target
 
 
-def _validate_case_structure(case: Any, seen_ids: set[str], label: str) -> list[str]:
+def _validate_case_structure(case: Any, seen_ids: set[str], label: str, prop_target: str | None = None) -> list[str]:
     if not isinstance(case, dict):
         return [f"{label} case must be a JSON object"]
     raw_id = case.get("case_id")
@@ -118,6 +124,37 @@ def _validate_case_structure(case: Any, seen_ids: set[str], label: str) -> list[
             v = rub.get(k, [])
             if not isinstance(v, (list, tuple)) or any(not isinstance(t, str) for t in v):
                 issues.append(f"case {cid!r} rubric {k} must be list of strings")
+    raw_inputs = case.get("inputs")
+    if raw_inputs is not None:
+        if not isinstance(raw_inputs, (list, tuple)):
+            issues.append(f"case {cid!r} inputs must be a list")
+        else:
+            seen_targets: list[str] = []
+            for idx, inp in enumerate(raw_inputs):
+                if not isinstance(inp, dict):
+                    issues.append(f"case {cid!r} input {idx} must be a JSON object")
+                    continue
+                src = inp.get("path")
+                if not isinstance(src, str) or not src.strip():
+                    issues.append(f"case {cid!r} input requires path string")
+                tgt = inp.get("target_path")
+                if not isinstance(tgt, str) or not _is_safe_relative_path(tgt):
+                    issues.append(f"case {cid!r} input requires valid relative target_path: {tgt!r}")
+                else:
+                    for prev_tgt in seen_targets:
+                        if prev_tgt == tgt:
+                            issues.append(f"case {cid!r} duplicate input target_path: {tgt!r}")
+                        elif _paths_overlap(prev_tgt, tgt):
+                            issues.append(f"case {cid!r} overlapping input target_paths: {tgt!r} and {prev_tgt!r}")
+                    if prop_target and _is_safe_relative_path(prop_target):
+                        if tgt == prop_target:
+                            issues.append(f"case {cid!r} input target_path conflicts with proposed_change: {tgt!r}")
+                        elif _paths_overlap(prop_target, tgt):
+                            issues.append(f"case {cid!r} input target_path overlaps with proposed_change: {tgt!r}")
+                    seen_targets.append(tgt)
+                sha = inp.get("sha256")
+                if not isinstance(sha, str) or not sha.strip():
+                    issues.append(f"case {cid!r} input sha256 required")
     return issues
 
 
@@ -163,9 +200,10 @@ def validate_proposal_structure(proposal: Any) -> list[str]:
     if not isinstance(reg_cases, list) or not reg_cases:
         issues.append("regression_cases must be non-empty list")
     seen_ids: set[str] = set()
+    prop_tgt = str(prop.get("target_path") or "").strip() if isinstance(prop, dict) else None
     for cases, label in (((imp_cases if isinstance(imp_cases, list) else ()), "improvement"), ((reg_cases if isinstance(reg_cases, list) else ()), "regression")):
         for c in cases:
-            issues.extend(_validate_case_structure(c, seen_ids, label))
+            issues.extend(_validate_case_structure(c, seen_ids, label, prop_target=prop_tgt))
     conds = proposal.get("execution_conditions")
     if not isinstance(conds, dict):
         issues.append("execution_conditions must be a JSON object")
@@ -363,6 +401,25 @@ def evaluate_proposal(
     }
     _write_json(manifest_path, manifest)
     b_cases, c_cases, timeout_s = [], [], proposal["execution_conditions"]["time_limit_seconds"]
+    staged_inputs: dict[str, list[tuple[str, bytes]]] = {}
+    for case in proposal.get("improvement_cases", []) + proposal.get("regression_cases", []):
+        cid = case.get("case_id")
+        for inp in case.get("inputs") or ():
+            if isinstance(inp, dict):
+                src = Path(str(inp.get("path") or ""))
+                if not src.is_file():
+                    raise UsageError(f"case {cid!r} input not found: {src}")
+                data = src.read_bytes()
+                sha = hashlib.sha256(data).hexdigest()
+                if sha != str(inp.get("sha256") or ""):
+                    raise UsageError(f"case {cid!r} input sha mismatch: expected {inp.get('sha256')}, got {sha}")
+                staged_inputs.setdefault(cid, []).append((str(inp["target_path"]), data))
+    cand_path = Path(proposal["proposed_change"]["content_path"])
+    if not cand_path.is_file():
+        raise UsageError(f"proposed_change content_path not found: {cand_path}")
+    cand_bytes = cand_path.read_bytes()
+    if hashlib.sha256(cand_bytes).hexdigest() != proposal["proposed_change"]["content_sha256"]:
+        raise UsageError("proposed_change content_sha256 mismatch")
     try:
         for side, store in (("baseline", b_cases), ("candidate", c_cases)):
             for kind, case in [("improvement", c) for c in proposal["improvement_cases"]] + [("regression", c) for c in proposal["regression_cases"]]:
@@ -370,10 +427,11 @@ def evaluate_proposal(
                 if repo and (repo / ".git").is_dir(): worker.prepare_isolated_git_checkout(repo, wt, "HEAD")
                 elif repo and repo.is_dir(): shutil.copytree(repo, wt, dirs_exist_ok=True)
                 else: wt.mkdir(parents=True, exist_ok=True)
+                for target_rel, inp_bytes in staged_inputs.get(case["case_id"], []):
+                    _write_confined_file(wt, target_rel, inp_bytes)
                 if side == "candidate":
                     target_rel = str(proposal["proposed_change"]["target_path"])
-                    content_bytes = Path(proposal["proposed_change"]["content_path"]).read_bytes()
-                    _write_confined_file(wt, target_rel, content_bytes)
+                    _write_confined_file(wt, target_rel, cand_bytes)
                 res = _execute_case(wt, case, side, proposal, attempt_dir, timeout_s)
                 res["case_kind"] = kind
                 store.append(res)
