@@ -170,3 +170,30 @@ class IntegrationBehaviorTest(unittest.TestCase):
                 finally:
                     if old is not None: os.environ["TURBO_GITHUB_TOKEN"] = old
                     else: os.environ.pop("TURBO_GITHUB_TOKEN", None)
+
+    def test_branch_protection_contract_and_single_encoded_segment(self) -> None:
+        import urllib.request, urllib.error
+        from urllib.parse import quote
+        with tempfile.TemporaryDirectory() as tmp_str:
+            with setup_disposable_delivery_context(Path(tmp_str)) as ctx:
+                gate, b_branch = self._setup_ctx(ctx)
+                res = self._call(ctx, gate, b_branch)
+                self.assertEqual(res.status, "confirmed")
+                prot_reqs = [r for r in ctx.gh.requests if r["path"].endswith("/protection")]
+                self.assertTrue(prot_reqs)
+                outbound_path = prot_reqs[0]["path"]
+                encoded_segment = quote(b_branch, safe="")
+                expected_path = f"/api/v3/repos/example/chat-bridge/branches/{encoded_segment}/protection"
+                self.assertEqual(outbound_path, expected_path)
+                prefix = "/api/v3/repos/example/chat-bridge/branches/"
+                extracted_segment = outbound_path[len(prefix):-len("/protection")]
+                self.assertNotIn("/", extracted_segment)
+                raw_url = f"{ctx.gh.base_url}/repos/example/chat-bridge/branches/{b_branch}/protection"
+                with self.assertRaises(urllib.error.HTTPError) as cm:
+                    urllib.request.urlopen(urllib.request.Request(raw_url, headers={"Authorization": "Bearer token"}))
+                self.assertEqual(cm.exception.code, 404)
+                pct_branch = "feature/pct%test"
+                ctx.gh.branch_protections = {pct_branch: {"required_status_checks": {"strict": True}, "enforce_admins": {"enabled": True}}}
+                enc_pct_url = f"{ctx.gh.base_url}/repos/example/chat-bridge/branches/{quote(pct_branch, safe='')}/protection"
+                with urllib.request.urlopen(urllib.request.Request(enc_pct_url, headers={"Authorization": "Bearer token"})) as resp:
+                    self.assertEqual(resp.status, 200)

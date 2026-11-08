@@ -6,7 +6,7 @@ import json, time
 from pathlib import Path
 from typing import Any, Callable
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 from urllib.request import Request, build_opener
 
 from factory import config as config_module, gitio
@@ -191,7 +191,8 @@ def integrate_approved_child(
         return _fail("stale-base-revision", f"remote origin/{base_branch} ({rem_base}) does not match base {base_sha}")
 
     # 7. Repository protection verification (AC6)
-    p_code, prot_data, p_msg = _http_req("GET", f"{eff_base_url}/repos/{repo_slug}/branches/{base_branch}/protection", eff_token, eff_base_url, trace, dl, limit_s)
+    quoted_branch = quote(base_branch, safe="")
+    p_code, prot_data, p_msg = _http_req("GET", f"{eff_base_url}/repos/{repo_slug}/branches/{quoted_branch}/protection", eff_token, eff_base_url, trace, dl, limit_s)
     if p_code in (401, 403):
         return _fail("denied-permissions", f"insufficient permissions to verify branch protection on {base_branch}: {p_msg}")
     if p_code != 200 or not prot_data:

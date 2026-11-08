@@ -15,7 +15,7 @@ import time
 from typing import Any, Callable
 import unittest
 from unittest import mock
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 import zipfile
 
 from factory import ci_gate, config as config_module, deliver_checks, worker as worker_module
@@ -276,7 +276,10 @@ class _DisposableGitHubServer:
                     self.wfile.write(raw_zip)
                     return
                 if path.startswith(f"{repo_prefix}/branches/") and path.endswith("/protection"):
-                    bname = path[len(f"{repo_prefix}/branches/") : -len("/protection")]
+                    raw_segment = path[len(f"{repo_prefix}/branches/") : -len("/protection")]
+                    if "/" in raw_segment or not raw_segment:
+                        return self._send_json(404, {"message": "Not Found"})
+                    bname = unquote(raw_segment)
                     if outer.protection_status != 200:
                         return self._send_json(outer.protection_status, {"message": f"Protection HTTP {outer.protection_status}"})
                     if outer.branch_protections is not None:
