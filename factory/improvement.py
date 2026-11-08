@@ -659,6 +659,16 @@ def build_parser() -> argparse.ArgumentParser:
     eval_p.add_argument("--evidence-dir", required=True, help="evidence directory path")
     eval_p.add_argument("--repo", help="base repository path")
     eval_p.add_argument("--json", action="store_true", help="output report JSON to stdout")
+    pkt_p = sub.add_parser("build-review-packet", aliases=["review-packet"], help="build an issue/PR review packet from evaluation report")
+    pkt_p.add_argument("--report", required=True, help="evaluation report JSON path")
+    pkt_p.add_argument("--out", required=True, help="output review packet JSON path")
+    pkt_p.add_argument("--proposal-json", help="optional external proposal JSON path to verify against")
+    res_p = sub.add_parser("resolve-approved", aliases=["select-approved"], help="resolve authoritative approved factory policy version")
+    res_p.add_argument("--repo", required=True, help="repository directory path")
+    res_p.add_argument("--report", required=True, help="evaluation report JSON path")
+    res_p.add_argument("--proof", required=True, help="authoritative approval proof JSON path")
+    res_p.add_argument("--proposal", help="optional proposal JSON path")
+    res_p.add_argument("--out", help="optional output path for resolved content bytes")
     return p
 
 
@@ -706,6 +716,36 @@ def main(argv: list[str] | None = None) -> int:
         if args.json: sys.stdout.write(json.dumps(report, indent=2, sort_keys=True) + "\n")
         else: sys.stdout.write(f"Evaluation complete: {report['eligibility']}\n")
         return 0 if report["eligibility"] == "improvement-eligible" else 1
+    elif args.action in ("build-review-packet", "review-packet"):
+        report_data = json.loads(Path(args.report).read_text(encoding="utf-8"))
+        prop_json = Path(args.proposal_json).read_text(encoding="utf-8") if args.proposal_json else None
+        from factory.promotion import build_review_packet
+        packet = build_review_packet(report_data, proposal_json=prop_json)
+        out_p = Path(args.out)
+        out_p.parent.mkdir(parents=True, exist_ok=True)
+        _write_json(out_p, packet)
+        sys.stdout.write(f"Review packet written to {out_p}\n")
+        return 0
+    elif args.action in ("resolve-approved", "select-approved"):
+        report_data = json.loads(Path(args.report).read_text(encoding="utf-8"))
+        proof_data = json.loads(Path(args.proof).read_text(encoding="utf-8"))
+        prop_data = json.loads(Path(args.proposal).read_text(encoding="utf-8")) if args.proposal else None
+        from factory.promotion import resolve_approved_version
+        res = resolve_approved_version(
+            repo=Path(args.repo).resolve(),
+            report=report_data,
+            proposal=prop_data,
+            approval_proof=proof_data,
+        )
+        if not res.verified:
+            sys.stderr.write(f"Refusal ({res.status}): {'; '.join(res.blockers)}\n")
+            return 1
+        if args.out and res.content_bytes is not None:
+            out_p = Path(args.out)
+            out_p.parent.mkdir(parents=True, exist_ok=True)
+            out_p.write_bytes(res.content_bytes)
+        sys.stdout.write(f"Resolved approved version: {res.selected_version} ({res.content_sha256})\n")
+        return 0
     return 1
 
 

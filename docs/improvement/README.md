@@ -72,3 +72,36 @@ Identical verified bytes are staged at `target_path` for both baseline and candi
 - **Eligibility is not approval**: An `"improvement-eligible"` report demonstrates behavioral improvement under test rubrics only.
 - It grants **NO authority** to install files, mutate delivery prompts, modify protected policies, or promote lessons.
 - Only a human maintainer's review through the repository's issue/PR review workflow and explicit merge to `main` can approve or promote factory policy or durable lessons.
+
+## Promotion Gate and Exact-Version Resolver (`factory.promotion`) — Issue #69
+
+`#69` implements the human-maintainer promotion gate and exact-version resolver (Part B of `#32`).
+
+### Review Packet Generation
+
+Turns an improvement-eligible report into an issue/PR review packet without autonomous submission or promotion side effects:
+
+```bash
+python3 -m factory.improvement build-review-packet \
+  --report <report.json> \
+  --out <packet.json>
+```
+
+- Packet includes proposal digest, candidate content digest, factory revision, bounded proposed change, failure evidence, expected improvement, complete comparison with regressions, and measurement provenance.
+- Fixed authority note: `"review-packet-only; not approved, submitted, merged, or promoted"`.
+- Validates eligibility directly from recorded case results; rejects ineligible or tampered reports.
+
+### Authoritative Resolver Contract for #70
+
+`resolve_approved_version` enforces exact approved version selection:
+
+- **Trust Anchor**: Maintainer-merged Pull Request targeting `main` (`merged: true`, `state: "closed"`), with `merge_commit_sha` verified as an ancestor of `main`.
+- **Untrusted Inputs**: Candidate-local `approved` flags, delivery-approval records (`#58`), unmerged branches, caller-supplied refs, and dirty workspace files are rejected.
+- **Fail-Closed Verification**: Rejects unapproved, unmerged, altered proposal content, altered candidate bytes, or altered evaluation evidence.
+- **Exact Git Retrieval**: Extracts candidate bytes directly from git object storage (`git show {merge_commit_sha}:{target_path}`); never reads local workspace files.
+- **Distinct Storage Contract**:
+  - Shared policy paths: `factory/`, `skills/`, `bin/`, `guards/`.
+  - Durable lessons path: `factory/lessons/`.
+  - Strictly excluded: `pilot/`, `examples/`, `tests/`, `evidence/`, `attempts/`, `homes/`, `context/`.
+- **Refusal Codes**: `"untrusted-approval-source"`, `"unmerged-revision"`, `"unintended-target"`, `"ineligible-proposal"`, `"binding-mismatch"`, `"mismatched-approved-content"`, `"missing-approved-content"`, `"forbidden-storage-path"`.
+- **No Delivery Activation**: Selection does not mutate delivery configs, install files, or activate candidate lessons in delivery runs.
