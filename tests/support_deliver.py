@@ -9,7 +9,7 @@ from typing import Any
 
 from automated_qa.test_automated_qa_eval import _case
 from factory import automated_qa, config as config_module, deliver as deliver_module, gitio, independent_review, runner, security_review
-from factory.paths import RuntimePaths, atomic_json, read_json
+from factory.paths import RuntimePaths, atomic_json, read_json, safe_dir
 from support import git
 from test_deliver import (
     GOOD_BUILDER_SCRIPT, PARENT_TASK, READY_CHILD,
@@ -417,5 +417,82 @@ def run_delivery_lifecycle_demo(evidence_dir: Path) -> dict[str, Any]:
         "success": True,
     }
     atomic_json(evidence_dir / "lifecycle-summary.json", summary, evidence_dir)
+    return summary
+
+
+def run_integration_demo(evidence_dir: Path) -> dict[str, Any]:
+    """Execute five-stage disposable child integration demonstration and retain evidence."""
+    from factory.integration import integrate_approved_child
+    evidence_dir.mkdir(parents=True, exist_ok=True)
+    stages_dir = safe_dir(evidence_dir / "stages", create=True)
+    if (evidence_dir / "workspace").exists():
+        shutil.rmtree(evidence_dir / "workspace", ignore_errors=True)
+    ws_root = safe_dir(evidence_dir / "workspace", create=True)
+    factory_rev_res = gitio.git(Path(__file__).resolve().parents[1], "rev-parse", "HEAD")
+    factory_rev = factory_rev_res.output.strip() if factory_rev_res.ok else "unknown"
+
+    with setup_disposable_delivery_context(ws_root) as ctx:
+        b_branch, h_branch = str(ctx.intake_rec["parent"]["target_feature_branch"]), ctx.head_branch
+        gate = deliver_module.enforce_delivery_approval(
+            candidate_sha=ctx.cand_sha, base_sha=ctx.base_sha, repo=ctx.repo, home=ctx.home,
+            child_dir=ctx.child_dir, child=ctx.child_contract, conf=ctx.conf,
+        )
+        assert gate.get("delivery_approved") is True
+
+        def _run_stage(num: int, name: str, **kw: Any) -> Any:
+            sdir = safe_dir(stages_dir / f"stage-{num}-{name}", create=True)
+            res = integrate_approved_child(
+                repo=kw.get("repo", ctx.repo), home=ctx.home, child_dir=ctx.child_dir,
+                child=ctx.child_contract, conf=ctx.conf, pr_number=1,
+                candidate_sha=kw.get("cand", ctx.cand_sha), base_sha=kw.get("base", ctx.base_sha),
+                head_branch=h_branch, base_branch=b_branch, approval_record=gate,
+                repo_slug="example/chat-bridge", base_url=ctx.gh.base_url, token="disposable-gh-token",
+                on_before_merge=kw.get("hook"),
+            )
+            for fn in ("integration-request.json", "integration-record.json"):
+                if (ctx.child_dir / fn).is_file(): shutil.copy(ctx.child_dir / fn, sdir / fn)
+            return res
+
+        # 1. Success
+        git(ctx.bare, "branch", "-f", b_branch, ctx.base_sha); git(ctx.bare, "branch", "-f", h_branch, ctx.cand_sha); git(ctx.repo, "fetch", "origin")
+        r1 = _run_stage(1, "success")
+        assert r1.status == "confirmed" and r1.landed_sha is not None
+
+        # 2. Competing base
+        git(ctx.bare, "branch", "-f", b_branch, ctx.base_sha); git(ctx.bare, "branch", "-f", h_branch, ctx.cand_sha); git(ctx.repo, "fetch", "origin")
+        ctx.gh.pulls[1]["state"], ctx.gh.pulls[1]["merged"] = "open", False
+        def _adv(): git(ctx.bare, "update-ref", f"refs/heads/{b_branch}", git(ctx.bare, "-c", "user.name=CI", "-c", "user.email=ci@test", "commit-tree", f"{ctx.base_sha}^{{tree}}", "-p", ctx.base_sha, "-m", "Comp"), ctx.base_sha)
+        r2 = _run_stage(2, "competing-base", hook=_adv)
+        assert r2.status == "rejected-competing-base"
+
+        # 3. Stale approval
+        r3 = _run_stage(3, "stale-approval", base="0" * 40)
+        assert r3.status == "stale-candidate-revision"
+
+        # 4. Unsupported protection
+        git(ctx.bare, "branch", "-f", b_branch, ctx.base_sha)
+        ctx.gh.branch_protections = {}
+        r4 = _run_stage(4, "unsupported-protection")
+        assert r4.status == "unsupported-protection"
+        ctx.gh.branch_protections = None
+
+        # 5. Uncertain outcome
+        ctx.gh.merge_status = 502
+        r5 = _run_stage(5, "uncertain-timeout")
+        assert r5.status == "uncertain"
+        ctx.gh.merge_status = 200
+
+    summary = {
+        "demo": "five-stage-child-integration-lifecycle", "provenance": PROVENANCE_NOTE, "factory_revision": factory_rev,
+        "stages": {
+            "stage_1_success": {"status": r1.status, "landed_sha": r1.landed_sha},
+            "stage_2_competing_base": {"status": r2.status, "blockers": r2.blockers},
+            "stage_3_stale_approval": {"status": r3.status, "blockers": r3.blockers},
+            "stage_4_unsupported_protection": {"status": r4.status, "blockers": r4.blockers},
+            "stage_5_uncertain_timeout": {"status": r5.status, "blockers": r5.blockers},
+        },
+        "success": True,
+    }
+    atomic_json(evidence_dir / "integration-demo-summary.json", summary, evidence_dir)
     return summary
 

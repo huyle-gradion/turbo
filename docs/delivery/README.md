@@ -40,6 +40,24 @@ The script demonstrates, in order:
 3. **Verified correction**: Candidate implements genuine fix, checks and reproducer pass; delivery approves that exact candidate.
 4. **Subsequent revision**: Candidate advances further; attempt to reuse prior approval fails closed.
 
+## Five-Stage Child Integration Demonstration (`#65`)
+
+The bounded child integration primitive (`factory.integration.integrate_approved_child`) integrates an approved child into its feature branch only under verified branch protections (`strict` status checks, direct push restrictions, admin enforcement) and exact candidate/base bindings. See [`docs/delivery/integration-ownership.md`](integration-ownership.md) for the complete architecture and ownership specification.
+
+The five-stage disposable integration lifecycle script is runnable via:
+
+```sh
+DEMO_KEEP_EVIDENCE_DIR="$(mktemp -d /tmp/turbo-issue-65.XXXXXX)" \
+  bash scripts/demo-child-integration.sh
+```
+
+The script demonstrates, in order:
+1. **Confirmed integration**: Fully approved child PR integrates cleanly into the protected feature branch; landed commit is recorded.
+2. **Boundary competition**: Competing update advances the remote base at the write boundary; provider strict check rejects the stale write (`rejected-competing-base`).
+3. **Stale approval**: Prior approval presented against moved base revision is rejected before mutation (`stale-candidate-revision`).
+4. **Unsupported protection**: Feature branch lacking strict status checks or admin enforcement fails closed (`unsupported-protection`).
+5. **Uncertain outcome**: Provider server error or timeout during merge is classified as `uncertain` without blind retries.
+
 ## Truth Boundaries and Provenance
 
 Fixture-based success in disposable demonstration environments establishes helper contract compliance, but **does not establish live Antigravity or hosted-provider support, merge approval (#24), or parent acceptance**.
