@@ -1,7 +1,7 @@
 """Tests proving the delivery rejection matrix and exact-candidate control (Issue #62 AC1)."""
 from __future__ import annotations
 
-import json, os, shutil, tempfile, unittest
+import json, os, shutil, tempfile, time, unittest
 from pathlib import Path
 
 from factory import deliver as deliver_module
@@ -157,5 +157,214 @@ class DeliveryRejectionMatrixTest(unittest.TestCase):
                 ctx.gh.__exit__(None, None, None)
 
 
+class DeliveryHistoricalAndProtocolRejectionTest(unittest.TestCase):
+    """Enforced delivery boundary tests for historical findings and invalid review (Issue #62 AC2)."""
+
+    def test_persisted_historical_blocker_omitted_from_reconciliation(self) -> None:
+        from factory import independent_review
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ctx = setup_disposable_delivery_context(root)
+            try:
+                fid = independent_review.compute_review_finding_id("bug", "src/chat_bridge/auth.py", "hist-omitted-rule")
+                b1 = {
+                    "finding_id": fid, "category": "bug", "blocking": True,
+                    "target": "src/chat_bridge/auth.py", "rule": "hist-omitted-rule",
+                    "title": "Historical bug", "evidence": "r1-ev", "actionable_correction": "Fix hist",
+                    "status": "open", "introduced_in_round": 1, "introduced_in_revision": ctx.cand_sha,
+                    "created_round": 1, "created_candidate_sha": ctx.cand_sha,
+                }
+                atomic_json(ctx.child_dir / "prior-blockers.json", {"schema": 1, "round": 1, "updated_in_round": 1, "findings": [b1]}, ctx.home)
+                r1_dir = ctx.child_dir / "independent-review-round-1"
+                r1_rec = dict(ctx.valid_snapshots["ir"])
+                r1_rec["findings"] = [b1]
+                r1_rec["blocking_findings"] = [b1]
+                r1_rec["open_finding_ids"] = [fid]
+                atomic_json(r1_dir / "record.json", r1_rec, ctx.home)
+
+                # Round 2 review passes but completely omits fid from reconciliation
+                rev_r2 = dict(ctx.valid_snapshots["ir"])
+                rev_r2["round"] = 2
+                rev_r2["outcome"] = "review-passed"
+                rev_r2["review_verified"] = True
+                rev_r2["findings"] = []
+                rev_r2["previous_findings_resolution"] = []
+                rev_r2["blocking_findings"] = []
+                rev_r2["open_finding_ids"] = []
+                atomic_json(ctx.child_dir / "independent-review.json", rev_r2, ctx.home)
+                (ctx.child_dir / "approval-gate.json").unlink(missing_ok=True)
+
+                res = deliver_module.deliver_feature(ctx.paths, ctx.spec)
+                self.assertEqual(res.status, "unresolved-historical-blockers")
+                self.assertFalse(res.delivery_approved)
+                self.assertIsNone(res.approved_revision)
+                self.assertFalse(res.verified)
+                self.assertTrue(any(fid in b and "omitted" in b for b in res.blockers), res.blockers)
+
+                gate_rec = json.loads((ctx.child_dir / "approval-gate.json").read_text(encoding="utf-8"))
+                self.assertEqual(gate_rec["status"], "unresolved-historical-blockers")
+                self.assertFalse(gate_rec["delivery_approved"])
+                self.assertIn(fid, gate_rec["historical_blockers"]["unresolved_ids"])
+            finally:
+                ctx.asana.__exit__(None, None, None)
+                ctx.gh.__exit__(None, None, None)
+
+    def test_ineffective_fixed_claim_contradicted_by_actual_reproducer_execution(self) -> None:
+        from factory import independent_review
+        from tests.independent_review.test_independent_review import _make_staged_reviewer_script
+        from test_deliver import _make_fake_agy
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ctx = setup_disposable_delivery_context(root)
+            try:
+                vcmd = "python3 -c \"import pathlib, sys; sys.exit(0 if '# genuine-fix-marker' in pathlib.Path('src/chat_bridge/auth.py').read_text() else 1)\""
+                fid = independent_review.compute_review_finding_id("bug", "src/chat_bridge/auth.py", "ineffective-repro-rule")
+                b1 = {
+                    "finding_id": fid, "category": "bug", "blocking": True,
+                    "target": "src/chat_bridge/auth.py", "rule": "ineffective-repro-rule",
+                    "title": "Repro bug", "evidence": "r1-repro", "actionable_correction": "Add # genuine-fix-marker",
+                    "verification_command": vcmd, "status": "open",
+                    "introduced_in_round": 1, "introduced_in_revision": ctx.base_sha,
+                    "last_seen_round": 1, "last_seen_revision": ctx.base_sha,
+                }
+                atomic_json(ctx.child_dir / "prior-blockers.json", {"schema": 1, "round": 1, "updated_in_round": 1, "findings": [b1]}, ctx.home)
+                r1_rec = {**ctx.valid_snapshots["ir"], "round": 1, "reviewed_revision": ctx.base_sha, "findings": [b1], "blocking_findings": [b1], "open_finding_ids": [fid]}
+                atomic_json(ctx.child_dir / "independent-review-round-1" / "record.json", r1_rec, ctx.home)
+
+                # Scripted reviewer claims fixed resolution, but reproducer executes on candidate lacking marker and fails
+                reconcils = [{"finding_id": fid, "resolution": "fixed", "evidence": "claimed fix in prose"}]
+                script_ineffective = _make_staged_reviewer_script(session_id="rev-ineff", outcome="review-passed", reconciliations=reconcils)
+                agy_ineff = _make_fake_agy(root, "agy-ineff", script_ineffective)
+
+                r2 = independent_review.review_candidate_independently(
+                    repo=ctx.repo, home=ctx.home, child_dir=ctx.child_dir, child=ctx.child_contract,
+                    conf=ctx.conf, base_sha=ctx.base_sha, candidate_sha=ctx.cand_sha,
+                    builder_session_id="c-101", builder_summary="Claimed fix.",
+                    qa_record=ctx.valid_snapshots["qa_round"], security_record=ctx.valid_snapshots["sec"],
+                    round_num=2, agy_bin=str(agy_ineff), deadline=time.monotonic() + 30.0, limit_s=30,
+                )
+                self.assertFalse(r2["review_verified"])
+                self.assertIn(fid, r2["open_finding_ids"])
+                self.assertEqual(r2["blocking_findings"][0]["resolution_blocker"], "check-failed")
+
+                (ctx.child_dir / "approval-gate.json").unlink(missing_ok=True)
+                res = deliver_module.deliver_feature(ctx.paths, ctx.spec)
+                self.assertFalse(res.delivery_approved)
+                self.assertIsNone(res.approved_revision)
+                self.assertFalse(res.verified)
+                self.assertIn(res.status, ("changes-requested", "unresolved-historical-blockers"))
+                self.assertTrue(any("failed trusted execution verification" in b or fid in b or "check-failed" in b for b in res.blockers), res.blockers)
+            finally:
+                ctx.asana.__exit__(None, None, None)
+                ctx.gh.__exit__(None, None, None)
+
+    def test_unsupported_resolution_claims_cannot_resolve_blocker(self) -> None:
+        from factory import independent_review
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ctx = setup_disposable_delivery_context(root)
+            try:
+                fid = independent_review.compute_review_finding_id("bug", "src/chat_bridge/auth.py", "unsupported-res-rule")
+                b1 = {
+                    "finding_id": fid, "category": "bug", "blocking": True,
+                    "target": "src/chat_bridge/auth.py", "rule": "unsupported-res-rule",
+                    "title": "Bug", "evidence": "r1-res", "actionable_correction": "Fix",
+                    "status": "open", "introduced_in_round": 1, "introduced_in_revision": ctx.cand_sha,
+                }
+                atomic_json(ctx.child_dir / "prior-blockers.json", {"schema": 1, "round": 1, "updated_in_round": 1, "findings": [b1]}, ctx.home)
+                atomic_json(ctx.child_dir / "independent-review-round-1" / "record.json", {**ctx.valid_snapshots["ir"], "round": 1, "findings": [b1], "blocking_findings": [b1], "open_finding_ids": [fid]}, ctx.home)
+
+                for unsupported_claim in ("thread-closed", "dismissed", "comment-resolved"):
+                    with self.subTest(claim=unsupported_claim):
+                        rev_rec = dict(ctx.valid_snapshots["ir"])
+                        rev_rec["round"] = 2
+                        rev_rec["outcome"] = "review-passed"
+                        rev_rec["review_verified"] = True
+                        resolved_finding = {**b1, "status": "resolved", "resolution": unsupported_claim, "last_seen_revision": ctx.cand_sha}
+                        resolution_entry = {"finding_id": fid, "status": "resolved", "resolution": unsupported_claim, "candidate_sha": ctx.cand_sha, "verified_on_revision": ctx.cand_sha, "resolution_evidence": "closed in thread"}
+                        rev_rec["findings"] = [resolved_finding]
+                        rev_rec["previous_findings_resolution"] = [resolution_entry]
+                        rev_rec["blocking_findings"] = []
+                        rev_rec["open_finding_ids"] = []
+                        atomic_json(ctx.child_dir / "independent-review.json", rev_rec, ctx.home)
+                        (ctx.child_dir / "approval-gate.json").unlink(missing_ok=True)
+
+                        res = deliver_module.deliver_feature(ctx.paths, ctx.spec)
+                        self.assertEqual(res.status, "unresolved-historical-blockers", f"claim={unsupported_claim}")
+                        self.assertFalse(res.delivery_approved)
+                        self.assertIsNone(res.approved_revision)
+                        self.assertTrue(any(fid in b and "unresolved" in b for b in res.blockers), res.blockers)
+            finally:
+                ctx.asana.__exit__(None, None, None)
+                ctx.gh.__exit__(None, None, None)
+
+    def test_reviewer_worktree_mutation_rejected_by_delivery(self) -> None:
+        from factory import independent_review
+        from tests.independent_review.test_independent_review import _make_staged_reviewer_script
+        from test_deliver import _make_fake_agy
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ctx = setup_disposable_delivery_context(root)
+            try:
+                script_mutating = _make_staged_reviewer_script(session_id="rev-mut", mutate_in_phase=2, mutate_kind="unstaged")
+                agy_mut = _make_fake_agy(root, "agy-mut", script_mutating)
+
+                r_mut = independent_review.review_candidate_independently(
+                    repo=ctx.repo, home=ctx.home, child_dir=ctx.child_dir, child=ctx.child_contract,
+                    conf=ctx.conf, base_sha=ctx.base_sha, candidate_sha=ctx.cand_sha,
+                    builder_session_id="c-101", builder_summary="Valid builder summary.",
+                    qa_record=ctx.valid_snapshots["qa_summary"], security_record=ctx.valid_snapshots["sec"],
+                    round_num=2, agy_bin=str(agy_mut), deadline=time.monotonic() + 30.0, limit_s=30,
+                )
+                self.assertFalse(r_mut["review_verified"])
+                self.assertTrue(r_mut["worktree_integrity"]["candidate_modified_by_reviewer"])
+
+                (ctx.child_dir / "approval-gate.json").unlink(missing_ok=True)
+                res = deliver_module.deliver_feature(ctx.paths, ctx.spec)
+                self.assertEqual(res.status, "reviewer-modified-worktree")
+                self.assertFalse(res.delivery_approved)
+                self.assertIsNone(res.approved_revision)
+                self.assertTrue(any("modified the candidate worktree" in b for b in res.blockers), res.blockers)
+            finally:
+                ctx.asana.__exit__(None, None, None)
+                ctx.gh.__exit__(None, None, None)
+
+    def test_invalid_review_identity_and_protocol_rejected_by_delivery(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ctx = setup_disposable_delivery_context(root)
+            try:
+                # 1. Reused builder session identity
+                ctx.restore_valid_evidence()
+                rev_reused = dict(ctx.valid_snapshots["ir"])
+                rev_reused["reviewer_session_id"] = "c-101"
+                rev_reused["builder_session_id"] = "c-101"
+                atomic_json(ctx.child_dir / "independent-review.json", rev_reused, ctx.home)
+                (ctx.child_dir / "approval-gate.json").unlink(missing_ok=True)
+
+                res_sid = deliver_module.deliver_feature(ctx.paths, ctx.spec)
+                self.assertEqual(res_sid.status, "reused-builder-identity")
+                self.assertFalse(res_sid.delivery_approved)
+                self.assertIsNone(res_sid.approved_revision)
+                self.assertTrue(any("reused session identity" in b for b in res_sid.blockers), res_sid.blockers)
+
+                # 2. Protocol ordering violation (hypotheses not persisted before summary)
+                ctx.restore_valid_evidence()
+                rev_proto = dict(ctx.valid_snapshots["ir"])
+                rev_proto["protocol_ordering"] = {**rev_proto["protocol_ordering"], "hypotheses_persisted_before_summary": False}
+                atomic_json(ctx.child_dir / "independent-review.json", rev_proto, ctx.home)
+                (ctx.child_dir / "approval-gate.json").unlink(missing_ok=True)
+
+                res_proto = deliver_module.deliver_feature(ctx.paths, ctx.spec)
+                self.assertEqual(res_proto.status, "invalid-review-protocol")
+                self.assertFalse(res_proto.delivery_approved)
+                self.assertIsNone(res_proto.approved_revision)
+                self.assertTrue(any("protocol ordering" in b for b in res_proto.blockers), res_proto.blockers)
+            finally:
+                ctx.asana.__exit__(None, None, None)
+                ctx.gh.__exit__(None, None, None)
+
+
 if __name__ == "__main__":
     unittest.main()
+
