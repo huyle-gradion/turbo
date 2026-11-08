@@ -105,3 +105,42 @@ python3 -m factory.improvement build-review-packet \
   - Strictly excluded: `pilot/`, `examples/`, `tests/`, `evidence/`, `attempts/`, `homes/`, `context/`.
 - **Refusal Codes**: `"untrusted-approval-source"`, `"unmerged-revision"`, `"unintended-target"`, `"ineligible-proposal"`, `"binding-mismatch"`, `"mismatched-approved-content"`, `"missing-approved-content"`, `"forbidden-storage-path"`.
 - **No Delivery Activation**: Selection does not mutate delivery configs, install files, or activate candidate lessons in delivery runs.
+
+## Approved Factory Policy Delivery Consumption (`factory.deliver`) — Issue #70
+
+`factory.deliver` implements Slice `#70` (Part C of `#32`, `[Factory 16c] Consume only approved factory versions in optional delivery improvement workflows`): an explicit, bounded per-run integration that consumes verified immutable policy content at the delivery boundary and records honest provenance.
+
+### Invocations
+
+```bash
+# 1. Ordinary delivery (baseline preserved, no improvement policy selected)
+python3 -m factory --repo <repo> --home <home> deliver --task <gid>
+
+# 2. Delivery with explicitly selected approved policy
+python3 -m factory --repo <repo> --home <home> deliver \
+  --task <gid> \
+  --policy-report <report.json> \
+  --policy-proof <proof.json> \
+  --policy-proposal <proposal.json>
+
+# Or using a selection descriptor:
+python3 -m factory --repo <repo> --home <home> deliver \
+  --task <gid> \
+  --policy-selection <selection.json>
+```
+
+### Consumption Boundary & Supported Mechanisms
+
+- **Lessons (`factory/lessons/`)**: Immutable approved bytes are retained under `consumed-policy/` and provided to the builder prompt under an explicit `Approved factory lessons:` section.
+- **Skills (`skills/`)**: Retained in `consumed-policy/` and staged into the isolated worker home at `.gemini/antigravity-cli/skills/`.
+- **Tools (`bin/`, `factory/`)**: Retained in `consumed-policy/`, staged with executable permissions into the isolated home `bin/`, and prepended to the worker `PATH`.
+- **Checks (`guards/`, `factory/`)**: Retained in `consumed-policy/` and executed directly against the candidate worktree; failing checks block delivery with `approved-policy-check-failed`.
+
+### Truth & Provenance Boundaries
+
+- **Ordinary Delivery Baseline**: Deliveries without explicit policy selection record `selected: false, status: "none"`, preserving baseline checks and never scanning proposal directories or product context.
+- **No Activation Side Effects**: Creating or evaluating a proposal never activates it; unapproved lessons remain excluded from subsequent deliveries.
+- **Immutable Git Content & Drift Detection**: Delivery consumes exact git object bytes (`git show {merge_commit_sha}:{target_path}`); local workspace files are never labeled as approved revisions when they differ (`local_source_drift: true`).
+- **Resume Compatibility**: Re-running or resuming delivery on an existing attempt validates policy selection identity, retained artifact existence and digest, and factory revision before reusing prior candidate/approval evidence.
+- **Preserved Identity**: Resolved policy consumption provenance survives through QA, repairs, security review, and record rewrites.
+

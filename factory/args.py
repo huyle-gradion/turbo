@@ -122,5 +122,10 @@ def build_parser() -> argparse.ArgumentParser:
     deliver.add_argument("--input-rate-usd-per-1m", type=float)
     deliver.add_argument("--output-rate-usd-per-1m", type=float)
     deliver.add_argument("--agy-bin", default="agy")
+    deliver.add_argument("--policy-report", help="path to evaluation report JSON for approved policy selection")
+    deliver.add_argument("--policy-proof", help="path to authoritative GitHub PR merge approval proof JSON")
+    deliver.add_argument("--policy-proposal", help="optional path to proposal JSON")
+    deliver.add_argument("--policy-repo", help="optional factory repo path (defaults to FACTORY_ROOT)")
+    deliver.add_argument("--policy-selection", help="optional JSON file containing policy selection paths")
     deliver.add_argument("--json", action="store_true")
     return parser

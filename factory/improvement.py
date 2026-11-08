@@ -173,8 +173,8 @@ def validate_proposal_structure(proposal: Any) -> list[str]:
     elif not isinstance(obs.get("artifacts"), list) or not obs.get("artifacts"):
         issues.append("observed_failure requires non-empty artifacts list")
     prop = proposal.get("proposed_change")
-    if not isinstance(prop, dict) or prop.get("kind") not in ("skill", "tool", "check"):
-        issues.append(f"proposed_change requires kind skill, tool, or check: {(prop or {}).get('kind')!r}")
+    if not isinstance(prop, dict) or prop.get("kind") not in ("skill", "tool", "check", "lesson"):
+        issues.append(f"proposed_change requires kind skill, tool, check, or lesson: {(prop or {}).get('kind')!r}")
     else:
         tgt = str(prop.get("target_path") or "").strip()
         if not _is_safe_relative_path(tgt):
@@ -646,7 +646,7 @@ def build_parser() -> argparse.ArgumentParser:
     prop.add_argument("--proposal-id")
     prop.add_argument("--failure-desc")
     prop.add_argument("--failure-artifact", action="append", default=[])
-    prop.add_argument("--kind", choices=("skill", "tool", "check"))
+    prop.add_argument("--kind", choices=("skill", "tool", "check", "lesson"))
     prop.add_argument("--target-path")
     prop.add_argument("--content-file")
     prop.add_argument("--baseline-identity")
