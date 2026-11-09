@@ -50,7 +50,7 @@ DEMO_KEEP_EVIDENCE_DIR="$(mktemp -d /tmp/turbo-qual-67.XXXXXX)" \
   bash scripts/qualify-protected-demo.sh --mode offline
 ```
 
-### Hosted Qualification (Preparation Baseline / Execution Not Implemented)
+### Hosted Qualification (Hosted Safety and Evidence Foundation / Scenarios Not Implemented)
 ```sh
 # Credentials must be pre-set in the launch environment (TURBO_QUAL_INTEGRATOR_TOKEN, TURBO_QUAL_COMPETITOR_TOKEN).
 # Do NOT pass token values on the command line or persist them to files.
@@ -59,7 +59,7 @@ DEMO_KEEP_EVIDENCE_DIR="$(mktemp -d /tmp/turbo-qual-67.XXXXXX)" \
   bash scripts/qualify-protected-demo.sh --mode hosted
 ```
 
-> **Current status**: Hosted qualification scenario execution is **NOT** implemented yet in this slice. Invocations of `run_hosted_qualification` halt with `status: "blocked"` and blocker `hosted-scenarios-pending-human-setup`. No hosted success is claimed; this slice establishes the honest preparation baseline.
+> **Current status (Slice 2)**: Hosted qualification foundation is implemented: fixed origin/slug/target authorization, two-token identity & permission verification, both-branch protection preflight, capability checks detecting empty contexts and missing seed, redacted operation ledger, and evidence index reduction over explicit subchecks. Hosted scenario execution is **NOT** implemented yet in this slice (`run_hosted_qualification` returns `status: "blocked"` with `hosted-scenarios-pending-human-setup`). No hosted success is claimed.
 
 ## 5. Parent Acceptance Criteria Evidence Index (`#24`)
 
