@@ -4,10 +4,13 @@ from __future__ import annotations
 import json, os, shutil, tempfile, threading, unittest
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
+from urllib.parse import quote
 
 from factory import deliver as deliver_module
 from factory.deliver_checks import AttemptTimeoutError
 from factory.integration import integrate_approved_child
+import factory.integration as integration_mod
 from support import git
 from support_deliver import setup_disposable_delivery_context
 from test_deliver import _make_disposable_product_workspace
@@ -380,3 +383,200 @@ class IntegrationBehaviorTest(unittest.TestCase):
                 self.assertEqual(res_r.status, "stale-base-revision")
                 self.assertTrue(any(f"remote origin/{b_branch} ({new_b})" in b for b in res_r.blockers))
                 self.assertEqual(len([r for r in ctx.gh.requests if r["method"] == "PUT"]), 0)
+
+    def test_confirmation_get_timeout_after_successful_put_persists_uncertainty(self) -> None:
+        """Confirmation GET timeout after PUT returns normally, persists uncertainty, and recovers without duplicate PUT."""
+        with tempfile.TemporaryDirectory() as tmp_str:
+            with setup_disposable_delivery_context(Path(tmp_str)) as ctx:
+                gate, b_branch = self._setup_ctx(ctx)
+                orig_http = integration_mod._http_req
+                put_state = {"done": False}
+
+                def fake_http(*args: Any, **kw: Any) -> Any:
+                    method = args[0]
+                    if method == "PUT":
+                        put_state["done"] = True
+                    elif method == "GET" and put_state["done"] and "pulls/1" in args[1]:
+                        raise AttemptTimeoutError("injected confirmation GET timeout")
+                    return orig_http(*args, **kw)
+
+                with patch.object(integration_mod, "_http_req", side_effect=fake_http):
+                    res = self._call(ctx, gate, b_branch)
+
+                self.assertEqual((res.status, res.outcome, res.confirmation_status), ("uncertain", "uncertain", "uncertain"))
+                self.assertEqual(res.mutation_outcome, "succeeded")
+                self.assertIsNone(res.landed_sha)
+                self.assertFalse(res.reconciled)
+                self.assertEqual(res.approval_status, "approved")
+                self.assertEqual(res.request_path, str(ctx.child_dir / "integration-request.json"))
+                self.assertEqual(res.record_path, str(ctx.child_dir / "integration-record.json"))
+                self.assertTrue((ctx.child_dir / "integration-record.json").is_file())
+
+                rec = json.loads((ctx.child_dir / "integration-record.json").read_text(encoding="utf-8"))
+                self.assertEqual((rec["status"], rec["outcome"], rec["confirmation_status"]), ("uncertain", "uncertain", "uncertain"))
+                self.assertEqual(rec["mutation_outcome"], "succeeded")
+                self.assertIsNone(rec["landed_sha"])
+                self.assertFalse(rec["reconciled"])
+                self.assertEqual(rec["approval_status"], "approved")
+                self.assertEqual(rec["candidate_sha"], ctx.cand_sha)
+                self.assertEqual(rec["base_sha"], ctx.base_sha)
+                self.assertEqual(len([r for r in ctx.gh.requests if r["method"] == "PUT"]), 1)
+
+                # Retry confirms existing landing without duplicate PUT
+                res_rec = self._call(ctx, gate, b_branch)
+                self.assertEqual((res_rec.status, res_rec.outcome), ("confirmed", "confirmed"))
+                self.assertTrue(res_rec.reconciled)
+                self.assertIsNotNone(res_rec.landed_sha)
+                self.assertEqual(len([r for r in ctx.gh.requests if r["method"] == "PUT"]), 1)
+
+                # Repeat recovery keeps confirmed state and single PUT
+                res_rep = self._call(ctx, gate, b_branch)
+                self.assertEqual((res_rep.status, res_rep.outcome), ("confirmed", "confirmed"))
+                self.assertEqual(len([r for r in ctx.gh.requests if r["method"] == "PUT"]), 1)
+
+    def test_confirmation_git_inspection_timeout_after_successful_put_persists_uncertainty(self) -> None:
+        """Confirmation git timeouts (fetch, commit inspection, parent inspection) persist uncertainty and recover."""
+        phases = ("git fetch origin", "inspect landed commit", "verify landed parents")
+        for target_phase in phases:
+            with self.subTest(phase=target_phase):
+                with tempfile.TemporaryDirectory() as tmp_str:
+                    with setup_disposable_delivery_context(Path(tmp_str)) as ctx:
+                        gate, b_branch = self._setup_ctx(ctx)
+                        orig_git_timed = integration_mod.git_timed
+                        put_done = False
+
+                        def on_merge(pr_num: int, payload: dict[str, Any]) -> None:
+                            nonlocal put_done
+                            put_done = True
+                        ctx.gh.on_before_merge = on_merge
+
+                        def fake_git_timed(repo: Any, dl: Any, limit_s: Any, phase: str, *args: Any) -> Any:
+                            if phase == target_phase and (target_phase != "git fetch origin" or put_done):
+                                raise AttemptTimeoutError(f"injected timeout during {target_phase}")
+                            return orig_git_timed(repo, dl, limit_s, phase, *args)
+
+                        with patch.object(integration_mod, "git_timed", side_effect=fake_git_timed):
+                            res = self._call(ctx, gate, b_branch)
+
+                        self.assertEqual((res.status, res.outcome, res.confirmation_status), ("uncertain", "uncertain", "uncertain"))
+                        self.assertEqual(res.mutation_outcome, "succeeded")
+                        self.assertIsNone(res.landed_sha)
+                        self.assertFalse(res.reconciled)
+                        self.assertEqual(res.request_path, str(ctx.child_dir / "integration-request.json"))
+                        self.assertEqual(res.record_path, str(ctx.child_dir / "integration-record.json"))
+                        self.assertTrue((ctx.child_dir / "integration-record.json").is_file())
+
+                        rec = json.loads((ctx.child_dir / "integration-record.json").read_text(encoding="utf-8"))
+                        self.assertEqual((rec["status"], rec["outcome"], rec["confirmation_status"]), ("uncertain", "uncertain", "uncertain"))
+                        self.assertEqual(rec["mutation_outcome"], "succeeded")
+                        self.assertIsNone(rec["landed_sha"])
+                        self.assertEqual(len([r for r in ctx.gh.requests if r["method"] == "PUT"]), 1)
+
+                        # Retry confirms existing landing without duplicate PUT
+                        res_rec = self._call(ctx, gate, b_branch)
+                        self.assertEqual((res_rec.status, res_rec.outcome), ("confirmed", "confirmed"))
+                        self.assertTrue(res_rec.reconciled)
+                        self.assertEqual(len([r for r in ctx.gh.requests if r["method"] == "PUT"]), 1)
+
+    def test_reconciliation_confirmation_timeout_persists_uncertainty(self) -> None:
+        """Reconciliation confirmation timeouts (GET or git) persist uncertainty and recover without additional PUT."""
+        # 1. Reconciliation confirmation GET timeout
+        with tempfile.TemporaryDirectory() as tmp_str:
+            with setup_disposable_delivery_context(Path(tmp_str)) as ctx:
+                gate, b_branch = self._setup_ctx(ctx)
+                ctx.gh.disconnect_after_merge = True
+                res1 = self._call(ctx, gate, b_branch)
+                self.assertEqual((res1.status, res1.outcome), ("uncertain", "uncertain"))
+                ctx.gh.disconnect_after_merge = False
+                self.assertTrue((ctx.child_dir / "integration-request.json").is_file())
+                (ctx.child_dir / "integration-record.json").unlink(missing_ok=True)
+
+                orig_http = integration_mod._http_req
+                get_state = {"count": 0}
+
+                def fake_http(*args: Any, **kw: Any) -> Any:
+                    method = args[0]
+                    if method == "GET" and "pulls/1" in args[1]:
+                        get_state["count"] += 1
+                        if get_state["count"] == 2:
+                            raise AttemptTimeoutError("injected reconciliation confirmation GET timeout")
+                    return orig_http(*args, **kw)
+
+                with patch.object(integration_mod, "_http_req", side_effect=fake_http):
+                    res2 = self._call(ctx, gate, b_branch)
+
+                self.assertEqual((res2.status, res2.outcome, res2.confirmation_status), ("uncertain", "uncertain", "uncertain"))
+                self.assertEqual(res2.mutation_outcome, "already-merged")
+                self.assertTrue(res2.reconciled)
+                self.assertIsNone(res2.landed_sha)
+                self.assertEqual(res2.request_path, str(ctx.child_dir / "integration-request.json"))
+                self.assertEqual(res2.record_path, str(ctx.child_dir / "integration-record.json"))
+                self.assertTrue((ctx.child_dir / "integration-record.json").is_file())
+
+                rec2 = json.loads((ctx.child_dir / "integration-record.json").read_text(encoding="utf-8"))
+                self.assertEqual((rec2["status"], rec2["outcome"], rec2["confirmation_status"]), ("uncertain", "uncertain", "uncertain"))
+                self.assertEqual(rec2["mutation_outcome"], "already-merged")
+                self.assertTrue(rec2["reconciled"])
+                self.assertIsNone(rec2["landed_sha"])
+                self.assertEqual(len([r for r in ctx.gh.requests if r["method"] == "PUT"]), 1)
+
+                # Retry confirms existing landing without duplicate PUT
+                res3 = self._call(ctx, gate, b_branch)
+                self.assertEqual((res3.status, res3.outcome), ("confirmed", "confirmed"))
+                self.assertTrue(res3.reconciled)
+                self.assertEqual(len([r for r in ctx.gh.requests if r["method"] == "PUT"]), 1)
+
+        # 2. Reconciliation git inspection timeout
+        with tempfile.TemporaryDirectory() as tmp_str:
+            with setup_disposable_delivery_context(Path(tmp_str)) as ctx:
+                gate, b_branch = self._setup_ctx(ctx)
+                ctx.gh.disconnect_after_merge = True
+                self._call(ctx, gate, b_branch)
+                ctx.gh.disconnect_after_merge = False
+                (ctx.child_dir / "integration-record.json").unlink(missing_ok=True)
+
+                orig_git_timed = integration_mod.git_timed
+
+                def fake_git_timed(repo: Any, dl: Any, limit_s: Any, phase: str, *args: Any) -> Any:
+                    if phase == "inspect landed commit":
+                        raise AttemptTimeoutError("injected reconciliation git timeout")
+                    return orig_git_timed(repo, dl, limit_s, phase, *args)
+
+                with patch.object(integration_mod, "git_timed", side_effect=fake_git_timed):
+                    res_g = self._call(ctx, gate, b_branch)
+
+                self.assertEqual((res_g.status, res_g.outcome, res_g.confirmation_status), ("uncertain", "uncertain", "uncertain"))
+                self.assertEqual(res_g.mutation_outcome, "already-merged")
+                self.assertTrue(res_g.reconciled)
+                self.assertIsNone(res_g.landed_sha)
+                self.assertEqual(len([r for r in ctx.gh.requests if r["method"] == "PUT"]), 1)
+
+    def test_confirmation_timeout_diagnostic_redacts_synthetic_secrets(self) -> None:
+        """Confirmation timeout diagnostics redact both raw and urlencoded synthetic secrets from disk evidence."""
+        with tempfile.TemporaryDirectory() as tmp_str:
+            with setup_disposable_delivery_context(Path(tmp_str)) as ctx:
+                gate, b_branch = self._setup_ctx(ctx)
+                raw_secret = "synthetic-secret-token/special%chars"
+                enc_secret = quote(raw_secret, safe="")
+
+                orig_http = integration_mod._http_req
+                put_state = {"done": False}
+
+                def fake_http(*args: Any, **kw: Any) -> Any:
+                    method = args[0]
+                    if method == "PUT":
+                        put_state["done"] = True
+                    elif method == "GET" and put_state["done"] and "pulls/1" in args[1]:
+                        raise AttemptTimeoutError(f"timed out with {raw_secret} and {enc_secret}")
+                    return orig_http(*args, **kw)
+
+                with patch.object(integration_mod, "_http_req", side_effect=fake_http):
+                    res = self._call(ctx, gate, b_branch, token=raw_secret)
+
+                self.assertEqual(res.status, "uncertain")
+                req_txt = (ctx.child_dir / "integration-request.json").read_text(encoding="utf-8")
+                rec_txt = (ctx.child_dir / "integration-record.json").read_text(encoding="utf-8")
+                for s in (raw_secret, enc_secret):
+                    self.assertNotIn(s, req_txt)
+                    self.assertNotIn(s, rec_txt)
+                    self.assertFalse(any(s in b for b in res.blockers))
