@@ -319,7 +319,7 @@ def integrate_approved_child(
             blockers.append(f"reconciliation failed; remote integration state is unresolved: {r_err or f'HTTP {r_code}'}")
             return _make("uncertain", "uncertain", req_p=str(req_file))
         if r_code in (401, 403):
-            mut_outcome = "denied"
+            mut_outcome = "not-attempted"
             return _fail("denied-permissions", f"insufficient permissions to reconcile PR #{pr_number}: {r_err}", req_p=str(req_file))
         if r_code == 404:
             return _fail("pr-not-found", f"PR #{pr_number} not found during reconciliation: {r_err}", req_p=str(req_file))

@@ -11,6 +11,7 @@ from factory import deliver as deliver_module
 from factory.deliver_checks import AttemptTimeoutError
 from factory.integration import integrate_approved_child
 import factory.integration as integration_mod
+from factory.paths import atomic_json
 from support import git
 from support_deliver import setup_disposable_delivery_context
 from test_deliver import _make_disposable_product_workspace
@@ -375,6 +376,71 @@ class IntegrationBehaviorTest(unittest.TestCase):
                 self.assertFalse(ok_empty)
                 self.assertEqual(status_empty, "unverifiable-landing-relationship")
                 self.assertIsNone(sha_empty)
+
+    def test_reconciliation_get_denial_records_mutation_not_attempted(self) -> None:
+        """Reconciliation GET 401/403 records mutation_outcome='not-attempted' and issues zero PUTs, while PUT denial records 'denied'."""
+        # 1. Reconciliation GET 401
+        with tempfile.TemporaryDirectory() as tmp_str:
+            with setup_disposable_delivery_context(Path(tmp_str)) as ctx:
+                gate, b_branch = self._setup_ctx(ctx)
+                req_p = ctx.child_dir / "integration-request.json"
+                req_data = {
+                    "schema": 1, "role": "child-integration-request", "factory_revision": "test",
+                    "repo_slug": "example/chat-bridge", "pr_number": 1,
+                    "candidate_sha": ctx.cand_sha, "base_sha": ctx.base_sha,
+                    "head_branch": ctx.head_branch, "base_branch": b_branch, "merge_method": "merge",
+                    "initiated_at": "2026-11-09T00:00:00Z",
+                }
+                atomic_json(req_p, req_data, ctx.home)
+                ctx.gh.get_status = 401
+
+                res_401 = self._call(ctx, gate, b_branch)
+                self.assertEqual((res_401.status, res_401.outcome), ("denied-permissions", "rejected"))
+                self.assertEqual(res_401.mutation_outcome, "not-attempted")
+                self.assertIsNone(res_401.landed_sha)
+                self.assertEqual(len([r for r in ctx.gh.requests if r["method"] == "PUT"]), 0)
+                self.assertTrue((ctx.child_dir / "integration-record.json").is_file())
+                rec_401 = json.loads((ctx.child_dir / "integration-record.json").read_text(encoding="utf-8"))
+                self.assertEqual((rec_401["status"], rec_401["mutation_outcome"]), ("denied-permissions", "not-attempted"))
+
+        # 2. Reconciliation GET 403
+        with tempfile.TemporaryDirectory() as tmp_str:
+            with setup_disposable_delivery_context(Path(tmp_str)) as ctx:
+                gate, b_branch = self._setup_ctx(ctx)
+                req_p = ctx.child_dir / "integration-request.json"
+                req_data = {
+                    "schema": 1, "role": "child-integration-request", "factory_revision": "test",
+                    "repo_slug": "example/chat-bridge", "pr_number": 1,
+                    "candidate_sha": ctx.cand_sha, "base_sha": ctx.base_sha,
+                    "head_branch": ctx.head_branch, "base_branch": b_branch, "merge_method": "merge",
+                    "initiated_at": "2026-11-09T00:00:00Z",
+                }
+                atomic_json(req_p, req_data, ctx.home)
+                ctx.gh.get_status = 403
+
+                res_403 = self._call(ctx, gate, b_branch)
+                self.assertEqual((res_403.status, res_403.outcome), ("denied-permissions", "rejected"))
+                self.assertEqual(res_403.mutation_outcome, "not-attempted")
+                self.assertIsNone(res_403.landed_sha)
+                self.assertEqual(len([r for r in ctx.gh.requests if r["method"] == "PUT"]), 0)
+                self.assertTrue((ctx.child_dir / "integration-record.json").is_file())
+                rec_403 = json.loads((ctx.child_dir / "integration-record.json").read_text(encoding="utf-8"))
+                self.assertEqual((rec_403["status"], rec_403["mutation_outcome"]), ("denied-permissions", "not-attempted"))
+
+        # 3. Genuine PUT 403 produces mutation_outcome='denied'
+        with tempfile.TemporaryDirectory() as tmp_str:
+            with setup_disposable_delivery_context(Path(tmp_str)) as ctx:
+                gate, b_branch = self._setup_ctx(ctx)
+                ctx.gh.merge_status = 403
+
+                res_put = self._call(ctx, gate, b_branch)
+                self.assertEqual((res_put.status, res_put.outcome), ("denied-permissions", "rejected"))
+                self.assertEqual(res_put.mutation_outcome, "denied")
+                self.assertIsNone(res_put.landed_sha)
+                self.assertEqual(len([r for r in ctx.gh.requests if r["method"] == "PUT"]), 1)
+                self.assertTrue((ctx.child_dir / "integration-record.json").is_file())
+                rec_put = json.loads((ctx.child_dir / "integration-record.json").read_text(encoding="utf-8"))
+                self.assertEqual((rec_put["status"], rec_put["mutation_outcome"]), ("denied-permissions", "denied"))
 
     def test_retry_reconciliation_and_retained_confirmed_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_str:
