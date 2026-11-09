@@ -657,6 +657,25 @@ def merge_remote_branch(
     return code, data, msg
 
 
+def get_remote_pulls(
+    base_url: str, repo_slug: str, head_branch: str, token: str,
+    *, state: str = "open", actor: str = "integrator", ledger: QualificationLedger | None = None,
+) -> list[dict[str, Any]]:
+    """Query open pull requests matching head_branch."""
+    owner = repo_slug.split("/")[0]
+    url = f"{base_url.rstrip('/')}/repos/{repo_slug}/pulls?head={owner}:{head_branch}&state={state}"
+    import urllib.request
+    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode("utf-8", "replace"))
+            if ledger: ledger.record("GET", url, actor, 200, "")
+            return data if isinstance(data, list) else []
+    except Exception as exc:
+        if ledger: ledger.record("GET", url, actor, 0, str(exc))
+        return []
+
+
 def poll_ci_check(
     base_url: str,
     repo_slug: str,
@@ -884,9 +903,8 @@ def prepare_qualification_candidate(
             prep_blockers.append(f"head-branch-missing: {head_branch} does not exist on {repo_slug}")
 
     if not pr_data and not prep_blockers:
-        owner = repo_slug.split("/")[0]
-        code_l, pulls_l, _ = _http_req("GET", f"{base_url.rstrip('/')}/repos/{repo_slug}/pulls?head={owner}:{head_branch}&state=open", integrator_token, base_url, [], time.monotonic() + 15.0, 15)
-        if code_l == 200 and isinstance(pulls_l, list) and pulls_l:
+        pulls_l = get_remote_pulls(base_url, repo_slug, head_branch, integrator_token, ledger=local_ledger)
+        if pulls_l:
             pr_data = pulls_l[0]
         else:
             code_pr, pr_res, pr_msg = create_qualification_pull_request(
@@ -1251,9 +1269,8 @@ def run_scenario_2_prereq_missing_and_denied(
     )
     unapp_pr_num = pr_unapp.get("number", 2)
     if unapp_pr_num == 2 and not allow_test_origin and code_pr2 not in (200, 201):
-        owner = repo_slug.split("/")[0]
-        code_l, pulls_l, _ = _http_req("GET", f"{base_url.rstrip('/')}/repos/{repo_slug}/pulls?head={owner}:{unapp_branch}&state=open", integrator_token, base_url, [], time.monotonic() + 15.0, 15)
-        if code_l == 200 and isinstance(pulls_l, list) and pulls_l:
+        pulls_l = get_remote_pulls(base_url, repo_slug, unapp_branch, integrator_token, ledger=sc_ledger)
+        if pulls_l:
             unapp_pr_num = pulls_l[0].get("number", 2)
     if allow_test_origin:
         from support import git
@@ -1325,9 +1342,8 @@ def run_scenario_3_competing_base_rejection(
     )
     cand_pr_num = pr_cand.get("number", 3)
     if cand_pr_num == 3 and not allow_test_origin and code_cand_pr not in (200, 201):
-        owner = repo_slug.split("/")[0]
-        code_l, pulls_l, _ = _http_req("GET", f"{base_url.rstrip('/')}/repos/{repo_slug}/pulls?head={owner}:{cand_branch}&state=open", integrator_token, base_url, [], time.monotonic() + 15.0, 15)
-        if code_l == 200 and isinstance(pulls_l, list) and pulls_l:
+        pulls_l = get_remote_pulls(base_url, repo_slug, cand_branch, integrator_token, ledger=sc_ledger)
+        if pulls_l:
             cand_pr_num = pulls_l[0].get("number", 3)
     adv_branch = "feat/qual-adv-sc3-r3"
     adv_sha = ctx.cand_sha
@@ -1345,9 +1361,8 @@ def run_scenario_3_competing_base_rejection(
     )
     adv_pr_num = pr_adv.get("number", 4)
     if adv_pr_num == 4 and not allow_test_origin and code_adv_pr not in (200, 201):
-        owner = repo_slug.split("/")[0]
-        code_l, pulls_l, _ = _http_req("GET", f"{base_url.rstrip('/')}/repos/{repo_slug}/pulls?head={owner}:{adv_branch}&state=open", competitor_token, base_url, [], time.monotonic() + 15.0, 15)
-        if code_l == 200 and isinstance(pulls_l, list) and pulls_l:
+        pulls_l = get_remote_pulls(base_url, repo_slug, adv_branch, competitor_token, ledger=sc_ledger)
+        if pulls_l:
             adv_pr_num = pulls_l[0].get("number", 4)
     if not allow_test_origin:
         poll_ci_check(base_url, repo_slug, cand_sha, base_sha_b, integrator_token, ledger=sc_ledger)
