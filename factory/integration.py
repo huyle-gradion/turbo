@@ -96,7 +96,14 @@ def _confirm_landing(
         eff_token, eff_base_url, trace, dl, limit_s,
     )
     if code != 200 or not pr_data:
-        st = "denied-permissions" if code in (401, 403) else ("pr-not-found" if code == 404 else "provider-error")
+        if code in (401, 403):
+            st = "denied-permissions"
+        elif code == 404:
+            st = "pr-not-found"
+        elif code >= 500 or code == 0:
+            st = "provider-unavailable"
+        else:
+            st = "provider-error"
         return False, st, f"authoritative PR verification failed: {err_msg or f'HTTP {code}'}", None
 
     if pr_data.get("state") != "closed" or pr_data.get("merged") is not True:
@@ -339,9 +346,15 @@ def integrate_approved_child(
                 blockers.append(str(approval_mod.redact_value(f"confirmation timed out: {exc}", secrets)))
             else:
                 if not ok_conf:
-                    conf_status = st_conf
-                    return _fail(st_conf, msg_conf, req_p=str(req_file))
-                status, outcome, conf_status = "confirmed", "confirmed", "confirmed"
+                    if st_conf == "provider-unavailable":
+                        status, outcome, conf_status = "uncertain", "uncertain", "uncertain"
+                        landed_sha = None
+                        blockers.append(str(approval_mod.redact_value(msg_conf, secrets)))
+                    else:
+                        conf_status = st_conf
+                        return _fail(st_conf, msg_conf, req_p=str(req_file))
+                else:
+                    status, outcome, conf_status = "confirmed", "confirmed", "confirmed"
 
             rec_path_str: str | None = None
             if child_dir.exists():
@@ -468,6 +481,10 @@ def integrate_approved_child(
             else:
                 if ok_conf:
                     status, outcome, conf_status = "confirmed", "confirmed", "confirmed"
+                elif st_conf == "provider-unavailable":
+                    status, outcome, conf_status = "uncertain", "uncertain", "uncertain"
+                    landed_sha = None
+                    blockers.append(str(approval_mod.redact_value(msg_conf, secrets)))
                 else:
                     status, outcome, conf_status = st_conf, "rejected", st_conf
                     landed_sha = None

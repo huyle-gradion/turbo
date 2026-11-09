@@ -442,6 +442,140 @@ class IntegrationBehaviorTest(unittest.TestCase):
                 rec_put = json.loads((ctx.child_dir / "integration-record.json").read_text(encoding="utf-8"))
                 self.assertEqual((rec_put["status"], rec_put["mutation_outcome"]), ("denied-permissions", "denied"))
 
+    def test_confirmation_503_after_successful_put_persists_uncertainty(self) -> None:
+        """Returned confirmation GET HTTP 503 or transport error persists uncertainty with mutation succeeded, and recovers without duplicate PUT."""
+        # 1. Confirmation HTTP 503 after successful PUT
+        with tempfile.TemporaryDirectory() as tmp_str:
+            with setup_disposable_delivery_context(Path(tmp_str)) as ctx:
+                gate, b_branch = self._setup_ctx(ctx)
+                raw_secret = "synthetic-secret-token"
+                orig_http = integration_mod._http_req
+                put_state = {"done": False, "fail_conf_503": True}
+
+                def fake_http(*args: Any, **kw: Any) -> Any:
+                    method = args[0]
+                    if method == "PUT":
+                        put_state["done"] = True
+                    elif method == "GET" and put_state["done"] and put_state["fail_conf_503"] and "pulls/1" in args[1]:
+                        trace = args[4]
+                        trace.append({"method": "GET", "url": args[1], "status": 503})
+                        return 503, {}, f"HTTP 503 Service Unavailable with {raw_secret}"
+                    return orig_http(*args, **kw)
+
+                with patch.object(integration_mod, "_http_req", side_effect=fake_http):
+                    res = self._call(ctx, gate, b_branch, token=raw_secret)
+
+                self.assertEqual((res.status, res.outcome, res.confirmation_status), ("uncertain", "uncertain", "uncertain"))
+                self.assertEqual(res.mutation_outcome, "succeeded")
+                self.assertIsNone(res.landed_sha)
+                self.assertFalse(res.reconciled)
+                self.assertEqual(res.approval_status, "approved")
+                self.assertEqual(res.request_path, str(ctx.child_dir / "integration-request.json"))
+                self.assertEqual(res.record_path, str(ctx.child_dir / "integration-record.json"))
+                self.assertTrue((ctx.child_dir / "integration-record.json").is_file())
+
+                rec = json.loads((ctx.child_dir / "integration-record.json").read_text(encoding="utf-8"))
+                self.assertEqual((rec["status"], rec["outcome"], rec["confirmation_status"]), ("uncertain", "uncertain", "uncertain"))
+                self.assertEqual(rec["mutation_outcome"], "succeeded")
+                self.assertEqual(rec["approval_status"], "approved")
+                self.assertIsNone(rec["landed_sha"])
+                self.assertEqual(rec["candidate_sha"], ctx.cand_sha)
+                self.assertEqual(rec["base_sha"], ctx.base_sha)
+                self.assertNotIn(raw_secret, json.dumps(rec))
+                self.assertFalse(any(raw_secret in b for b in res.blockers))
+                self.assertEqual(len([r for r in ctx.gh.requests if r["method"] == "PUT"]), 1)
+
+                # Removing the fault reconciles existing landing without another PUT
+                put_state["fail_conf_503"] = False
+                res_rec1 = self._call(ctx, gate, b_branch)
+                self.assertEqual((res_rec1.status, res_rec1.outcome), ("confirmed", "confirmed"))
+                self.assertTrue(res_rec1.reconciled)
+                self.assertIsNotNone(res_rec1.landed_sha)
+                self.assertEqual(len([r for r in ctx.gh.requests if r["method"] == "PUT"]), 1)
+
+                # Repeated recovery still leaves total at one PUT
+                res_rec2 = self._call(ctx, gate, b_branch)
+                self.assertEqual((res_rec2.status, res_rec2.outcome), ("confirmed", "confirmed"))
+                self.assertTrue(res_rec2.reconciled)
+                self.assertEqual(len([r for r in ctx.gh.requests if r["method"] == "PUT"]), 1)
+
+        # 2. Confirmation transport unavailable (code 0) after successful PUT
+        with tempfile.TemporaryDirectory() as tmp_str:
+            with setup_disposable_delivery_context(Path(tmp_str)) as ctx:
+                gate, b_branch = self._setup_ctx(ctx)
+                orig_http = integration_mod._http_req
+                put_state = {"done": False}
+
+                def fake_http(*args: Any, **kw: Any) -> Any:
+                    method = args[0]
+                    if method == "PUT":
+                        put_state["done"] = True
+                    elif method == "GET" and put_state["done"] and "pulls/1" in args[1]:
+                        trace = args[4]
+                        trace.append({"method": "GET", "url": args[1], "status": "network-error"})
+                        return 0, {}, "network error on /api/v3/repos/example/chat-bridge/pulls/1: Connection refused"
+                    return orig_http(*args, **kw)
+
+                with patch.object(integration_mod, "_http_req", side_effect=fake_http):
+                    res_trans = self._call(ctx, gate, b_branch)
+
+                self.assertEqual((res_trans.status, res_trans.outcome, res_trans.confirmation_status), ("uncertain", "uncertain", "uncertain"))
+                self.assertEqual(res_trans.mutation_outcome, "succeeded")
+                self.assertIsNone(res_trans.landed_sha)
+                rec_trans = json.loads((ctx.child_dir / "integration-record.json").read_text(encoding="utf-8"))
+                self.assertEqual((rec_trans["status"], rec_trans["outcome"], rec_trans["confirmation_status"]), ("uncertain", "uncertain", "uncertain"))
+                self.assertEqual(rec_trans["mutation_outcome"], "succeeded")
+
+    def test_reconciliation_confirmation_503_persists_uncertainty(self) -> None:
+        """Second GET in reconciliation returning 503 persists uncertainty with already-merged and reconciled=True."""
+        with tempfile.TemporaryDirectory() as tmp_str:
+            with setup_disposable_delivery_context(Path(tmp_str)) as ctx:
+                gate, b_branch = self._setup_ctx(ctx)
+                # First perform mutation with disconnect after merge to retain request evidence
+                ctx.gh.disconnect_after_merge = True
+                res1 = self._call(ctx, gate, b_branch)
+                self.assertEqual((res1.status, res1.outcome), ("uncertain", "uncertain"))
+                ctx.gh.disconnect_after_merge = False
+                self.assertTrue((ctx.child_dir / "integration-request.json").is_file())
+                (ctx.child_dir / "integration-record.json").unlink(missing_ok=True)
+
+                orig_http = integration_mod._http_req
+                get_state = {"count": 0}
+
+                def fake_http(*args: Any, **kw: Any) -> Any:
+                    method = args[0]
+                    if method == "GET" and "pulls/1" in args[1]:
+                        get_state["count"] += 1
+                        if get_state["count"] == 2:
+                            trace = args[4]
+                            trace.append({"method": "GET", "url": args[1], "status": 503})
+                            return 503, {}, "HTTP 503 Service Unavailable"
+                    return orig_http(*args, **kw)
+
+                with patch.object(integration_mod, "_http_req", side_effect=fake_http):
+                    res2 = self._call(ctx, gate, b_branch)
+
+                self.assertEqual((res2.status, res2.outcome, res2.confirmation_status), ("uncertain", "uncertain", "uncertain"))
+                self.assertEqual(res2.mutation_outcome, "already-merged")
+                self.assertTrue(res2.reconciled)
+                self.assertIsNone(res2.landed_sha)
+                self.assertEqual(res2.request_path, str(ctx.child_dir / "integration-request.json"))
+                self.assertEqual(res2.record_path, str(ctx.child_dir / "integration-record.json"))
+                self.assertTrue((ctx.child_dir / "integration-record.json").is_file())
+
+                rec2 = json.loads((ctx.child_dir / "integration-record.json").read_text(encoding="utf-8"))
+                self.assertEqual((rec2["status"], rec2["outcome"], rec2["confirmation_status"]), ("uncertain", "uncertain", "uncertain"))
+                self.assertEqual(rec2["mutation_outcome"], "already-merged")
+                self.assertTrue(rec2["reconciled"])
+                self.assertIsNone(rec2["landed_sha"])
+                self.assertEqual(len([r for r in ctx.gh.requests if r["method"] == "PUT"]), 1)
+
+                # Retry confirms existing landing without duplicate PUT
+                res3 = self._call(ctx, gate, b_branch)
+                self.assertEqual((res3.status, res3.outcome), ("confirmed", "confirmed"))
+                self.assertTrue(res3.reconciled)
+                self.assertEqual(len([r for r in ctx.gh.requests if r["method"] == "PUT"]), 1)
+
     def test_retry_reconciliation_and_retained_confirmed_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_str:
             with setup_disposable_delivery_context(Path(tmp_str)) as ctx:
