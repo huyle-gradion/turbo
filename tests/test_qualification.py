@@ -1,21 +1,26 @@
 """Tests for protected repository qualification harness (#67)."""
 from __future__ import annotations
 
-import json, os, shutil, tempfile, threading, unittest
+import base64, json, os, shutil, tempfile, threading, unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlparse
 
 from factory.qualification import (
+    CALC_CANDIDATE_SRC, CALC_CANDIDATE_TEST,
     DISPOSABLE_REPO_ALLOWLIST, REQUIRED_SEED_ASSETS, SEED_ASSETS_DIR,
+    assert_landed_landing_properties,
     build_parent_evidence_index, check_branch_protection_and_topology,
     check_credentials_and_capabilities, check_hosted_authorization,
     check_qualification_pr_ci, check_seed_and_workflow_capabilities,
     create_qualification_pull_request, evaluate_qualification_qa,
     get_submitted_review, observe_identity_and_permissions,
     prepare_qualification_candidate, reduce_evidence_index,
+    resolve_agy_bin,
     run_hosted_qualification, run_offline_qualification,
+    run_scenario_1_confirmed_landing, run_scenario_2_prereq_missing_and_denied,
+    run_scenario_3_competing_base_rejection, run_scenario_4_renewed_verification_after_base_change,
     submit_qualification_pr_review, verify_qualification_pr_review,
 )
 
@@ -54,8 +59,8 @@ class _HostedQualificationFakeServer:
         self.contents = contents if contents is not None else {
             ".github/workflows/ci.yml": {"sha": "wf123", "name": "ci.yml"},
             ".factory/policy.json": {"sha": "pol123", "name": "policy.json"},
-            "src/calc.py": {"sha": "calc123", "name": "calc.py"},
-            "tests/test_calc.py": {"sha": "testcalc123", "name": "test_calc.py"},
+            "src/calc.py": {"sha": "calc123", "name": "calc.py", "content": base64.b64encode(b"def add(a, b): return a + b\ndef multiply(a, b): return a * b\ndef subtract(a, b): return a - b\n").decode()},
+            "tests/test_calc.py": {"sha": "testcalc123", "name": "test_calc.py", "content": base64.b64encode(b"import unittest\nclass T(unittest.TestCase):\n def test_add(self): pass\n def test_multiply(self): pass\n def test_subtract(self): pass\n").decode()},
             "qa/qa-cases.json": {"sha": "qa123", "name": "qa-cases.json"},
         }
         self.reviews = reviews if reviews is not None else {
@@ -83,6 +88,7 @@ class _HostedQualificationFakeServer:
             }
         ]
         self.default_branch = default_branch
+        self.branch_heads: dict[str, str] = {}
         self.requests: list[dict[str, Any]] = []
 
         outer = self
@@ -131,7 +137,7 @@ class _HostedQualificationFakeServer:
 
                 prefix_cont = "/api/v3/repos/turbo-factory/turbo-qual-67/contents/"
                 if path.startswith(prefix_cont):
-                    cpath = unquote(path[len(prefix_cont):])
+                    cpath = unquote(path[len(prefix_cont):]).split("?")[0]
                     if cpath in outer.contents:
                         return self._send_json(200, outer.contents[cpath])
                     return self._send_json(404, {"message": "File not found"})
@@ -172,12 +178,16 @@ class _HostedQualificationFakeServer:
                 if path == "/api/v3/repos/turbo-factory/turbo-qual-67/pulls":
                     pr_num = len(outer.pulls) + 1
                     user_login = outer.users.get(tok, {}).get("login", "unknown")
+                    ref_h = body.get("head", "")
+                    ref_b = body.get("base", "feature/demo")
+                    h_sha = outer.branch_heads.get(ref_h, "c1234567890abcdef1234567890abcdef1234567")
+                    b_sha = outer.branch_heads.get(ref_b, "b1234567890abcdef1234567890abcdef1234567")
                     pr_obj = {
                         "number": pr_num,
                         "title": body.get("title", "Candidate PR"),
                         "state": "open",
-                        "head": {"sha": "c1234567890abcdef1234567890abcdef1234567", "ref": body.get("head", "")},
-                        "base": {"sha": "b1234567890abcdef1234567890abcdef1234567", "ref": body.get("base", "feature/demo")},
+                        "head": {"sha": h_sha, "ref": ref_h, "repo": {"full_name": "turbo-factory/turbo-qual-67"}},
+                        "base": {"sha": b_sha, "ref": ref_b, "repo": {"full_name": "turbo-factory/turbo-qual-67"}},
                         "user": {"login": user_login},
                     }
                     outer.pulls[pr_num] = pr_obj
@@ -204,6 +214,26 @@ class _HostedQualificationFakeServer:
                     }
                     outer.reviews[rev_id] = rev_obj
                     return self._send_json(200, rev_obj)
+
+                return self._send_json(404, {"message": "Not Found"})
+
+            def do_PUT(self) -> None:
+                auth = self.headers.get("Authorization", "")
+                tok = auth.split("Bearer ", 1)[-1] if "Bearer " in auth else auth.split("token ", 1)[-1]
+                path = urlparse(self.path).path
+                len_hdr = int(self.headers.get("Content-Length", 0))
+                raw_body = self.rfile.read(len_hdr).decode("utf-8") if len_hdr > 0 else "{}"
+                try: body = json.loads(raw_body)
+                except Exception: body = {}
+                outer.requests.append({"method": "PUT", "path": path, "token": tok, "body": body})
+
+                if "/pulls/" in path and path.endswith("/merge"):
+                    pr_id_str = path.split("/pulls/")[1].split("/merge")[0]
+                    pr_id = int(pr_id_str) if pr_id_str.isdigit() else 1
+                    pr = outer.pulls.get(pr_id, {})
+                    pr["state"] = "closed"
+                    pr["merged"] = True
+                    return self._send_json(200, {"sha": "l1234567890abcdef1234567890abcdef1234567", "merged": True, "message": "Pull Request successfully merged"})
 
                 return self._send_json(404, {"message": "Not Found"})
 
@@ -405,7 +435,7 @@ class QualificationSafetyAndCapabilityTest(unittest.TestCase):
                 )
                 self.assertFalse(res["qualified"], "Fake-provider tests must NEVER promote hosted status")
                 self.assertEqual(res["status"], "blocked")
-                self.assertIn("hosted-scenarios-pending-human-setup", res["blockers"])
+                self.assertIn("hosted-scenarios-5-and-6-pending-slice-5", res["blockers"])
 
     def test_qualification_token_redaction_and_ledger(self) -> None:
         """Explicitly redact qualification tokens in persistence and record operation ledger."""
@@ -645,6 +675,71 @@ class QualificationCandidatePreparationTest(unittest.TestCase):
                 self.assertEqual(rec["prerequisites"]["ci"]["status"], "verified")
                 self.assertEqual(rec["prerequisites"]["github_review"]["state"], "APPROVED")
                 self.assertEqual(rec["builder"]["candidate_sha"], cand_sha)
+
+    def test_candidate_fixture_defines_new_operations_and_tests(self) -> None:
+        """Candidate commit fixture defines genuine operations and executable tests."""
+        for op in ("add", "multiply", "subtract"):
+            self.assertIn(f"def {op}", CALC_CANDIDATE_SRC)
+            self.assertIn(f"def test_{op}", CALC_CANDIDATE_TEST)
+        self.assertIn("class CalcTest", CALC_CANDIDATE_TEST)
+
+
+class HostedScenariosExecutionTest(unittest.TestCase):
+    def test_hosted_scenarios_simulated_execution(self) -> None:
+        """Verify scenario runners 1-4, boundary coordination, and renewal flows."""
+        from support_deliver import setup_disposable_delivery_context
+
+        with _HostedQualificationFakeServer() as gh:
+            with tempfile.TemporaryDirectory() as tmp:
+                ev_dir = Path(tmp) / "ev"
+                ws = ev_dir / "ws"
+                ws.mkdir(parents=True)
+                with setup_disposable_delivery_context(ws) as ctx:
+                    from support import git
+                    git(ctx.bare, "update-ref", "refs/heads/feature/demo", ctx.base_sha)
+                    gh.branch_heads = {
+                        "feat/qual-candidate-101": ctx.cand_sha,
+                        "feat/qual-unapp-sc2-r2": ctx.cand_sha,
+                        "feat/qual-cand-sc3-r2": ctx.cand_sha,
+                        "feat/qual-adv-sc3-r2": ctx.cand_sha,
+                        "feat/qual-cand-sc3-r3": ctx.cand_sha,
+                        "feat/qual-adv-sc3-r3": ctx.cand_sha,
+                        "feature/demo": ctx.base_sha,
+                    }
+                    # Scenario 1: Confirmed landing
+                    s1 = run_scenario_1_confirmed_landing(
+                        gh.base_url, "turbo-factory/turbo-qual-67", ev_dir, ctx,
+                        "valid-int-tok", "valid-comp-tok", allow_test_origin=True,
+                    )
+                    self.assertEqual(s1["scenario"], "confirmed_landing")
+                    self.assertEqual(s1["head_branch"], "feat/qual-candidate-101")
+
+                    # Scenario 2: Prereq missing and denied
+                    s2 = run_scenario_2_prereq_missing_and_denied(
+                        gh.base_url, "turbo-factory/turbo-qual-67", ev_dir, ctx,
+                        "valid-int-tok", "valid-comp-tok", allow_test_origin=True,
+                    )
+                    self.assertEqual(s2["scenario"], "prereq_missing_and_denied")
+                    self.assertTrue(s2["missing_prereq_rejected"])
+                    self.assertTrue(s2["stale_prereq_rejected"])
+                    self.assertTrue(s2["main_preserved"])
+
+                    # Scenario 3: Competing base rejection
+                    s3, cand_br3, base_prime, cand_pr3 = run_scenario_3_competing_base_rejection(
+                        gh.base_url, "turbo-factory/turbo-qual-67", ev_dir, ctx,
+                        "valid-int-tok", "valid-comp-tok", allow_test_origin=True,
+                    )
+                    self.assertEqual(s3["scenario"], "competing_base_rejection")
+                    self.assertTrue(s3["main_preserved"])
+
+                    # Scenario 4: Renewed verification after base change
+                    s4 = run_scenario_4_renewed_verification_after_base_change(
+                        gh.base_url, "turbo-factory/turbo-qual-67", ev_dir, ctx,
+                        "valid-int-tok", "valid-comp-tok", cand_br3, base_prime, cand_pr3,
+                        allow_test_origin=True,
+                    )
+                    self.assertEqual(s4["scenario"], "renewed_verification_after_base_change")
+                    self.assertTrue(s4["old_evidence_rejected"])
 
 
 if __name__ == "__main__":
