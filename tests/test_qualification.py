@@ -9,13 +9,17 @@ from urllib.parse import unquote, urlparse
 
 from factory.qualification import (
     DISPOSABLE_REPO_ALLOWLIST, REQUIRED_SEED_ASSETS, SEED_ASSETS_DIR,
+    assert_landed_landing_properties,
     build_parent_evidence_index, check_branch_protection_and_topology,
     check_credentials_and_capabilities, check_hosted_authorization,
     check_qualification_pr_ci, check_seed_and_workflow_capabilities,
     create_qualification_pull_request, evaluate_qualification_qa,
     get_submitted_review, observe_identity_and_permissions,
     prepare_qualification_candidate, reduce_evidence_index,
+    resolve_agy_bin,
     run_hosted_qualification, run_offline_qualification,
+    run_scenario_1_confirmed_landing, run_scenario_2_prereq_missing_and_denied,
+    run_scenario_3_competing_base_rejection, run_scenario_4_renewed_verification_after_base_change,
     submit_qualification_pr_review, verify_qualification_pr_review,
 )
 
@@ -405,7 +409,7 @@ class QualificationSafetyAndCapabilityTest(unittest.TestCase):
                 )
                 self.assertFalse(res["qualified"], "Fake-provider tests must NEVER promote hosted status")
                 self.assertEqual(res["status"], "blocked")
-                self.assertIn("hosted-scenarios-pending-human-setup", res["blockers"])
+                self.assertIn("hosted-scenarios-5-and-6-pending-slice-5", res["blockers"])
 
     def test_qualification_token_redaction_and_ledger(self) -> None:
         """Explicitly redact qualification tokens in persistence and record operation ledger."""
