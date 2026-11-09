@@ -1098,7 +1098,7 @@ def _prepare_approved_delivery_gate(
     child_dir = Path(child_dir)
     child_dir.mkdir(parents=True, exist_ok=True)
     child_contract = {**ctx.child_contract, "head_branch": head_branch}
-    if (repo / "tests/test_calc.py").is_file():
+    if (repo / "tests/test_calc.py").is_file() or gitio.git(repo, "cat-file", "-e", f"{candidate_sha}:tests/test_calc.py").ok:
         if "AC-1" in ctx.conf.gates:
             ctx.conf.gates["AC-1"].command = "python3 -m unittest discover -s tests -p test_calc.py -v"
         if child_contract.get("criteria"):
@@ -1594,6 +1594,7 @@ def run_hosted_qualification(
                     subprocess.run(["git", "clone", "-q", clone_url, str(live_repo_dir)], check=True, capture_output=True)
                     subprocess.run(["git", "config", "remote.origin.url", f"https://github.com/{repo_slug}.git"], cwd=live_repo_dir, check=True)
                     fetch_remote_repo(live_repo_dir, repo_slug, integrator_token)
+                    subprocess.run(["git", "checkout", "-q", "-B", branch, f"origin/{branch}"], cwd=live_repo_dir, check=True)
                 ctx.repo = live_repo_dir
 
             # 1. Scenario 1: Confirmed landing
