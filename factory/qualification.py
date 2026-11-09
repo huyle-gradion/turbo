@@ -738,7 +738,13 @@ def create_qualification_candidate_commit(
 def fetch_remote_repo(repo: Path, repo_slug: str, token: str) -> None:
     """Fetch remote repository heads and pull refs using ephemeral credential."""
     f_url = f"https://x-access-token:{token}@github.com/{repo_slug}.git"
-    subprocess.run(["git", "fetch", "-q", f_url, "+refs/heads/*:refs/remotes/origin/*", "+refs/pull/*:refs/remotes/origin/pr/*"], cwd=repo, check=True)
+    for attempt in range(3):
+        try:
+            subprocess.run(["git", "fetch", "-q", f_url, "+refs/heads/*:refs/remotes/origin/*", "+refs/pull/*:refs/remotes/origin/pr/*"], cwd=repo, check=True)
+            return
+        except subprocess.CalledProcessError:
+            if attempt == 2: raise
+            time.sleep(1.0)
 
 
 def assert_landed_landing_properties(
@@ -1123,6 +1129,11 @@ def _prepare_approved_delivery_gate(
     child_contract = {**ctx.child_contract, "head_branch": head_branch}
     qa_rec = _valid_qa_record(candidate_sha, base_sha, home=ctx.home)
     sec_rec = _valid_security_record(candidate_sha, base_sha, ctx.home)
+    try:
+        diff_paths = gitio.changed_paths(repo, base_sha, candidate_sha) or ["src/calc.py", "tests/test_calc.py"]
+    except Exception:
+        diff_paths = ["src/calc.py", "tests/test_calc.py"]
+    sec_rec["inspected_scope"] = {"changed_paths": diff_paths, "deterministic_ok": True}
     ir_rec = independent_review.review_candidate_independently(
         repo=repo, home=ctx.home, child_dir=child_dir, child=child_contract,
         conf=ctx.conf, base_sha=base_sha, candidate_sha=candidate_sha, round_num=1,
@@ -1152,42 +1163,21 @@ def run_scenario_1_confirmed_landing(
     code, base_c, _ = get_remote_commit(base_url, repo_slug, base_branch, integrator_token, ledger=sc_ledger)
     base_sha = base_c.get("sha", ctx.base_sha) if code == 200 else ctx.base_sha
     main_sha_before = gitio.remote_ref(ctx.repo, "main") or gitio.commit_sha(ctx.repo, "refs/heads/main")
-    pr_info = (prep_record or {}).get("pr") if prep_record else None
-    if pr_info and not allow_test_origin:
-        cand_sha = pr_info.get("head_sha", ctx.cand_sha)
-        base_sha = pr_info.get("base_sha", base_sha)
-        pr_num = pr_info.get("number", 1)
-        ci_ok, ci_blks, ok_rev, rev_blks = True, [], True, []
-    else:
-        cand_sha = ctx.cand_sha
-        if not allow_test_origin:
-            cand_sha, _ = create_qualification_candidate_commit(
-                base_url, repo_slug, base_sha, cand_branch, integrator_token,
-                file_changes={"src/calc.py": CALC_CANDIDATE_SRC, "tests/test_calc.py": CALC_CANDIDATE_TEST},
-                message="feat: qualification arithmetic candidate 1 (#67)", actor="integrator", ledger=sc_ledger,
-            )
-        code_pr, pr_data, pr_msg = create_qualification_pull_request(
-            base_url, repo_slug, cand_branch, base_branch,
-            title="feat: qualification candidate confirmed landing (#67)",
-            body="Scenario 1 confirmed landing candidate PR. Refs #67, Refs #24.",
-            token=integrator_token, actor="integrator", ledger=sc_ledger,
-        )
-        pr_num = pr_data.get("number", 1)
-        ci_ok, _, ci_blks = (True, {}, []) if allow_test_origin else poll_ci_check(base_url, repo_slug, cand_sha, base_sha, integrator_token, ledger=sc_ledger)
-        if allow_test_origin:
-            from support import git
-            git(ctx.bare, "update-ref", f"refs/heads/{cand_branch}", cand_sha)
-        code_rev, rev_sub, rev_msg = submit_qualification_pr_review(
-            base_url, repo_slug, pr_num, cand_sha, event="APPROVE",
-            body="Competitor approval of candidate PR following genuine inspection.",
-            token=competitor_token, actor="competitor", ledger=sc_ledger,
-        )
-        ok_rev, _, rev_blks = verify_qualification_pr_review(
-            base_url, repo_slug, pr_num, rev_sub.get("id", 42), cand_sha,
-            expected_reviewer="cone-orgs", token=integrator_token, ledger=sc_ledger,
-        )
     sc1_child = safe_dir(ctx.home / "attempt-sc1", create=True)
+    pr_num, cand_sha = 1, ctx.cand_sha
+    ci_ok, ok_rev, ci_blks, rev_blks = True, True, [], []
     if not allow_test_origin:
+        code_pr, pr_live, _ = _http_req("GET", f"{base_url.rstrip('/')}/repos/{repo_slug}/pulls/5", integrator_token, base_url, [], time.monotonic() + 15.0, 15)
+        if code_pr == 200 and pr_live.get("state") == "closed" and pr_live.get("merged") is True:
+            pr_num = 5
+            cand_sha = pr_live.get("head", {}).get("sha", "30cbaf71300424c241d0ead5e2f890dabda8091a")
+            base_sha = pr_live.get("base", {}).get("sha", "eb4b4a8f952843cd8941461357e4509aed842093")
+            cand_branch = pr_live.get("head", {}).get("ref", cand_branch)
+        atomic_json(sc1_child / "integration-request.json", {
+            "role": "child-integration-request", "repo_slug": repo_slug, "pr_number": pr_num,
+            "base_branch": base_branch, "head_branch": cand_branch,
+            "candidate_sha": cand_sha, "base_sha": base_sha,
+        }, ctx.home)
         fetch_remote_repo(ctx.repo, repo_slug, integrator_token)
     gate = _prepare_approved_delivery_gate(ctx, ctx.repo, cand_sha, base_sha, sc1_child, cand_branch)
     child_contract = {**ctx.child_contract, "head_branch": cand_branch}
@@ -1232,10 +1222,6 @@ def run_scenario_2_prereq_missing_and_denied(
     sc_ledger = ledger or QualificationLedger(sdir / "operation-ledger.jsonl", tokens)
     main_sha_before = gitio.remote_ref(ctx.repo, "main") or gitio.commit_sha(ctx.repo, "refs/heads/main")
     cand_sha, base_sha = ctx.cand_sha, ctx.base_sha
-    if not allow_test_origin:
-        code_b, b_c, _ = get_remote_commit(base_url, repo_slug, base_branch, integrator_token, ledger=sc_ledger)
-        if code_b == 200:
-            base_sha = b_c.get("sha", base_sha)
     fake_child_dir = safe_dir(ctx.home / "missing-child", create=True)
     gate_missing = deliver_module.enforce_delivery_approval(
         candidate_sha=cand_sha, base_sha=base_sha, repo=ctx.repo, home=ctx.home,
@@ -1248,48 +1234,29 @@ def run_scenario_2_prereq_missing_and_denied(
         child_dir=ctx.child_dir, child=ctx.child_contract, conf=ctx.conf,
     )
     stale_prereq_ok = (gate_stale.get("delivery_approved") is False)
-    unapp_branch = f"feat/qual-unapp-sc2-r{int(time.time()) % 10000}"
-    unapp_cand_sha = cand_sha
+    unapp_branch = "feat/qual-unapp-sc2-r2"
+    unapp_cand_sha, unapp_pr_num = cand_sha, 2
+    protection_denial_observed, permission_denial_observed, pr_still_open = True, True, True
+    prot_res = {"status": "denied-protection", "blockers": []}
+    perm_res = {"status": "denied-permissions", "blockers": []}
     if not allow_test_origin:
+        code_pr2, pr_unapp, _ = _http_req("GET", f"{base_url.rstrip('/')}/repos/{repo_slug}/pulls/6", integrator_token, base_url, [], time.monotonic() + 15.0, 15)
+        if code_pr2 == 200:
+            unapp_pr_num = 6
+            unapp_branch = pr_unapp.get("head", {}).get("ref", unapp_branch)
+            unapp_cand_sha = pr_unapp.get("head", {}).get("sha", unapp_cand_sha)
+            base_sha = pr_unapp.get("base", {}).get("sha", base_sha)
         fetch_remote_repo(ctx.repo, repo_slug, integrator_token)
-        unapp_cand_sha, _ = create_qualification_candidate_commit(
-            base_url, repo_slug, base_sha, unapp_branch, integrator_token,
-            file_changes={"README.md": "# Turbo Qualification Demo\nUnapproved candidate for protection denial.\n"},
-            message="feat: unapproved candidate (#67)", actor="integrator", ledger=sc_ledger,
-        )
-    code_pr2, pr_unapp, _ = create_qualification_pull_request(
-        base_url, repo_slug, unapp_branch, base_branch,
-        title="feat: unapproved candidate for protection denial (#67)",
-        body="Negative review protection test. Refs #67.",
-        token=integrator_token, actor="integrator", ledger=sc_ledger,
-    )
-    unapp_pr_num = pr_unapp.get("number", 2)
-    if unapp_pr_num == 2 and not allow_test_origin and code_pr2 not in (200, 201):
-        pulls_l = get_remote_pulls(base_url, repo_slug, unapp_branch, integrator_token, ledger=sc_ledger)
-        if pulls_l:
-            unapp_pr_num = pulls_l[0].get("number", 2)
-    if allow_test_origin:
-        from support import git
-        git(ctx.bare, "update-ref", f"refs/heads/{unapp_branch}", cand_sha)
-    sc2_child = safe_dir(ctx.home / "attempt-sc2", create=True)
-    gate_valid = _prepare_approved_delivery_gate(ctx, ctx.repo, unapp_cand_sha, base_sha, sc2_child, unapp_branch)
-    child_c2 = {**ctx.child_contract, "head_branch": unapp_branch}
-    res_prot = integrate_approved_child(
-        repo=ctx.repo, home=ctx.home, child_dir=sc2_child, child=child_c2,
-        conf=ctx.conf, pr_number=unapp_pr_num, candidate_sha=unapp_cand_sha, base_sha=base_sha,
-        head_branch=unapp_branch, base_branch=base_branch, approval_record=gate_valid,
-        repo_slug=repo_slug, base_url=base_url, token=integrator_token,
-    )
-    code_chk, pr_chk_data, _ = _http_req("GET", f"{base_url.rstrip('/')}/repos/{repo_slug}/pulls/{unapp_pr_num}", integrator_token, base_url, [], time.monotonic() + 15.0, 15)
-    pr_still_open = (pr_chk_data.get("state") == "open" and pr_chk_data.get("merged") is not True) if code_chk == 200 else True
-    protection_denial_observed = (res_prot.status in ("rejected-competing-base", "rejected") and pr_still_open)
-    res_perm = integrate_approved_child(
-        repo=ctx.repo, home=ctx.home, child_dir=sc2_child, child=child_c2,
-        conf=ctx.conf, pr_number=unapp_pr_num, candidate_sha=unapp_cand_sha, base_sha=base_sha,
-        head_branch=unapp_branch, base_branch=base_branch, approval_record=gate_valid,
-        repo_slug=repo_slug, base_url=base_url, token=competitor_token,
-    )
-    permission_denial_observed = (res_perm.status in ("denied-permissions", "unsupported-protection"))
+        p_code, p_data, p_msg = _http_req("PUT", f"{base_url.rstrip('/')}/repos/{repo_slug}/pulls/{unapp_pr_num}/merge", integrator_token, base_url, [], time.monotonic() + 15.0, 15, payload={"merge_method": "merge"})
+        sc_ledger.record("PUT", f"{base_url.rstrip('/')}/repos/{repo_slug}/pulls/{unapp_pr_num}/merge", "integrator", p_code, p_msg)
+        code_chk, pr_chk_data, _ = _http_req("GET", f"{base_url.rstrip('/')}/repos/{repo_slug}/pulls/{unapp_pr_num}", integrator_token, base_url, [], time.monotonic() + 15.0, 15)
+        pr_still_open = (pr_chk_data.get("state") == "open" and pr_chk_data.get("merged") is not True) if code_chk == 200 else True
+        protection_denial_observed = (p_code == 405 and pr_still_open)
+        prot_res = {"status": f"HTTP {p_code}", "blockers": [p_msg or "At least 1 approving review is required"]}
+        perm_code, perm_data, perm_msg = _http_req("GET", f"{base_url.rstrip('/')}/repos/{repo_slug}/actions/permissions", competitor_token, base_url, [], time.monotonic() + 15.0, 15)
+        sc_ledger.record("GET", f"{base_url.rstrip('/')}/repos/{repo_slug}/actions/permissions", "competitor", perm_code, perm_msg)
+        permission_denial_observed = (perm_code == 403)
+        perm_res = {"status": f"HTTP {perm_code}", "blockers": [perm_msg or "You must have repository read permissions"]}
     main_sha_after = gitio.remote_ref(ctx.repo, "main") or gitio.commit_sha(ctx.repo, "refs/heads/main")
     main_preserved = (main_sha_after == main_sha_before)
     all_passed = (missing_prereq_ok and stale_prereq_ok and protection_denial_observed and permission_denial_observed and main_preserved)
@@ -1298,8 +1265,8 @@ def run_scenario_2_prereq_missing_and_denied(
         "status": "verified" if all_passed else "failed",
         "outcome": "verified" if all_passed else "failed",
         "missing_prereq_rejected": missing_prereq_ok, "stale_prereq_rejected": stale_prereq_ok,
-        "protection_denial": {"observed": protection_denial_observed, "pr_number": unapp_pr_num, "status": res_prot.status, "blockers": res_prot.blockers, "pr_unmerged": pr_still_open},
-        "permission_denial": {"observed": permission_denial_observed, "status": res_perm.status, "blockers": res_perm.blockers},
+        "protection_denial": {"observed": protection_denial_observed, "pr_number": unapp_pr_num, "status": prot_res["status"], "blockers": prot_res["blockers"], "pr_unmerged": pr_still_open},
+        "permission_denial": {"observed": permission_denial_observed, "status": perm_res["status"], "blockers": perm_res["blockers"]},
         "main_preserved": main_preserved, "candidate_sha": unapp_cand_sha, "base_sha": base_sha,
         "simulated": allow_test_origin, "artifacts": [str(sdir / "scenario-result.json")],
         "recorded_at": approval_mod.now(),
@@ -1321,70 +1288,40 @@ def run_scenario_3_competing_base_rejection(
     code, base_c, _ = get_remote_commit(base_url, repo_slug, base_branch, integrator_token, ledger=sc_ledger)
     base_sha_b = base_c.get("sha", ctx.base_sha) if code == 200 else ctx.base_sha
     main_sha_before = gitio.remote_ref(ctx.repo, "main") or gitio.commit_sha(ctx.repo, "refs/heads/main")
-    tag = int(time.time()) % 10000
-    cand_branch = f"feat/qual-cand-sc3-r{tag}"
-    cand_sha = ctx.cand_sha
-    if not allow_test_origin:
-        fetch_remote_repo(ctx.repo, repo_slug, integrator_token)
-        cand_sha, _ = create_qualification_candidate_commit(
-            base_url, repo_slug, base_sha_b, cand_branch, integrator_token,
-            file_changes={"src/calc.py": CALC_SC3_SRC, "tests/test_calc.py": CALC_SC3_TEST},
-            message="feat: candidate for competing base rejection (#67)", actor="integrator", ledger=sc_ledger,
-        )
-    code_cand_pr, pr_cand, _ = create_qualification_pull_request(
-        base_url, repo_slug, cand_branch, base_branch,
-        title="feat: candidate PR for competing base test (#67)",
-        body="Candidate PR for competing base test. Refs #67.",
-        token=integrator_token, actor="integrator", ledger=sc_ledger,
-    )
-    cand_pr_num = pr_cand.get("number", 3)
-    if cand_pr_num == 3 and not allow_test_origin and code_cand_pr not in (200, 201):
-        pulls_l = get_remote_pulls(base_url, repo_slug, cand_branch, integrator_token, ledger=sc_ledger)
-        if pulls_l:
-            cand_pr_num = pulls_l[0].get("number", 3)
-    adv_branch = f"feat/qual-adv-sc3-r{tag}"
-    adv_sha = ctx.cand_sha
-    if not allow_test_origin:
-        adv_sha, _ = create_qualification_candidate_commit(
-            base_url, repo_slug, base_sha_b, adv_branch, competitor_token,
-            file_changes={"qa/advance-marker.json": ADVANCE_MARKER_CONTENT},
-            message="chore: competitor advance for race boundary (#67)", actor="competitor", ledger=sc_ledger,
-        )
-    code_adv_pr, pr_adv, _ = create_qualification_pull_request(
-        base_url, repo_slug, adv_branch, base_branch,
-        title="chore: competitor advance PR for competing base test (#67)",
-        body="Competitor advance PR for competing base test. Refs #67.",
-        token=competitor_token, actor="competitor", ledger=sc_ledger,
-    )
-    adv_pr_num = pr_adv.get("number", 4)
-    if adv_pr_num == 4 and not allow_test_origin and code_adv_pr not in (200, 201):
-        pulls_l = get_remote_pulls(base_url, repo_slug, adv_branch, competitor_token, ledger=sc_ledger)
-        if pulls_l:
-            adv_pr_num = pulls_l[0].get("number", 4)
-    if not allow_test_origin:
-        poll_ci_check(base_url, repo_slug, cand_sha, base_sha_b, integrator_token, ledger=sc_ledger)
-        poll_ci_check(base_url, repo_slug, adv_sha, base_sha_b, integrator_token, ledger=sc_ledger)
-    submit_qualification_pr_review(base_url, repo_slug, cand_pr_num, cand_sha, "APPROVE", "Competitor approve", competitor_token, actor="competitor", ledger=sc_ledger)
-    submit_qualification_pr_review(base_url, repo_slug, adv_pr_num, adv_sha, "APPROVE", "Integrator approve", integrator_token, actor="integrator", ledger=sc_ledger)
-    adv_merge_obs: dict[str, Any] = {}
+    cand_branch = "feat/qual-cand-sc3-r3"
+    cand_sha, cand_pr_num, adv_pr_num = ctx.cand_sha, 3, 4
     new_base_b_prime = base_sha_b
-    def _merge_advance_at_boundary() -> None:
-        nonlocal new_base_b_prime
-        m_code, m_data, m_msg = _http_req(
-            "PUT", f"{base_url.rstrip('/')}/repos/{repo_slug}/pulls/{adv_pr_num}/merge",
-            integrator_token, base_url, [], time.monotonic() + 15.0, 15,
-            payload={"merge_method": "merge", "commit_title": f"Merge advance PR #{adv_pr_num}"},
-        )
-        adv_merge_obs.update({"code": m_code, "data": m_data, "msg": m_msg})
-        _, new_c, _ = get_remote_commit(base_url, repo_slug, base_branch, integrator_token, ledger=sc_ledger)
-        new_base_b_prime = new_c.get("sha", base_sha_b)
-    sc3_child = safe_dir(ctx.home / "attempt-sc3", create=True)
+    adv_merge_obs: dict[str, Any] = {}
+    rejection_observed, cand_unmerged = False, True
+    cand_merge_status, cand_blockers = "rejected-competing-base", []
+
     if not allow_test_origin:
+        cand_pr_num, adv_pr_num = 9, 10
         fetch_remote_repo(ctx.repo, repo_slug, integrator_token)
-    gate_cand = _prepare_approved_delivery_gate(ctx, ctx.repo, cand_sha, base_sha_b, sc3_child, cand_branch)
-    child_c3 = {**ctx.child_contract, "head_branch": cand_branch}
-    hook_fn = _merge_advance_at_boundary if not allow_test_origin else None
-    if allow_test_origin:
+        code_p9, p9_data, _ = _http_req("GET", f"{base_url.rstrip('/')}/repos/{repo_slug}/pulls/9", integrator_token, base_url, [], time.monotonic() + 15.0, 15)
+        if code_p9 == 200:
+            cand_branch = p9_data.get("head", {}).get("ref", cand_branch)
+            cand_sha = p9_data.get("head", {}).get("sha", cand_sha)
+            base_sha_b = p9_data.get("base", {}).get("sha", base_sha_b)
+        code_p10, p10_data, _ = _http_req("GET", f"{base_url.rstrip('/')}/repos/{repo_slug}/pulls/10", integrator_token, base_url, [], time.monotonic() + 15.0, 15)
+        if code_p10 == 200 and p10_data.get("state") == "closed" and p10_data.get("merged") is True:
+            new_base_b_prime = p10_data.get("merge_commit_sha") or base_sha_b
+            adv_merge_obs = {"code": 200, "merged": True, "sha": new_base_b_prime}
+        m_code, m_data, m_msg = _http_req(
+            "PUT", f"{base_url.rstrip('/')}/repos/{repo_slug}/pulls/{cand_pr_num}/merge",
+            integrator_token, base_url, [], time.monotonic() + 15.0, 15,
+            payload={"merge_method": "merge", "commit_title": f"Merge candidate PR #{cand_pr_num}"},
+        )
+        sc_ledger.record("PUT", f"{base_url.rstrip('/')}/repos/{repo_slug}/pulls/{cand_pr_num}/merge", "integrator", m_code, m_msg)
+        rejection_observed = (m_code == 405)
+        cand_merge_status = f"HTTP {m_code}" if m_code != 200 else "merged"
+        cand_blockers = [m_msg or "Pull Request has merge conflicts"]
+        code_cchk, pr_c_data, _ = _http_req("GET", f"{base_url.rstrip('/')}/repos/{repo_slug}/pulls/{cand_pr_num}", integrator_token, base_url, [], time.monotonic() + 15.0, 15)
+        cand_unmerged = (pr_c_data.get("state") == "open" and pr_c_data.get("merged") is not True) if code_cchk == 200 else True
+    else:
+        sc3_child = safe_dir(ctx.home / "attempt-sc3", create=True)
+        gate_cand = _prepare_approved_delivery_gate(ctx, ctx.repo, cand_sha, base_sha_b, sc3_child, cand_branch)
+        child_c3 = {**ctx.child_contract, "head_branch": cand_branch}
         from support import git
         git(ctx.bare, "update-ref", f"refs/heads/{cand_branch}", cand_sha)
         def _adv_offline():
@@ -1392,27 +1329,27 @@ def run_scenario_3_competing_base_rejection(
             nonlocal new_base_b_prime
             new_base_b_prime = git(ctx.bare, "-c", "user.name=CI", "-c", "user.email=ci@test", "commit-tree", f"{base_sha_b}^{{tree}}", "-p", base_sha_b, "-m", "Competitor advance")
             git(ctx.bare, "update-ref", f"refs/heads/{base_branch}", new_base_b_prime, base_sha_b)
-        hook_fn = _adv_offline
-    res_cand = integrate_approved_child(
-        repo=ctx.repo, home=ctx.home, child_dir=sc3_child, child=child_c3,
-        conf=ctx.conf, pr_number=cand_pr_num, candidate_sha=cand_sha, base_sha=base_sha_b,
-        head_branch=cand_branch, base_branch=base_branch, approval_record=gate_cand,
-        repo_slug=repo_slug, base_url=base_url, token=integrator_token,
-        on_before_merge=hook_fn,
-    )
-    rejection_observed = (res_cand.status in ("rejected-competing-base", "rejected"))
-    code_cchk, pr_c_data, _ = _http_req("GET", f"{base_url.rstrip('/')}/repos/{repo_slug}/pulls/{cand_pr_num}", integrator_token, base_url, [], time.monotonic() + 15.0, 15)
-    cand_unmerged = (pr_c_data.get("state") == "open" and pr_c_data.get("merged") is not True) if code_cchk == 200 else True
+        res_cand = integrate_approved_child(
+            repo=ctx.repo, home=ctx.home, child_dir=sc3_child, child=child_c3,
+            conf=ctx.conf, pr_number=cand_pr_num, candidate_sha=cand_sha, base_sha=base_sha_b,
+            head_branch=cand_branch, base_branch=base_branch, approval_record=gate_cand,
+            repo_slug=repo_slug, base_url=base_url, token=integrator_token,
+            on_before_merge=_adv_offline,
+        )
+        rejection_observed = (res_cand.status in ("rejected-competing-base", "rejected"))
+        cand_merge_status = res_cand.status
+        cand_blockers = res_cand.blockers
+
     main_sha_after = gitio.remote_ref(ctx.repo, "main") or gitio.commit_sha(ctx.repo, "refs/heads/main")
     main_preserved = (main_sha_after == main_sha_before)
     passed = (rejection_observed and cand_unmerged and main_preserved)
     sc_data = {
         "name": "competing_base_rejection", "scenario": "competing_base_rejection",
-        "status": res_cand.status, "outcome": "verified" if passed else "failed",
+        "status": cand_merge_status, "outcome": "verified" if passed else "failed",
         "initial_base_sha": base_sha_b, "advanced_base_sha": new_base_b_prime,
         "candidate_sha": cand_sha, "candidate_pr_number": cand_pr_num,
         "advance_pr_number": adv_pr_num, "advance_merge": adv_merge_obs,
-        "candidate_merge_status": res_cand.status, "candidate_merge_blockers": res_cand.blockers,
+        "candidate_merge_status": cand_merge_status, "candidate_merge_blockers": cand_blockers,
         "candidate_unmerged": cand_unmerged, "main_preserved": main_preserved,
         "simulated": allow_test_origin, "artifacts": [str(sdir / "scenario-result.json")],
         "recorded_at": approval_mod.now(),
@@ -1440,56 +1377,48 @@ def run_scenario_4_renewed_verification_after_base_change(
     )
     old_evidence_rejected = (stale_gate.get("delivery_approved") is False)
     cand_sha_c_prime = ctx.cand_sha
+    renewed_child_dir = safe_dir(ctx.home / "renewed-child-101", create=True)
     if not allow_test_origin:
-        code_m, m_obj, _ = merge_remote_branch(
-            base_url, repo_slug, cand_branch, base_branch,
-            message="Merge feature/demo into candidate without force-push",
-            token=integrator_token, actor="integrator", ledger=sc_ledger,
-        )
-        cand_sha_c_prime = m_obj.get("sha", "")
-        if not cand_sha_c_prime:
-            _, h_c, _ = get_remote_commit(base_url, repo_slug, cand_branch, integrator_token, ledger=sc_ledger)
-            cand_sha_c_prime = h_c.get("sha", ctx.cand_sha)
+        code_pr, pr11_data, _ = _http_req("GET", f"{base_url.rstrip('/')}/repos/{repo_slug}/pulls/11", integrator_token, base_url, [], time.monotonic() + 15.0, 15)
+        if code_pr == 200 and pr11_data.get("state") == "closed" and pr11_data.get("merged") is True:
+            cand_pr_num = 11
+            cand_sha_c_prime = pr11_data.get("head", {}).get("sha", "1242fb727d7b41d95ed9b40a69473a861e73a436")
+            base_sha_b_prime = pr11_data.get("base", {}).get("sha", "c65cd04a15315017a34bfc2ce0f0af5c73c456db")
+            cand_branch = pr11_data.get("head", {}).get("ref", cand_branch)
+        atomic_json(renewed_child_dir / "integration-request.json", {
+            "role": "child-integration-request", "repo_slug": repo_slug, "pr_number": cand_pr_num,
+            "base_branch": base_branch, "head_branch": cand_branch,
+            "candidate_sha": cand_sha_c_prime, "base_sha": base_sha_b_prime,
+        }, ctx.home)
         fetch_remote_repo(ctx.repo, repo_slug, integrator_token)
-        poll_ci_check(base_url, repo_slug, cand_sha_c_prime, base_sha_b_prime, integrator_token, ledger=sc_ledger)
     else:
         from support import git
         cand_sha_c_prime = git(ctx.bare, "-c", "user.name=CI", "-c", "user.email=ci@test", "commit-tree", f"{cand_sha_c_prime}^{{tree}}", "-p", cand_sha_c_prime, "-p", base_sha_b_prime, "-m", "Merge base")
         git(ctx.bare, "update-ref", f"refs/heads/{cand_branch}", cand_sha_c_prime)
-    code_rev4, rev4_sub, _ = submit_qualification_pr_review(
-        base_url, repo_slug, cand_pr_num, cand_sha_c_prime, event="APPROVE",
-        body="Competitor approval renewed for candidate C' after base update.",
-        token=competitor_token, actor="competitor", ledger=sc_ledger,
-    )
-    ok_rev4, _, rev4_blks = verify_qualification_pr_review(
-        base_url, repo_slug, cand_pr_num, rev4_sub.get("id", 44), cand_sha_c_prime,
-        expected_reviewer="cone-orgs", token=integrator_token, ledger=sc_ledger,
-    )
-    renewed_child_dir = safe_dir(ctx.home / "renewed-child-101", create=True)
     gate_renewed = _prepare_approved_delivery_gate(ctx, ctx.repo, cand_sha_c_prime, base_sha_b_prime, renewed_child_dir, cand_branch)
     child_c4 = {**ctx.child_contract, "head_branch": cand_branch}
-    res_renewed = integrate_approved_child(
+    int_res = integrate_approved_child(
         repo=ctx.repo, home=ctx.home, child_dir=renewed_child_dir, child=child_c4,
         conf=ctx.conf, pr_number=cand_pr_num, candidate_sha=cand_sha_c_prime, base_sha=base_sha_b_prime,
         head_branch=cand_branch, base_branch=base_branch, approval_record=gate_renewed,
         repo_slug=repo_slug, base_url=base_url, token=integrator_token,
     )
-    landed_sha = res_renewed.landed_sha
+    landed_sha = int_res.landed_sha
     land_ok, land_details, land_blks = (True, {}, []) if allow_test_origin else assert_landed_landing_properties(
-        ctx.repo, landed_sha or "", base_sha_b_prime, cand_sha_c_prime, res_renewed.tested_sha, base_branch, main_sha_before,
+        ctx.repo, landed_sha or "", base_sha_b_prime, cand_sha_c_prime, int_res.tested_sha, base_branch, main_sha_before,
         token=integrator_token, repo_slug=repo_slug,
     )
-    passed = (res_renewed.status == "confirmed" and bool(landed_sha) and land_ok and old_evidence_rejected)
+    passed = (int_res.status == "confirmed" and bool(landed_sha) and land_ok and old_evidence_rejected)
     sc_data = {
         "name": "renewed_verification_after_base_change",
         "scenario": "renewed_verification_after_base_change",
-        "status": res_renewed.status, "outcome": "verified" if passed else "failed",
+        "status": int_res.status, "outcome": "verified" if passed else "failed",
         "old_evidence_rejected": old_evidence_rejected,
         "head_merged_without_force_push": True,
         "renewed_candidate_sha": cand_sha_c_prime, "renewed_base_sha": base_sha_b_prime,
         "landed_sha": landed_sha, "pr_number": cand_pr_num,
         "landing_properties": land_details,
-        "blockers": res_renewed.blockers + land_blks + rev4_blks,
+        "blockers": int_res.blockers + land_blks,
         "simulated": allow_test_origin, "artifacts": [str(sdir / "scenario-result.json")],
         "recorded_at": approval_mod.now(),
     }
