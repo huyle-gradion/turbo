@@ -637,7 +637,8 @@ def set_remote_branch_ref(
         ledger.record("GET", url_ref, actor, code, msg)
     if code == 200:
         url_patch = f"{base_url.rstrip('/')}/repos/{repo_slug}/git/refs/heads/{quoted}"
-        p_code, p_data, p_msg = _http_req("PATCH", url_patch, token, base_url, [], time.monotonic() + 15.0, 15, payload={"sha": commit_sha, "force": False})
+        force_ok = branch_name not in ("main", "feature/demo")
+        p_code, p_data, p_msg = _http_req("PATCH", url_patch, token, base_url, [], time.monotonic() + 15.0, 15, payload={"sha": commit_sha, "force": force_ok})
         if ledger:
             ledger.record("PATCH", url_patch, actor, p_code, p_msg)
         return p_code, p_data, p_msg
@@ -1247,19 +1248,15 @@ def run_scenario_2_prereq_missing_and_denied(
         child_dir=ctx.child_dir, child=ctx.child_contract, conf=ctx.conf,
     )
     stale_prereq_ok = (gate_stale.get("delivery_approved") is False)
-    unapp_branch = "feat/qual-unapp-sc2-r2"
+    unapp_branch = f"feat/qual-unapp-sc2-r{int(time.time()) % 10000}"
     unapp_cand_sha = cand_sha
     if not allow_test_origin:
         fetch_remote_repo(ctx.repo, repo_slug, integrator_token)
-        code_h, h_c, _ = get_remote_commit(base_url, repo_slug, unapp_branch, integrator_token, ledger=sc_ledger)
-        if code_h == 200:
-            unapp_cand_sha = h_c.get("sha", cand_sha)
-        else:
-            unapp_cand_sha, _ = create_qualification_candidate_commit(
-                base_url, repo_slug, base_sha, unapp_branch, integrator_token,
-                file_changes={"README.md": "# Turbo Qualification Demo\nUnapproved candidate for protection denial.\n"},
-                message="feat: unapproved candidate (#67)", actor="integrator", ledger=sc_ledger,
-            )
+        unapp_cand_sha, _ = create_qualification_candidate_commit(
+            base_url, repo_slug, base_sha, unapp_branch, integrator_token,
+            file_changes={"README.md": "# Turbo Qualification Demo\nUnapproved candidate for protection denial.\n"},
+            message="feat: unapproved candidate (#67)", actor="integrator", ledger=sc_ledger,
+        )
     code_pr2, pr_unapp, _ = create_qualification_pull_request(
         base_url, repo_slug, unapp_branch, base_branch,
         title="feat: unapproved candidate for protection denial (#67)",
@@ -1324,7 +1321,8 @@ def run_scenario_3_competing_base_rejection(
     code, base_c, _ = get_remote_commit(base_url, repo_slug, base_branch, integrator_token, ledger=sc_ledger)
     base_sha_b = base_c.get("sha", ctx.base_sha) if code == 200 else ctx.base_sha
     main_sha_before = gitio.remote_ref(ctx.repo, "main") or gitio.commit_sha(ctx.repo, "refs/heads/main")
-    cand_branch = "feat/qual-cand-sc3-r3"
+    tag = int(time.time()) % 10000
+    cand_branch = f"feat/qual-cand-sc3-r{tag}"
     cand_sha = ctx.cand_sha
     if not allow_test_origin:
         fetch_remote_repo(ctx.repo, repo_slug, integrator_token)
@@ -1344,7 +1342,7 @@ def run_scenario_3_competing_base_rejection(
         pulls_l = get_remote_pulls(base_url, repo_slug, cand_branch, integrator_token, ledger=sc_ledger)
         if pulls_l:
             cand_pr_num = pulls_l[0].get("number", 3)
-    adv_branch = "feat/qual-adv-sc3-r3"
+    adv_branch = f"feat/qual-adv-sc3-r{tag}"
     adv_sha = ctx.cand_sha
     if not allow_test_origin:
         adv_sha, _ = create_qualification_candidate_commit(
