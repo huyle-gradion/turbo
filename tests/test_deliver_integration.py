@@ -4,10 +4,12 @@ from __future__ import annotations
 import copy, json, os, shutil, tempfile, unittest
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 from factory import deliver as deliver_module
 from factory.deliver_checks import AttemptTimeoutError
 from factory.integration import integrate_approved_child
+import factory.integration as integration_mod
 from factory.paths import atomic_json
 from support import git
 from support_deliver import setup_disposable_delivery_context
@@ -145,6 +147,49 @@ class DeliverIntegrationBehaviorTest(unittest.TestCase):
                 self.assertTrue(res3.merged)
                 put_count_3 = len([r for r in ctx.gh.requests if r["method"] == "PUT"])
                 self.assertEqual(put_count_3, 1, "Repeated delivery must not issue another PUT merge mutation")
+                self.assertEqual(git(ctx.bare, "rev-parse", "refs/heads/main"), main_sha_before)
+
+    def test_confirmation_timeout_preserves_approval_and_resumes_without_duplicate_put(self) -> None:
+        """Confirmation timeout preserves approval, prevents completion, and resume completes without another PUT."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with setup_disposable_delivery_context(root) as ctx:
+                ctx.restore_valid_evidence()
+                main_sha_before = git(ctx.bare, "rev-parse", "refs/heads/main")
+
+                orig_http = integration_mod._http_req
+                put_state = {"done": False, "fail_conf": True}
+
+                def fake_http(*args: Any, **kw: Any) -> Any:
+                    method = args[0]
+                    if method == "PUT":
+                        put_state["done"] = True
+                    elif method == "GET" and put_state["done"] and put_state["fail_conf"] and "pulls/1" in args[1]:
+                        raise AttemptTimeoutError("injected confirmation GET timeout")
+                    return orig_http(*args, **kw)
+
+                with patch.object(integration_mod, "_http_req", side_effect=fake_http):
+                    res1 = deliver_module.deliver_feature(ctx.paths, ctx.spec)
+
+                self.assertEqual(res1.status, "uncertain")
+                self.assertFalse(res1.merged)
+                self.assertIsNone(res1.landed_sha)
+                self.assertTrue(res1.delivery_approved)
+                self.assertTrue((ctx.child_dir / "approval-gate.json").is_file())
+                self.assertTrue((ctx.child_dir / "integration-record.json").is_file())
+                rec1 = json.loads((ctx.child_dir / "integration-record.json").read_text(encoding="utf-8"))
+                self.assertEqual((rec1["status"], rec1["mutation_outcome"]), ("uncertain", "succeeded"))
+                put_count_1 = len([r for r in ctx.gh.requests if r["method"] == "PUT"])
+                self.assertEqual(put_count_1, 1)
+
+                # Resume delivery without fault: confirms landing without new mutation
+                put_state["fail_conf"] = False
+                res2 = deliver_module.deliver_feature(ctx.paths, ctx.spec)
+                self.assertEqual(res2.status, "completed")
+                self.assertTrue(res2.merged)
+                self.assertIsNotNone(res2.landed_sha)
+                put_count_2 = len([r for r in ctx.gh.requests if r["method"] == "PUT"])
+                self.assertEqual(put_count_2, 1, "Resume must not issue another PUT merge mutation")
                 self.assertEqual(git(ctx.bare, "rev-parse", "refs/heads/main"), main_sha_before)
 
     def test_changed_candidate_and_changed_base_prevent_new_mutation(self) -> None:

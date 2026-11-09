@@ -324,23 +324,29 @@ def integrate_approved_child(
 
         if r_pr.get("state") == "closed" and r_pr.get("merged") is True:
             mut_outcome, is_reconciled = "already-merged", True
-            ok_conf, st_conf, msg_conf, landed_sha = _confirm_landing(
-                repo=repo, eff_base_url=eff_base_url, eff_token=eff_token, repo_slug=repo_slug,
-                pr_number=pr_number, candidate_sha=candidate_sha, base_sha=base_sha,
-                tested_sha=tested_sha_val, head_branch=head_branch, base_branch=base_branch,
-                merge_method=merge_method, trace=trace, dl=dl, limit_s=limit_s,
-            )
-            if not ok_conf:
-                conf_status = st_conf
-                return _fail(st_conf, msg_conf, req_p=str(req_file))
+            try:
+                ok_conf, st_conf, msg_conf, landed_sha = _confirm_landing(
+                    repo=repo, eff_base_url=eff_base_url, eff_token=eff_token, repo_slug=repo_slug,
+                    pr_number=pr_number, candidate_sha=candidate_sha, base_sha=base_sha,
+                    tested_sha=tested_sha_val, head_branch=head_branch, base_branch=base_branch,
+                    merge_method=merge_method, trace=trace, dl=dl, limit_s=limit_s,
+                )
+            except AttemptTimeoutError as exc:
+                status, outcome, conf_status = "uncertain", "uncertain", "uncertain"
+                landed_sha = None
+                blockers.append(str(approval_mod.redact_value(f"confirmation timed out: {exc}", secrets)))
+            else:
+                if not ok_conf:
+                    conf_status = st_conf
+                    return _fail(st_conf, msg_conf, req_p=str(req_file))
+                status, outcome, conf_status = "confirmed", "confirmed", "confirmed"
 
-            conf_status = "confirmed"
             rec_path_str: str | None = None
             if child_dir.exists():
                 rec_target = child_dir / "integration-record.json"
                 rec_data = approval_mod.redact_value({
-                    "schema": 1, "role": "child-integration-result", "factory_revision": f_rev, "status": "confirmed",
-                    "outcome": "confirmed", "repo_slug": repo_slug, "pr_number": pr_number,
+                    "schema": 1, "role": "child-integration-result", "factory_revision": f_rev, "status": status,
+                    "outcome": outcome, "repo_slug": repo_slug, "pr_number": pr_number,
                     "candidate_sha": candidate_sha, "base_sha": base_sha, "head_branch": head_branch, "base_branch": base_branch,
                     "landed_sha": landed_sha, "merge_method": merge_method, "protection_observed": prot_obs,
                     "approval_status": ap_status, "mutation_outcome": mut_outcome,
@@ -352,9 +358,11 @@ def integrate_approved_child(
                     rec_path_str = str(rec_target)
                 except Exception as exc:
                     blockers.append(str(approval_mod.redact_value(f"failed to persist integration record: {exc}", secrets)))
-                    return _make("persistence-failed", "rejected", landed=None, req_p=str(req_file), rec_p=None)
+                    rec_path_str = None
+                    if status == "confirmed":
+                        return _make("persistence-failed", "rejected", landed=None, req_p=str(req_file), rec_p=None)
 
-            return _make("confirmed", "confirmed", landed=landed_sha, req_p=str(req_file), rec_p=rec_path_str)
+            return _make(status, outcome, landed=landed_sha, req_p=str(req_file), rec_p=rec_path_str)
 
     # 5. Authoritative Provider PR state & revision check (AC2, AC4)
     code, pr_data, err_msg = _http_req("GET", f"{eff_base_url}/repos/{repo_slug}/pulls/{pr_number}", eff_token, eff_base_url, trace, dl, limit_s)
@@ -444,18 +452,24 @@ def integrate_approved_child(
     else:
         if m_code in (200, 201) and m_data.get("merged") is True:
             mut_outcome = "succeeded"
-            ok_conf, st_conf, msg_conf, landed_sha = _confirm_landing(
-                repo=repo, eff_base_url=eff_base_url, eff_token=eff_token, repo_slug=repo_slug,
-                pr_number=pr_number, candidate_sha=candidate_sha, base_sha=base_sha,
-                tested_sha=tested_sha_val, head_branch=head_branch, base_branch=base_branch,
-                merge_method=merge_method, trace=trace, dl=dl, limit_s=limit_s,
-            )
-            if ok_conf:
-                status, outcome, conf_status = "confirmed", "confirmed", "confirmed"
-            else:
-                status, outcome, conf_status = st_conf, "rejected", st_conf
+            try:
+                ok_conf, st_conf, msg_conf, landed_sha = _confirm_landing(
+                    repo=repo, eff_base_url=eff_base_url, eff_token=eff_token, repo_slug=repo_slug,
+                    pr_number=pr_number, candidate_sha=candidate_sha, base_sha=base_sha,
+                    tested_sha=tested_sha_val, head_branch=head_branch, base_branch=base_branch,
+                    merge_method=merge_method, trace=trace, dl=dl, limit_s=limit_s,
+                )
+            except AttemptTimeoutError as exc:
+                status, outcome, conf_status = "uncertain", "uncertain", "uncertain"
                 landed_sha = None
-                blockers.append(msg_conf)
+                blockers.append(str(approval_mod.redact_value(f"confirmation timed out: {exc}", secrets)))
+            else:
+                if ok_conf:
+                    status, outcome, conf_status = "confirmed", "confirmed", "confirmed"
+                else:
+                    status, outcome, conf_status = st_conf, "rejected", st_conf
+                    landed_sha = None
+                    blockers.append(msg_conf)
         elif m_code == 405:
             status, outcome, mut_outcome = "rejected-competing-base", "rejected", "rejected"
             conf_status = "unconfirmed"
