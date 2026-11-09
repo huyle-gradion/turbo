@@ -139,15 +139,17 @@ def _confirm_landing(
     if parents != [base_sha, candidate_sha]:
         return False, "invalid-landing-relationship", f"landed commit {landed_sha} parents {parents} do not match [base_sha={base_sha}, candidate_sha={candidate_sha}]", None
 
-    if tested_sha:
-        if not git_timed(repo, dl, limit_s, "inspect tested_sha", "cat-file", "-t", tested_sha).ok:
-            git_timed(repo, dl, limit_s, "fetch PR merge ref", "fetch", "-q", "--no-tags", "origin", f"refs/pull/{pr_number}/merge")
-        landed_tree_res = git_timed(repo, dl, limit_s, "landed tree", "rev-parse", f"{landed_sha}^{{tree}}")
-        tested_tree_res = git_timed(repo, dl, limit_s, "tested tree", "rev-parse", f"{tested_sha}^{{tree}}")
-        if not (landed_tree_res.ok and tested_tree_res.ok):
-            return False, "tree-resolution-failed", "failed to resolve landed or tested tree in git", None
-        if landed_tree_res.output.strip() != tested_tree_res.output.strip():
-            return False, "invalid-landing-relationship", f"landed tree {landed_tree_res.output.strip()} does not match tested tree {tested_tree_res.output.strip()}", None
+    if not (tested_sha and tested_sha.strip()):
+        return False, "unverifiable-landing-relationship", "missing tested_sha for landing proof", None
+
+    if not git_timed(repo, dl, limit_s, "inspect tested_sha", "cat-file", "-t", tested_sha).ok:
+        git_timed(repo, dl, limit_s, "fetch PR merge ref", "fetch", "-q", "--no-tags", "origin", f"refs/pull/{pr_number}/merge")
+    landed_tree_res = git_timed(repo, dl, limit_s, "landed tree", "rev-parse", f"{landed_sha}^{{tree}}")
+    tested_tree_res = git_timed(repo, dl, limit_s, "tested tree", "rev-parse", f"{tested_sha}^{{tree}}")
+    if not (landed_tree_res.ok and tested_tree_res.ok):
+        return False, "tree-resolution-failed", "failed to resolve landed or tested tree in git", None
+    if landed_tree_res.output.strip() != tested_tree_res.output.strip():
+        return False, "invalid-landing-relationship", f"landed tree {landed_tree_res.output.strip()} does not match tested tree {tested_tree_res.output.strip()}", None
 
     rem_base = gitio.remote_ref(repo, base_branch)
     if not rem_base or not SHA40_RE.fullmatch(rem_base):

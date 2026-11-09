@@ -323,6 +323,59 @@ class IntegrationBehaviorTest(unittest.TestCase):
                 res = self._call(ctx, gate, b_branch)
                 self.assertEqual((res.status, res.outcome), ("landed-commit-not-on-base", "rejected"))
 
+    def test_confirm_landing_requires_tested_sha_proof(self) -> None:
+        """_confirm_landing helper fails closed when tested_sha is None or empty with otherwise valid landing evidence."""
+        import time
+        with tempfile.TemporaryDirectory() as tmp_str:
+            with setup_disposable_delivery_context(Path(tmp_str)) as ctx:
+                gate, b_branch = self._setup_ctx(ctx)
+                # First run successful integration so PR is merged and repo has landed commit
+                res = self._call(ctx, gate, b_branch)
+                self.assertEqual((res.status, res.outcome), ("confirmed", "confirmed"))
+                landed_sha = res.landed_sha
+                self.assertIsNotNone(landed_sha)
+                tested_sha = gate.get("tested_sha")
+                self.assertTrue(bool(tested_sha))
+
+                # 1. Valid-proof control succeeds
+                trace_control: list[dict[str, Any]] = []
+                ok, status, msg, confirmed_sha = integration_mod._confirm_landing(
+                    repo=ctx.repo, eff_base_url=ctx.gh.base_url, eff_token="disposable-token",
+                    repo_slug="example/chat-bridge", pr_number=1,
+                    candidate_sha=ctx.cand_sha, base_sha=ctx.base_sha,
+                    tested_sha=tested_sha, head_branch=ctx.head_branch, base_branch=b_branch,
+                    merge_method="merge", trace=trace_control, dl=time.monotonic() + 30.0, limit_s=30,
+                )
+                self.assertTrue(ok)
+                self.assertEqual(status, "confirmed")
+                self.assertEqual(confirmed_sha, landed_sha)
+
+                # 2. tested_sha=None fails closed with unverifiable-landing-relationship
+                trace_none: list[dict[str, Any]] = []
+                ok_none, status_none, msg_none, sha_none = integration_mod._confirm_landing(
+                    repo=ctx.repo, eff_base_url=ctx.gh.base_url, eff_token="disposable-token",
+                    repo_slug="example/chat-bridge", pr_number=1,
+                    candidate_sha=ctx.cand_sha, base_sha=ctx.base_sha,
+                    tested_sha=None, head_branch=ctx.head_branch, base_branch=b_branch,
+                    merge_method="merge", trace=trace_none, dl=time.monotonic() + 30.0, limit_s=30,
+                )
+                self.assertFalse(ok_none)
+                self.assertEqual(status_none, "unverifiable-landing-relationship")
+                self.assertIsNone(sha_none)
+
+                # 3. tested_sha="" fails closed with unverifiable-landing-relationship
+                trace_empty: list[dict[str, Any]] = []
+                ok_empty, status_empty, msg_empty, sha_empty = integration_mod._confirm_landing(
+                    repo=ctx.repo, eff_base_url=ctx.gh.base_url, eff_token="disposable-token",
+                    repo_slug="example/chat-bridge", pr_number=1,
+                    candidate_sha=ctx.cand_sha, base_sha=ctx.base_sha,
+                    tested_sha="", head_branch=ctx.head_branch, base_branch=b_branch,
+                    merge_method="merge", trace=trace_empty, dl=time.monotonic() + 30.0, limit_s=30,
+                )
+                self.assertFalse(ok_empty)
+                self.assertEqual(status_empty, "unverifiable-landing-relationship")
+                self.assertIsNone(sha_empty)
+
     def test_retry_reconciliation_and_retained_confirmed_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_str:
             with setup_disposable_delivery_context(Path(tmp_str)) as ctx:
