@@ -73,6 +73,15 @@ The script demonstrates, in order:
 3. **Permission denial**: Merge mutation rejected by provider with HTTP 403 preserves approval status while rejecting completion (`denied-permissions`).
 4. **Uncertain outcome**: Merge mutation transport error yields `uncertain` status without issuing duplicate mutation, preserving evidence for recovery.
 
+## Repeatable Protected Qualification Harness (`#67`)
+
+Protected repository qualification exercises delivery and integration against allowlisted disposable repository `turbo-factory/turbo-qual-67`. See [`docs/delivery/qualification-setup.md`](qualification-setup.md) for complete setup, token capability requirements, and the parent `#24` evidence index:
+
+```sh
+DEMO_KEEP_EVIDENCE_DIR="$(mktemp -d /tmp/turbo-qual-67.XXXXXX)" \
+  bash scripts/qualify-protected-demo.sh --mode offline
+```
+
 ## Truth Boundaries and Provenance
 
 Fixture-based success in disposable demonstration environments establishes helper contract compliance, but **does not establish live Antigravity or hosted-provider support, merge approval (#24), or parent acceptance**.
