@@ -192,6 +192,55 @@ class DeliverIntegrationBehaviorTest(unittest.TestCase):
                 self.assertEqual(put_count_2, 1, "Resume must not issue another PUT merge mutation")
                 self.assertEqual(git(ctx.bare, "rev-parse", "refs/heads/main"), main_sha_before)
 
+    def test_confirmation_503_preserves_approval_and_resumes_without_duplicate_put(self) -> None:
+        """Returned confirmation 503 preserves approval, prevents completion, and resume completes without another PUT while main ref is unchanged."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with setup_disposable_delivery_context(root) as ctx:
+                ctx.restore_valid_evidence()
+                main_sha_before = git(ctx.bare, "rev-parse", "refs/heads/main")
+
+                orig_http = integration_mod._http_req
+                put_state = {"done": False, "fail_conf": True}
+
+                def fake_http(*args: Any, **kw: Any) -> Any:
+                    method = args[0]
+                    if method == "PUT":
+                        put_state["done"] = True
+                    elif method == "GET" and put_state["done"] and put_state["fail_conf"] and "pulls/1" in args[1]:
+                        trace = args[4]
+                        trace.append({"method": "GET", "url": args[1], "status": 503})
+                        return 503, {}, "HTTP 503 Service Unavailable"
+                    return orig_http(*args, **kw)
+
+                with patch.object(integration_mod, "_http_req", side_effect=fake_http):
+                    res1 = deliver_module.deliver_feature(ctx.paths, ctx.spec)
+
+                self.assertEqual(res1.status, "uncertain")
+                self.assertFalse(res1.merged)
+                self.assertIsNone(res1.landed_sha)
+                self.assertTrue(res1.delivery_approved)
+                self.assertEqual(res1.approval_outcome, "approved")
+                self.assertTrue((ctx.child_dir / "approval-gate.json").is_file())
+                self.assertTrue((ctx.child_dir / "integration-record.json").is_file())
+                rec1 = json.loads((ctx.child_dir / "integration-record.json").read_text(encoding="utf-8"))
+                self.assertEqual((rec1["status"], rec1["outcome"], rec1["confirmation_status"]), ("uncertain", "uncertain", "uncertain"))
+                self.assertEqual(rec1["mutation_outcome"], "succeeded")
+                self.assertEqual(rec1["approval_status"], "approved")
+                self.assertIsNone(rec1["landed_sha"])
+                put_count_1 = len([r for r in ctx.gh.requests if r["method"] == "PUT"])
+                self.assertEqual(put_count_1, 1)
+
+                # Resume delivery without fault: confirms landing without new mutation
+                put_state["fail_conf"] = False
+                res2 = deliver_module.deliver_feature(ctx.paths, ctx.spec)
+                self.assertEqual(res2.status, "completed")
+                self.assertTrue(res2.merged)
+                self.assertIsNotNone(res2.landed_sha)
+                put_count_2 = len([r for r in ctx.gh.requests if r["method"] == "PUT"])
+                self.assertEqual(put_count_2, 1, "Resume must not issue another PUT merge mutation")
+                self.assertEqual(git(ctx.bare, "rev-parse", "refs/heads/main"), main_sha_before)
+
     def test_changed_candidate_and_changed_base_prevent_new_mutation(self) -> None:
         """Changed candidate or base invalidates authorization and prevents new mutation."""
         with tempfile.TemporaryDirectory() as tmp:

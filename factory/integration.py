@@ -96,7 +96,14 @@ def _confirm_landing(
         eff_token, eff_base_url, trace, dl, limit_s,
     )
     if code != 200 or not pr_data:
-        st = "denied-permissions" if code in (401, 403) else ("pr-not-found" if code == 404 else "provider-error")
+        if code in (401, 403):
+            st = "denied-permissions"
+        elif code == 404:
+            st = "pr-not-found"
+        elif code >= 500 or code == 0:
+            st = "provider-unavailable"
+        else:
+            st = "provider-error"
         return False, st, f"authoritative PR verification failed: {err_msg or f'HTTP {code}'}", None
 
     if pr_data.get("state") != "closed" or pr_data.get("merged") is not True:
@@ -139,15 +146,17 @@ def _confirm_landing(
     if parents != [base_sha, candidate_sha]:
         return False, "invalid-landing-relationship", f"landed commit {landed_sha} parents {parents} do not match [base_sha={base_sha}, candidate_sha={candidate_sha}]", None
 
-    if tested_sha:
-        if not git_timed(repo, dl, limit_s, "inspect tested_sha", "cat-file", "-t", tested_sha).ok:
-            git_timed(repo, dl, limit_s, "fetch PR merge ref", "fetch", "-q", "--no-tags", "origin", f"refs/pull/{pr_number}/merge")
-        landed_tree_res = git_timed(repo, dl, limit_s, "landed tree", "rev-parse", f"{landed_sha}^{{tree}}")
-        tested_tree_res = git_timed(repo, dl, limit_s, "tested tree", "rev-parse", f"{tested_sha}^{{tree}}")
-        if not (landed_tree_res.ok and tested_tree_res.ok):
-            return False, "tree-resolution-failed", "failed to resolve landed or tested tree in git", None
-        if landed_tree_res.output.strip() != tested_tree_res.output.strip():
-            return False, "invalid-landing-relationship", f"landed tree {landed_tree_res.output.strip()} does not match tested tree {tested_tree_res.output.strip()}", None
+    if not (tested_sha and tested_sha.strip()):
+        return False, "unverifiable-landing-relationship", "missing tested_sha for landing proof", None
+
+    if not git_timed(repo, dl, limit_s, "inspect tested_sha", "cat-file", "-t", tested_sha).ok:
+        git_timed(repo, dl, limit_s, "fetch PR merge ref", "fetch", "-q", "--no-tags", "origin", f"refs/pull/{pr_number}/merge")
+    landed_tree_res = git_timed(repo, dl, limit_s, "landed tree", "rev-parse", f"{landed_sha}^{{tree}}")
+    tested_tree_res = git_timed(repo, dl, limit_s, "tested tree", "rev-parse", f"{tested_sha}^{{tree}}")
+    if not (landed_tree_res.ok and tested_tree_res.ok):
+        return False, "tree-resolution-failed", "failed to resolve landed or tested tree in git", None
+    if landed_tree_res.output.strip() != tested_tree_res.output.strip():
+        return False, "invalid-landing-relationship", f"landed tree {landed_tree_res.output.strip()} does not match tested tree {tested_tree_res.output.strip()}", None
 
     rem_base = gitio.remote_ref(repo, base_branch)
     if not rem_base or not SHA40_RE.fullmatch(rem_base):
@@ -317,7 +326,7 @@ def integrate_approved_child(
             blockers.append(f"reconciliation failed; remote integration state is unresolved: {r_err or f'HTTP {r_code}'}")
             return _make("uncertain", "uncertain", req_p=str(req_file))
         if r_code in (401, 403):
-            mut_outcome = "denied"
+            mut_outcome = "not-attempted"
             return _fail("denied-permissions", f"insufficient permissions to reconcile PR #{pr_number}: {r_err}", req_p=str(req_file))
         if r_code == 404:
             return _fail("pr-not-found", f"PR #{pr_number} not found during reconciliation: {r_err}", req_p=str(req_file))
@@ -337,9 +346,15 @@ def integrate_approved_child(
                 blockers.append(str(approval_mod.redact_value(f"confirmation timed out: {exc}", secrets)))
             else:
                 if not ok_conf:
-                    conf_status = st_conf
-                    return _fail(st_conf, msg_conf, req_p=str(req_file))
-                status, outcome, conf_status = "confirmed", "confirmed", "confirmed"
+                    if st_conf == "provider-unavailable":
+                        status, outcome, conf_status = "uncertain", "uncertain", "uncertain"
+                        landed_sha = None
+                        blockers.append(str(approval_mod.redact_value(msg_conf, secrets)))
+                    else:
+                        conf_status = st_conf
+                        return _fail(st_conf, msg_conf, req_p=str(req_file))
+                else:
+                    status, outcome, conf_status = "confirmed", "confirmed", "confirmed"
 
             rec_path_str: str | None = None
             if child_dir.exists():
@@ -466,6 +481,10 @@ def integrate_approved_child(
             else:
                 if ok_conf:
                     status, outcome, conf_status = "confirmed", "confirmed", "confirmed"
+                elif st_conf == "provider-unavailable":
+                    status, outcome, conf_status = "uncertain", "uncertain", "uncertain"
+                    landed_sha = None
+                    blockers.append(str(approval_mod.redact_value(msg_conf, secrets)))
                 else:
                     status, outcome, conf_status = st_conf, "rejected", st_conf
                     landed_sha = None
