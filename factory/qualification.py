@@ -1360,7 +1360,7 @@ def run_scenario_3_competing_base_rejection(
         nonlocal new_base_b_prime
         m_code, m_data, m_msg = _http_req(
             "PUT", f"{base_url.rstrip('/')}/repos/{repo_slug}/pulls/{adv_pr_num}/merge",
-            competitor_token, base_url, [], time.monotonic() + 15.0, 15,
+            integrator_token, base_url, [], time.monotonic() + 15.0, 15,
             payload={"merge_method": "merge", "commit_title": f"Merge advance PR #{adv_pr_num}"},
         )
         adv_merge_obs.update({"code": m_code, "data": m_data, "msg": m_msg})
