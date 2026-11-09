@@ -1063,7 +1063,30 @@ def run_scenario_1_confirmed_landing(
     if not allow_test_origin:
         cand_sha, _ = create_qualification_candidate_commit(
             base_url, repo_slug, base_sha, cand_branch, integrator_token,
-            file_changes={"src/calc.py": "# arithmetic candidate 1\n", "tests/test_calc.py": "# candidate tests\n"},
+            file_changes={
+                "src/calc.py": (
+                    '"""Minimal product fixture for qualification (#67)."""\n\n'
+                    'def add(a: int, b: int) -> int:\n'
+                    '    return a + b\n\n'
+                    'def multiply(a: int, b: int) -> int:\n'
+                    '    return a * b\n\n'
+                    'def subtract(a: int, b: int) -> int:\n'
+                    '    return a - b\n'
+                ),
+                "tests/test_calc.py": (
+                    'import unittest\n'
+                    'from src.calc import add, multiply, subtract\n\n'
+                    'class CalcTest(unittest.TestCase):\n'
+                    '    def test_add(self):\n'
+                    '        self.assertEqual(add(2, 3), 5)\n'
+                    '    def test_multiply(self):\n'
+                    '        self.assertEqual(multiply(3, 4), 12)\n'
+                    '    def test_subtract(self):\n'
+                    '        self.assertEqual(subtract(5, 2), 3)\n\n'
+                    'if __name__ == "__main__":\n'
+                    '    unittest.main()\n'
+                ),
+            },
             message="feat: qualification arithmetic candidate 1 (#67)",
             actor="integrator", ledger=sc_ledger,
         )
@@ -1079,6 +1102,9 @@ def run_scenario_1_confirmed_landing(
     ci_ok, ci_rec, ci_blks = (True, {"status": "verified"}, []) if allow_test_origin else poll_ci_check(
         base_url, repo_slug, cand_sha, base_sha, integrator_token, ledger=sc_ledger,
     )
+    if allow_test_origin:
+        from support import git
+        git(ctx.bare, "update-ref", f"refs/heads/{cand_branch}", cand_sha)
 
     code_rev, rev_sub, rev_msg = submit_qualification_pr_review(
         base_url, repo_slug, pr_num, cand_sha, event="APPROVE",
@@ -1090,13 +1116,19 @@ def run_scenario_1_confirmed_landing(
         expected_reviewer="cone-orgs", token=integrator_token, ledger=sc_ledger,
     )
 
+    sc1_child = safe_dir(ctx.home / "attempt-sc1", create=True)
+    if hasattr(ctx, "backup_child_dir") and ctx.backup_child_dir.exists():
+        shutil.copytree(ctx.backup_child_dir, sc1_child, dirs_exist_ok=True)
+    else:
+        sc1_child = ctx.child_dir
+
     gate = deliver_module.enforce_delivery_approval(
         candidate_sha=cand_sha, base_sha=base_sha, repo=ctx.repo, home=ctx.home,
-        child_dir=ctx.child_dir, child=ctx.child_contract, conf=ctx.conf,
+        child_dir=sc1_child, child=ctx.child_contract, conf=ctx.conf,
     )
 
     int_res = integrate_approved_child(
-        repo=ctx.repo, home=ctx.home, child_dir=ctx.child_dir, child=ctx.child_contract,
+        repo=ctx.repo, home=ctx.home, child_dir=sc1_child, child=ctx.child_contract,
         conf=ctx.conf, pr_number=pr_num, candidate_sha=cand_sha, base_sha=base_sha,
         head_branch=cand_branch, base_branch=base_branch, approval_record=gate,
         repo_slug=repo_slug, base_url=base_url, token=integrator_token,
@@ -1175,7 +1207,7 @@ def run_scenario_2_prereq_missing_and_denied(
     if not allow_test_origin:
         create_qualification_candidate_commit(
             base_url, repo_slug, base_sha, unapp_branch, integrator_token,
-            file_changes={"src/calc.py": "# unapproved candidate\n"},
+            file_changes={"README.md": "# Turbo Qualification Demo\nUnapproved candidate for protection denial.\n"},
             message="feat: unapproved candidate (#67)",
             actor="integrator", ledger=sc_ledger,
         )
@@ -1185,14 +1217,23 @@ def run_scenario_2_prereq_missing_and_denied(
         body="Negative review protection test. Refs #67.",
         token=integrator_token, actor="integrator", ledger=sc_ledger,
     )
+    if allow_test_origin:
+        from support import git
+        git(ctx.bare, "update-ref", f"refs/heads/{unapp_branch}", cand_sha)
     unapp_pr_num = pr_unapp.get("number", 2)
+
+    sc2_child = safe_dir(ctx.home / "attempt-sc2", create=True)
+    if hasattr(ctx, "backup_child_dir") and ctx.backup_child_dir.exists():
+        shutil.copytree(ctx.backup_child_dir, sc2_child, dirs_exist_ok=True)
+    else:
+        sc2_child = ctx.child_dir
 
     gate_valid = deliver_module.enforce_delivery_approval(
         candidate_sha=cand_sha, base_sha=base_sha, repo=ctx.repo, home=ctx.home,
-        child_dir=ctx.child_dir, child=ctx.child_contract, conf=ctx.conf,
+        child_dir=sc2_child, child=ctx.child_contract, conf=ctx.conf,
     )
     res_prot = integrate_approved_child(
-        repo=ctx.repo, home=ctx.home, child_dir=ctx.child_dir, child=ctx.child_contract,
+        repo=ctx.repo, home=ctx.home, child_dir=sc2_child, child=ctx.child_contract,
         conf=ctx.conf, pr_number=unapp_pr_num, candidate_sha=cand_sha, base_sha=base_sha,
         head_branch=unapp_branch, base_branch=base_branch, approval_record=gate_valid,
         repo_slug=repo_slug, base_url=base_url, token=integrator_token,
@@ -1203,7 +1244,7 @@ def run_scenario_2_prereq_missing_and_denied(
 
     # 4. Actual permission denial (call integration with competitor token)
     res_perm = integrate_approved_child(
-        repo=ctx.repo, home=ctx.home, child_dir=ctx.child_dir, child=ctx.child_contract,
+        repo=ctx.repo, home=ctx.home, child_dir=sc2_child, child=ctx.child_contract,
         conf=ctx.conf, pr_number=unapp_pr_num, candidate_sha=cand_sha, base_sha=base_sha,
         head_branch=unapp_branch, base_branch=base_branch, approval_record=gate_valid,
         repo_slug=repo_slug, base_url=base_url, token=competitor_token,
@@ -1270,7 +1311,30 @@ def run_scenario_3_competing_base_rejection(
     if not allow_test_origin:
         cand_sha, _ = create_qualification_candidate_commit(
             base_url, repo_slug, base_sha_b, cand_branch, integrator_token,
-            file_changes={"src/calc.py": "# candidate sc3\n"},
+            file_changes={
+                "src/calc.py": (
+                    '"""Minimal product fixture for qualification (#67)."""\n\n'
+                    'def add(a: int, b: int) -> int:\n'
+                    '    return a + b\n\n'
+                    'def multiply(a: int, b: int) -> int:\n'
+                    '    return a * b\n\n'
+                    'def divide(a: int, b: int) -> int:\n'
+                    '    return a // b\n'
+                ),
+                "tests/test_calc.py": (
+                    'import unittest\n'
+                    'from src.calc import add, multiply, divide\n\n'
+                    'class CalcTest(unittest.TestCase):\n'
+                    '    def test_add(self):\n'
+                    '        self.assertEqual(add(2, 3), 5)\n'
+                    '    def test_multiply(self):\n'
+                    '        self.assertEqual(multiply(2, 3), 6)\n'
+                    '    def test_divide(self):\n'
+                    '        self.assertEqual(divide(6, 2), 3)\n\n'
+                    'if __name__ == "__main__":\n'
+                    '    unittest.main()\n'
+                ),
+            },
             message="feat: candidate for competing base rejection (#67)",
             actor="integrator", ledger=sc_ledger,
         )
@@ -1322,13 +1386,21 @@ def run_scenario_3_competing_base_rejection(
         _, new_c, _ = get_remote_commit(base_url, repo_slug, base_branch, integrator_token, ledger=sc_ledger)
         new_base_b_prime = new_c.get("sha", base_sha_b)
 
+    sc3_child = safe_dir(ctx.home / "attempt-sc3", create=True)
+    if hasattr(ctx, "backup_child_dir") and ctx.backup_child_dir.exists():
+        shutil.copytree(ctx.backup_child_dir, sc3_child, dirs_exist_ok=True)
+    else:
+        sc3_child = ctx.child_dir
+
     gate_cand = deliver_module.enforce_delivery_approval(
         candidate_sha=cand_sha, base_sha=base_sha_b, repo=ctx.repo, home=ctx.home,
-        child_dir=ctx.child_dir, child=ctx.child_contract, conf=ctx.conf,
+        child_dir=sc3_child, child=ctx.child_contract, conf=ctx.conf,
     )
 
     hook_fn = _merge_advance_at_boundary if not allow_test_origin else None
     if allow_test_origin:
+        from support import git
+        git(ctx.bare, "update-ref", f"refs/heads/{cand_branch}", cand_sha)
         def _adv_offline():
             from support import git
             nonlocal new_base_b_prime
@@ -1337,7 +1409,7 @@ def run_scenario_3_competing_base_rejection(
         hook_fn = _adv_offline
 
     res_cand = integrate_approved_child(
-        repo=ctx.repo, home=ctx.home, child_dir=ctx.child_dir, child=ctx.child_contract,
+        repo=ctx.repo, home=ctx.home, child_dir=sc3_child, child=ctx.child_contract,
         conf=ctx.conf, pr_number=cand_pr_num, candidate_sha=cand_sha, base_sha=base_sha_b,
         head_branch=cand_branch, base_branch=base_branch, approval_record=gate_cand,
         repo_slug=repo_slug, base_url=base_url, token=integrator_token,
@@ -1397,9 +1469,15 @@ def run_scenario_4_renewed_verification_after_base_change(
 
     main_sha_before = gitio.remote_ref(ctx.repo, "main") or gitio.commit_sha(ctx.repo, "refs/heads/main")
 
+    sc4_old_child = safe_dir(ctx.home / "attempt-sc4-old", create=True)
+    if hasattr(ctx, "backup_child_dir") and ctx.backup_child_dir.exists():
+        shutil.copytree(ctx.backup_child_dir, sc4_old_child, dirs_exist_ok=True)
+    else:
+        sc4_old_child = ctx.child_dir
+
     stale_gate = deliver_module.enforce_delivery_approval(
         candidate_sha=ctx.cand_sha, base_sha=base_sha_b_prime, repo=ctx.repo, home=ctx.home,
-        child_dir=ctx.child_dir, child=ctx.child_contract, conf=ctx.conf,
+        child_dir=sc4_old_child, child=ctx.child_contract, conf=ctx.conf,
     )
     old_evidence_rejected = (stale_gate.get("delivery_approved") is False)
 
@@ -1411,6 +1489,10 @@ def run_scenario_4_renewed_verification_after_base_change(
             token=integrator_token, actor="integrator", ledger=sc_ledger,
         )
         cand_sha_c_prime = m_obj.get("sha", ctx.cand_sha)
+    else:
+        from support import git
+        cand_sha_c_prime = git(ctx.bare, "-c", "user.name=CI", "-c", "user.email=ci@test", "commit-tree", f"{cand_sha_c_prime}^{{tree}}", "-p", cand_sha_c_prime, "-p", base_sha_b_prime, "-m", "Merge base")
+        git(ctx.bare, "update-ref", f"refs/heads/{cand_branch}", cand_sha_c_prime)
 
     if not allow_test_origin:
         poll_ci_check(base_url, repo_slug, cand_sha_c_prime, base_sha_b_prime, integrator_token, ledger=sc_ledger)
