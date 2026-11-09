@@ -702,6 +702,8 @@ class HostedScenariosExecutionTest(unittest.TestCase):
                         "feat/qual-unapp-sc2-r2": ctx.cand_sha,
                         "feat/qual-cand-sc3-r2": ctx.cand_sha,
                         "feat/qual-adv-sc3-r2": ctx.cand_sha,
+                        "feat/qual-cand-sc3-r3": ctx.cand_sha,
+                        "feat/qual-adv-sc3-r3": ctx.cand_sha,
                         "feature/demo": ctx.base_sha,
                     }
                     # Scenario 1: Confirmed landing
