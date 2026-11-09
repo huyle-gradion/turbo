@@ -30,23 +30,26 @@ CALC_CANDIDATE_SRC = (
     '"""Minimal product fixture for qualification (#67)."""\n\n'
     'def add(a: int, b: int) -> int:\n    return a + b\n\n'
     'def multiply(a: int, b: int) -> int:\n    return a * b\n\n'
-    'def subtract(a: int, b: int) -> int:\n    return a - b\n'
+    'def subtract(a: int, b: int) -> int:\n    return a - b\n\n'
+    'def power(a: int, b: int) -> int:\n    return a ** b\n'
 )
 CALC_CANDIDATE_TEST = (
-    'import unittest\nfrom src.calc import add, multiply, subtract\n\n'
-    'class CalcTest(unittest.TestCase):\n'
-    '    def test_add(self):\n        self.assertEqual(add(2, 3), 5)\n'
-    '    def test_multiply(self):\n        self.assertEqual(multiply(3, 4), 12)\n'
-    '    def test_subtract(self):\n        self.assertEqual(subtract(5, 2), 3)\n\n'
-    'if __name__ == "__main__":\n    unittest.main()\n'
-)
-CALC_SC3_SRC = CALC_CANDIDATE_SRC + '\ndef divide(a: int, b: int) -> int:\n    return a // b\n'
-CALC_SC3_TEST = (
-    'import unittest\nfrom src.calc import add, multiply, subtract, divide\n\n'
+    'import unittest\nfrom src.calc import add, multiply, subtract, power\n\n'
     'class CalcTest(unittest.TestCase):\n'
     '    def test_add(self):\n        self.assertEqual(add(2, 3), 5)\n'
     '    def test_multiply(self):\n        self.assertEqual(multiply(3, 4), 12)\n'
     '    def test_subtract(self):\n        self.assertEqual(subtract(5, 2), 3)\n'
+    '    def test_power(self):\n        self.assertEqual(power(2, 3), 8)\n\n'
+    'if __name__ == "__main__":\n    unittest.main()\n'
+)
+CALC_SC3_SRC = CALC_CANDIDATE_SRC + '\ndef divide(a: int, b: int) -> int:\n    return a // b\n'
+CALC_SC3_TEST = (
+    'import unittest\nfrom src.calc import add, multiply, subtract, power, divide\n\n'
+    'class CalcTest(unittest.TestCase):\n'
+    '    def test_add(self):\n        self.assertEqual(add(2, 3), 5)\n'
+    '    def test_multiply(self):\n        self.assertEqual(multiply(3, 4), 12)\n'
+    '    def test_subtract(self):\n        self.assertEqual(subtract(5, 2), 3)\n'
+    '    def test_power(self):\n        self.assertEqual(power(2, 3), 8)\n'
     '    def test_divide(self):\n        self.assertEqual(divide(6, 2), 3)\n\n'
     'if __name__ == "__main__":\n    unittest.main()\n'
 )
@@ -881,8 +884,11 @@ def prepare_qualification_candidate(
             if code_b == 200:
                 base_sha = b_c.get("sha", base_sha)
                 pr_base_sha = base_sha
-        code_h, h_c, _ = get_remote_commit(base_url, repo_slug, head_branch, integrator_token, ledger=local_ledger)
-        if code_h != 200:
+        open_prs = get_remote_pulls(base_url, repo_slug, head_branch, integrator_token, ledger=local_ledger)
+        if open_prs:
+            pr_data = open_prs[0]
+            pr_head_sha = pr_data.get("head", {}).get("sha", candidate_sha)
+        else:
             c_sha, _ = create_qualification_candidate_commit(
                 base_url, repo_slug, base_sha, head_branch, integrator_token,
                 file_changes={"src/calc.py": CALC_CANDIDATE_SRC, "tests/test_calc.py": CALC_CANDIDATE_TEST},
@@ -890,8 +896,6 @@ def prepare_qualification_candidate(
                 actor="integrator", ledger=local_ledger,
             )
             pr_head_sha = c_sha
-        else:
-            pr_head_sha = h_c.get("sha", candidate_sha)
 
         _, cf_src, _ = get_remote_file_content(base_url, repo_slug, "src/calc.py", head_branch, integrator_token, ledger=local_ledger)
         _, tf_tst, _ = get_remote_file_content(base_url, repo_slug, "tests/test_calc.py", head_branch, integrator_token, ledger=local_ledger)
@@ -903,21 +907,16 @@ def prepare_qualification_candidate(
             prep_blockers.append(f"head-branch-missing: {head_branch} does not exist on {repo_slug}")
 
     if not pr_data and not prep_blockers:
-        pulls_l = get_remote_pulls(base_url, repo_slug, head_branch, integrator_token, ledger=local_ledger)
-        if pulls_l:
-            pr_data = pulls_l[0]
+        code_pr, pr_res, pr_msg = create_qualification_pull_request(
+            base_url, repo_slug, head_branch, target_branch,
+            title="feat: qualification candidate arithmetic (#67)",
+            body="Genuine qualification candidate PR for issue #67. Refs #67, Refs #24.",
+            token=integrator_token, actor="integrator", ledger=local_ledger,
+        )
+        if code_pr not in (200, 201):
+            prep_blockers.append(f"pr-creation-failed: candidate PR creation returned HTTP {code_pr}: {pr_msg}")
         else:
-            code_pr, pr_res, pr_msg = create_qualification_pull_request(
-                base_url, repo_slug, head_branch, target_branch,
-                title="feat: qualification candidate arithmetic (#67)",
-                body="Genuine qualification candidate PR for issue #67. Refs #67, Refs #24.",
-                token=integrator_token, actor="integrator", ledger=local_ledger,
-            )
-            if code_pr not in (200, 201):
-                prep_blockers.append(f"pr-creation-failed: candidate PR creation returned HTTP {code_pr}: {pr_msg}")
-                pr_data = None
-            else:
-                pr_data = pr_res
+            pr_data = pr_res
 
     pr_num = (pr_data or {}).get("number", 0)
     pr_head_sha = (pr_data or {}).get("head", {}).get("sha", pr_head_sha)
@@ -1115,12 +1114,12 @@ def _prepare_approved_delivery_gate(
     from factory import independent_review
     child_dir = Path(child_dir)
     child_dir.mkdir(parents=True, exist_ok=True)
-    child_contract = {**ctx.child_contract, "head_branch": head_branch}
     if (repo / "tests/test_calc.py").is_file() or gitio.git(repo, "cat-file", "-e", f"{candidate_sha}:tests/test_calc.py").ok:
         if "AC-1" in ctx.conf.gates:
             ctx.conf.gates["AC-1"].command = "python3 -m unittest discover -s tests -p test_calc.py -v"
-        if child_contract.get("criteria"):
-            child_contract["criteria"] = [{**c, "verification": "python3 -m unittest discover -s tests -p test_calc.py -v"} for c in child_contract["criteria"]]
+        if ctx.child_contract.get("criteria"):
+            ctx.child_contract["criteria"] = [{**c, "verification": "python3 -m unittest discover -s tests -p test_calc.py -v"} for c in ctx.child_contract["criteria"]]
+    child_contract = {**ctx.child_contract, "head_branch": head_branch}
     qa_rec = _valid_qa_record(candidate_sha, base_sha, home=ctx.home)
     sec_rec = _valid_security_record(candidate_sha, base_sha, ctx.home)
     ir_rec = independent_review.review_candidate_independently(
