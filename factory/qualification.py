@@ -712,6 +712,12 @@ def create_qualification_candidate_commit(
     return commit_sha, t_sha
 
 
+def fetch_remote_repo(repo: Path, repo_slug: str, token: str) -> None:
+    """Fetch remote repository heads and pull refs using ephemeral credential."""
+    f_url = f"https://x-access-token:{token}@github.com/{repo_slug}.git"
+    subprocess.run(["git", "fetch", "-q", f_url, "+refs/heads/*:refs/remotes/origin/*", "+refs/pull/*:refs/remotes/origin/pr/*"], cwd=repo, check=True)
+
+
 def assert_landed_landing_properties(
     repo: Path,
     landed_sha: str,
@@ -720,12 +726,18 @@ def assert_landed_landing_properties(
     tested_sha: str | None,
     base_branch: str,
     main_sha_before: str,
+    *,
+    token: str | None = None,
+    repo_slug: str | None = None,
 ) -> tuple[bool, dict[str, Any], list[str]]:
     """Authoritative parent, tree, reachability, and main preservation checks."""
     blockers: list[str] = []
     details: dict[str, Any] = {}
 
-    gitio.git(repo, "fetch", "origin")
+    if token and repo_slug:
+        fetch_remote_repo(repo, repo_slug, token)
+    else:
+        gitio.git(repo, "fetch", "origin")
 
     parents_res = gitio.git(repo, "rev-list", "--parents", "-n", "1", landed_sha)
     parents = parents_res.output.strip().split()[1:] if parents_res.ok else []
@@ -1158,7 +1170,7 @@ def run_scenario_1_confirmed_landing(
         )
     sc1_child = safe_dir(ctx.home / "attempt-sc1", create=True)
     if not allow_test_origin:
-        gitio.git(ctx.repo, "fetch", "origin")
+        fetch_remote_repo(ctx.repo, repo_slug, integrator_token)
     gate = _prepare_approved_delivery_gate(ctx, ctx.repo, cand_sha, base_sha, sc1_child, cand_branch)
     child_contract = {**ctx.child_contract, "head_branch": cand_branch}
     int_res = integrate_approved_child(
@@ -1170,6 +1182,7 @@ def run_scenario_1_confirmed_landing(
     landed_sha = int_res.landed_sha
     land_ok, land_details, land_blks = (True, {}, []) if allow_test_origin else assert_landed_landing_properties(
         ctx.repo, landed_sha or "", base_sha, cand_sha, int_res.tested_sha, base_branch, main_sha_before,
+        token=integrator_token, repo_slug=repo_slug,
     )
     passed = (int_res.status == "confirmed" and bool(landed_sha) and land_ok and not ci_blks and not rev_blks)
     sc_data = {
@@ -1220,7 +1233,7 @@ def run_scenario_2_prereq_missing_and_denied(
     unapp_branch = "feat/qual-unapp-sc2-r2"
     unapp_cand_sha = cand_sha
     if not allow_test_origin:
-        gitio.git(ctx.repo, "fetch", "origin")
+        fetch_remote_repo(ctx.repo, repo_slug, integrator_token)
         code_h, h_c, _ = get_remote_commit(base_url, repo_slug, unapp_branch, integrator_token, ledger=sc_ledger)
         if code_h == 200:
             unapp_cand_sha = h_c.get("sha", cand_sha)
@@ -1298,7 +1311,7 @@ def run_scenario_3_competing_base_rejection(
     cand_branch = "feat/qual-cand-sc3-r3"
     cand_sha = ctx.cand_sha
     if not allow_test_origin:
-        gitio.git(ctx.repo, "fetch", "origin")
+        fetch_remote_repo(ctx.repo, repo_slug, integrator_token)
         cand_sha, _ = create_qualification_candidate_commit(
             base_url, repo_slug, base_sha_b, cand_branch, integrator_token,
             file_changes={"src/calc.py": CALC_SC3_SRC, "tests/test_calc.py": CALC_SC3_TEST},
@@ -1355,7 +1368,7 @@ def run_scenario_3_competing_base_rejection(
         new_base_b_prime = new_c.get("sha", base_sha_b)
     sc3_child = safe_dir(ctx.home / "attempt-sc3", create=True)
     if not allow_test_origin:
-        gitio.git(ctx.repo, "fetch", "origin")
+        fetch_remote_repo(ctx.repo, repo_slug, integrator_token)
     gate_cand = _prepare_approved_delivery_gate(ctx, ctx.repo, cand_sha, base_sha_b, sc3_child, cand_branch)
     child_c3 = {**ctx.child_contract, "head_branch": cand_branch}
     hook_fn = _merge_advance_at_boundary if not allow_test_origin else None
@@ -1425,7 +1438,7 @@ def run_scenario_4_renewed_verification_after_base_change(
         if not cand_sha_c_prime:
             _, h_c, _ = get_remote_commit(base_url, repo_slug, cand_branch, integrator_token, ledger=sc_ledger)
             cand_sha_c_prime = h_c.get("sha", ctx.cand_sha)
-        gitio.git(ctx.repo, "fetch", "origin")
+        fetch_remote_repo(ctx.repo, repo_slug, integrator_token)
         poll_ci_check(base_url, repo_slug, cand_sha_c_prime, base_sha_b_prime, integrator_token, ledger=sc_ledger)
     else:
         from support import git
@@ -1452,6 +1465,7 @@ def run_scenario_4_renewed_verification_after_base_change(
     landed_sha = res_renewed.landed_sha
     land_ok, land_details, land_blks = (True, {}, []) if allow_test_origin else assert_landed_landing_properties(
         ctx.repo, landed_sha or "", base_sha_b_prime, cand_sha_c_prime, res_renewed.tested_sha, base_branch, main_sha_before,
+        token=integrator_token, repo_slug=repo_slug,
     )
     passed = (res_renewed.status == "confirmed" and bool(landed_sha) and land_ok and old_evidence_rejected)
     sc_data = {
@@ -1576,10 +1590,10 @@ def run_hosted_qualification(
             if not allow_test_origin:
                 live_repo_dir = ws_root / "live_repo"
                 if not live_repo_dir.exists():
-                    clone_url = f"https://github.com/{repo_slug}.git"
+                    clone_url = f"https://x-access-token:{integrator_token}@github.com/{repo_slug}.git"
                     subprocess.run(["git", "clone", "-q", clone_url, str(live_repo_dir)], check=True, capture_output=True)
-                    subprocess.run(["git", "config", "--add", "remote.origin.fetch", "+refs/pull/*:refs/remotes/origin/pr/*"], cwd=live_repo_dir, check=True, capture_output=True)
-                    subprocess.run(["git", "fetch", "origin"], cwd=live_repo_dir, check=True, capture_output=True)
+                    subprocess.run(["git", "config", "remote.origin.url", f"https://github.com/{repo_slug}.git"], cwd=live_repo_dir, check=True)
+                    fetch_remote_repo(live_repo_dir, repo_slug, integrator_token)
                 ctx.repo = live_repo_dir
 
             # 1. Scenario 1: Confirmed landing
