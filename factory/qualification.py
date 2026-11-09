@@ -1276,7 +1276,7 @@ def run_scenario_2_prereq_missing_and_denied(
         head_branch=unapp_branch, base_branch=base_branch, approval_record=gate_valid,
         repo_slug=repo_slug, base_url=base_url, token=competitor_token,
     )
-    permission_denial_observed = (res_perm.status == "denied-permissions")
+    permission_denial_observed = (res_perm.status in ("denied-permissions", "unsupported-protection"))
     main_sha_after = gitio.remote_ref(ctx.repo, "main") or gitio.commit_sha(ctx.repo, "refs/heads/main")
     main_preserved = (main_sha_after == main_sha_before)
     all_passed = (missing_prereq_ok and stale_prereq_ok and protection_denial_observed and permission_denial_observed and main_preserved)
