@@ -14,7 +14,13 @@ from factory.paths import atomic_json, safe_dir
 
 FACTORY_ROOT = Path(__file__).resolve().parents[1]
 
+HOSTED_API_ORIGIN = "https://api.github.com"
 DISPOSABLE_REPO_ALLOWLIST = frozenset(["turbo-factory/turbo-qual-67"])
+ALLOWED_TARGET_BRANCHES = frozenset(["feature/demo"])
+REQUIRED_SEED_ASSETS: tuple[tuple[str, str], ...] = (
+    (".github/workflows/ci.yml", "CI workflow"),
+    (".factory/policy.json", "factory policy"),
+)
 
 REAL_SETUP_METADATA: dict[str, Any] = {
     "repo_slug": "turbo-factory/turbo-qual-67",
@@ -55,57 +61,326 @@ PARENT_AC_DESCRIPTIONS: dict[str, str] = {
 }
 
 
-def check_hosted_authorization(repo_slug: str, live_enabled: bool) -> tuple[bool, str]:
-    """Require explicit hosted enablement and exact disposable-repository allowlist."""
+def redact_qualification_tokens(val: Any, tokens: list[str]) -> Any:
+    """Explicitly protect qualification token values in persisted data structures."""
+    toks = [t for t in tokens if t]
+    if not toks:
+        return val
+    if isinstance(val, str):
+        res = val
+        for t in toks:
+            res = res.replace(t, "[REDACTED-TOKEN]")
+        return res
+    if isinstance(val, dict):
+        return {k: redact_qualification_tokens(v, toks) for k, v in val.items()}
+    if isinstance(val, list):
+        return [redact_qualification_tokens(item, toks) for item in val]
+    return val
+
+
+class QualificationLedger:
+    """Append-only redacted operation ledger for qualification operations."""
+
+    def __init__(self, path: Path, tokens: list[str]) -> None:
+        self.path = Path(path)
+        self.tokens = [t for t in tokens if t]
+        self._seq = 0
+
+    def record(
+        self, method: str, url: str, actor: str, status_code: int,
+        error: str = "", extra: dict[str, Any] | None = None,
+    ) -> None:
+        self._seq += 1
+        entry = {
+            "seq": self._seq,
+            "timestamp": approval_mod.now(),
+            "method": method,
+            "url": url,
+            "actor": actor,
+            "status_code": status_code,
+            "error": error or None,
+            **(extra or {}),
+        }
+        redacted = redact_qualification_tokens(entry, self.tokens)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with self.path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(redacted, sort_keys=True) + "\n")
+
+
+def check_hosted_authorization(
+    repo_slug: str,
+    live_enabled: bool,
+    *,
+    base_url: str = HOSTED_API_ORIGIN,
+    target_branch: str = "feature/demo",
+    allow_test_origin: bool = False,
+) -> tuple[bool, str]:
+    """Require explicit hosted enablement, fixed origin, target branch, and exact disposable allowlist."""
     if not live_enabled:
         return False, "hosted-qualification-disabled: live hosted qualification requires TURBO_LIVE_QUALIFICATION=1"
     if repo_slug not in DISPOSABLE_REPO_ALLOWLIST:
         return False, f"repo-disallowed: {repo_slug!r} is not in disposable allowlist {sorted(DISPOSABLE_REPO_ALLOWLIST)}"
+    if target_branch not in ALLOWED_TARGET_BRANCHES:
+        return False, f"target-branch-disallowed: target branch {target_branch!r} is not an allowed qualification target {sorted(ALLOWED_TARGET_BRANCHES)}"
+    if not allow_test_origin and base_url.rstrip("/") != HOSTED_API_ORIGIN:
+        return False, f"wrong-origin: origin {base_url!r} does not match fixed hosted origin {HOSTED_API_ORIGIN}"
     return True, ""
+
+
+def observe_identity_and_permissions(
+    base_url: str,
+    repo_slug: str,
+    token: str | None,
+    expected_login: str,
+    expected_role: str,
+    role_name: str,
+    ledger: QualificationLedger | None = None,
+) -> tuple[bool, dict[str, Any], list[str]]:
+    """Observe user identity and repository permissions via GitHub API object endpoints."""
+    if not token:
+        rec = {"role": role_name, "status": "unavailable", "reason": "missing-credentials"}
+        return False, rec, [f"missing-token: {role_name} token is missing"]
+
+    trace: list[dict[str, Any]] = []
+    user_url = f"{base_url.rstrip('/')}/user"
+    code, user_data, err_msg = _http_req("GET", user_url, token, base_url, trace, time.monotonic() + 15.0, 15)
+    if ledger:
+        ledger.record("GET", user_url, role_name, code, err_msg)
+    if code != 200 or not user_data:
+        rec = {"role": role_name, "status": "identity-read-failed", "http_code": code}
+        return False, rec, [f"identity-read-failed: {role_name} identity check returned HTTP {code}: {err_msg}"]
+
+    observed_login = user_data.get("login")
+    if observed_login != expected_login:
+        rec = {"role": role_name, "status": "wrong-identity", "observed_login": observed_login, "expected_login": expected_login}
+        return False, rec, [f"wrong-identity: {role_name} token belongs to {observed_login!r}, expected {expected_login!r}"]
+
+    repo_url = f"{base_url.rstrip('/')}/repos/{repo_slug}"
+    code, repo_data, err_msg = _http_req("GET", repo_url, token, base_url, trace, time.monotonic() + 15.0, 15)
+    if ledger:
+        ledger.record("GET", repo_url, role_name, code, err_msg)
+    if code != 200 or not repo_data:
+        rec = {"role": role_name, "login": observed_login, "status": "permission-read-failed", "http_code": code}
+        return False, rec, [f"permission-read-failed: {role_name} permission check returned HTTP {code}: {err_msg}"]
+
+    perms = repo_data.get("permissions") or {}
+    if expected_role == "admin" and not perms.get("admin"):
+        rec = {"role": role_name, "login": observed_login, "permissions": perms, "status": "insufficient-permissions"}
+        return False, rec, [f"insufficient-permissions: {role_name} requires admin permissions on {repo_slug}"]
+    if expected_role == "write" and not perms.get("push"):
+        rec = {"role": role_name, "login": observed_login, "permissions": perms, "status": "insufficient-permissions"}
+        return False, rec, [f"insufficient-permissions: {role_name} requires push/write permissions on {repo_slug}"]
+
+    rec = {
+        "role": role_name,
+        "login": observed_login,
+        "expected_login": expected_login,
+        "expected_role": expected_role,
+        "observed_role": "admin" if perms.get("admin") else ("write" if perms.get("push") else "read"),
+        "permissions": perms,
+        "status": "verified",
+    }
+    return True, rec, []
+
+
+def check_branch_protection_and_topology(
+    base_url: str,
+    repo_slug: str,
+    integrator_token: str | None,
+    branches: tuple[str, ...] = ("main", "feature/demo"),
+    ledger: QualificationLedger | None = None,
+) -> tuple[bool, dict[str, Any], list[str]]:
+    """Verify both-branch protection rules, required check contexts, and ownership topology."""
+    blockers: list[str] = []
+    prot_by_branch: dict[str, Any] = {}
+    if not integrator_token:
+        blockers.append("missing-credentials: integrator token required for branch protection inspection")
+        return False, {}, blockers
+
+    trace: list[dict[str, Any]] = []
+    repo_url = f"{base_url.rstrip('/')}/repos/{repo_slug}"
+    code, repo_data, err_msg = _http_req("GET", repo_url, integrator_token, base_url, trace, time.monotonic() + 15.0, 15)
+    if ledger:
+        ledger.record("GET", repo_url, "integrator", code, err_msg)
+    if code != 200 or not repo_data:
+        blockers.append(f"topology-read-failed: repository {repo_slug} returned HTTP {code}: {err_msg}")
+        return False, {}, blockers
+
+    default_branch = repo_data.get("default_branch")
+    if default_branch != "main":
+        blockers.append(f"unsupported-topology: default branch must be 'main', observed {default_branch!r}")
+
+    for b in branches:
+        quoted = quote(b, safe="")
+        url = f"{base_url.rstrip('/')}/repos/{repo_slug}/branches/{quoted}/protection"
+        code, p_data, err_msg = _http_req("GET", url, integrator_token, base_url, trace, time.monotonic() + 15.0, 15)
+        if ledger:
+            ledger.record("GET", url, "integrator", code, err_msg)
+        if code in (401, 403):
+            blockers.append(f"unavailable-protection-capability: branch protection read on {b} returned HTTP {code} ({err_msg or 'permission denied'})")
+            continue
+        if code != 200 or not p_data:
+            blockers.append(f"unsupported-protection: branch protection read on {b} returned HTTP {code}: {err_msg}")
+            continue
+        prot_by_branch[b] = p_data
+
+        rsc = p_data.get("required_status_checks") or {}
+        admins = p_data.get("enforce_admins") or {}
+        allow_fp = p_data.get("allow_force_pushes") or {}
+        allow_del = p_data.get("allow_deletions") or {}
+        reviews = p_data.get("required_pull_request_reviews") or {}
+
+        if not isinstance(rsc, dict) or not rsc.get("strict"):
+            blockers.append(f"unsupported-protection: branch protection on {b} must require strict status checks")
+        contexts = rsc.get("contexts") if isinstance(rsc, dict) else []
+        if not contexts:
+            blockers.append(f"empty-required-check-contexts: required status check contexts on {b} are empty; qualification requires nonempty status checks")
+        if not isinstance(admins, dict) or not admins.get("enabled"):
+            blockers.append(f"unsupported-protection: branch protection on {b} must enforce admins")
+        if isinstance(allow_fp, dict) and allow_fp.get("enabled"):
+            blockers.append(f"unsupported-protection: branch protection on {b} forbids force pushes")
+        if isinstance(allow_del, dict) and allow_del.get("enabled"):
+            blockers.append(f"unsupported-protection: branch protection on {b} forbids deletions")
+        if not isinstance(reviews, dict) or reviews.get("required_approving_review_count", 0) < 1:
+            blockers.append(f"unsupported-protection: branch protection on {b} requires at least 1 approving review")
+        if not isinstance(reviews, dict) or not reviews.get("dismiss_stale_reviews"):
+            blockers.append(f"unsupported-protection: branch protection on {b} must dismiss stale reviews")
+
+    record = {
+        "repo_slug": repo_slug,
+        "default_branch": default_branch,
+        "branches_checked": list(branches),
+        "protections": prot_by_branch,
+        "status": "verified" if not blockers else "failed",
+    }
+    return len(blockers) == 0, record, blockers
+
+
+def check_seed_and_workflow_capabilities(
+    base_url: str,
+    repo_slug: str,
+    branch: str,
+    token: str | None,
+    ledger: QualificationLedger | None = None,
+) -> tuple[bool, dict[str, Any], list[str]]:
+    """Probe for seed CI workflow, product fixture, and factory policy on target branch."""
+    if not token:
+        return False, {"status": "unavailable", "reason": "missing-credentials"}, ["missing-credentials: token required for seed capability check"]
+
+    trace: list[dict[str, Any]] = []
+    observed_assets: dict[str, Any] = {}
+    blockers: list[str] = []
+
+    for path, desc in REQUIRED_SEED_ASSETS:
+        quoted_path = quote(path.lstrip("/"), safe="/")
+        url = f"{base_url.rstrip('/')}/repos/{repo_slug}/contents/{quoted_path}?ref={quote(branch, safe='')}"
+        code, data, err_msg = _http_req("GET", url, token, base_url, trace, time.monotonic() + 15.0, 15)
+        if ledger:
+            ledger.record("GET", url, "integrator", code, err_msg)
+        if code == 404:
+            blockers.append(f"missing-seed: {branch} is missing required seed asset {desc} at {path}")
+            observed_assets[path] = {"present": False, "status": "missing"}
+        elif code != 200:
+            blockers.append(f"seed-check-failed: seed check for {path} on {branch} returned HTTP {code}: {err_msg}")
+            observed_assets[path] = {"present": False, "status": f"HTTP {code}"}
+        else:
+            observed_assets[path] = {"present": True, "status": "present", "sha": data.get("sha")}
+
+    record = {
+        "branch": branch,
+        "assets": observed_assets,
+        "status": "verified" if not blockers else "incomplete",
+    }
+    return len(blockers) == 0, record, blockers
+
+
+def get_submitted_review(
+    base_url: str,
+    repo_slug: str,
+    pr_number: int,
+    review_id: int,
+    token: str,
+    trace: list[dict[str, Any]] | None = None,
+    ledger: QualificationLedger | None = None,
+) -> tuple[int, dict[str, Any], str]:
+    """Read a submitted pull request review by explicit ID from object endpoint."""
+    url = f"{base_url.rstrip('/')}/repos/{repo_slug}/pulls/{pr_number}/reviews/{review_id}"
+    tr = trace if trace is not None else []
+    code, data, msg = _http_req("GET", url, token, base_url, tr, time.monotonic() + 15.0, 15)
+    if ledger:
+        ledger.record("GET", url, "integrator", code, msg)
+    return code, data, msg
 
 
 def check_credentials_and_capabilities(
     base_url: str, repo_slug: str, branch: str,
     integrator_token: str | None, competitor_token: str | None,
+    *,
+    branches: tuple[str, ...] = ("main", "feature/demo"),
 ) -> tuple[bool, dict[str, Any], list[str]]:
     """Detect missing credentials and unavailable protection capabilities."""
-    blockers: list[str] = []
     if not integrator_token or not competitor_token:
-        blockers.append("missing-credentials: both TURBO_QUAL_INTEGRATOR_TOKEN and TURBO_QUAL_COMPETITOR_TOKEN are required")
-        return False, {}, blockers
+        return False, {}, ["missing-credentials: both TURBO_QUAL_INTEGRATOR_TOKEN and TURBO_QUAL_COMPETITOR_TOKEN are required"]
+    ok, rec, blockers = check_branch_protection_and_topology(
+        base_url, repo_slug, integrator_token, branches=branches,
+    )
+    return ok, rec.get("protections", {}).get(branch, rec), blockers
 
-    trace: list[dict[str, Any]] = []
-    quoted_branch = quote(branch, safe="")
-    url = f"{base_url.rstrip('/')}/repos/{repo_slug}/branches/{quoted_branch}/protection"
-    code, prot_data, err_msg = _http_req("GET", url, integrator_token, base_url, trace, time.monotonic() + 15.0, 15)
 
-    if code in (401, 403):
-        blockers.append(
-            f"unavailable-protection-capability: branch protection read returned HTTP {code} "
-            f"({err_msg or 'protection read permission required'})"
-        )
-        return False, {}, blockers
-    if code != 200 or not prot_data:
-        blockers.append(f"unsupported-protection: branch protection read returned HTTP {code}: {err_msg}")
-        return False, {}, blockers
+def reduce_evidence_index(
+    parent_index: dict[str, Any],
+    preflight: dict[str, Any],
+    scenarios: dict[str, Any],
+) -> tuple[dict[str, Any], bool, list[str]]:
+    """Reduce parent evidence index over required subchecks, artifacts, and simulation status."""
+    reduced_index: dict[str, Any] = {}
+    reduction_blockers: list[str] = []
+    all_qualified = True
 
-    rsc = prot_data.get("required_status_checks") or {}
-    admins = prot_data.get("enforce_admins") or {}
-    allow_fp = prot_data.get("allow_force_pushes") or {}
-    allow_del = prot_data.get("allow_deletions") or {}
+    preflight_ok = preflight.get("status") == "verified"
+    if not preflight_ok:
+        reduction_blockers.extend(preflight.get("blockers", []))
 
-    if not isinstance(rsc, dict) or not rsc.get("strict"):
-        blockers.append(f"unsupported-protection: branch protection on {branch} must require strict status checks")
-    if not isinstance(admins, dict) or not admins.get("enabled"):
-        blockers.append(f"unsupported-protection: branch protection on {branch} must enforce admins")
-    if isinstance(allow_fp, dict) and allow_fp.get("enabled"):
-        blockers.append(f"unsupported-protection: branch protection on {branch} forbids force pushes")
-    if isinstance(allow_del, dict) and allow_del.get("enabled"):
-        blockers.append(f"unsupported-protection: branch protection on {branch} forbids deletions")
+    for ac_id, entry in parent_index.items():
+        ac_entry = dict(entry)
+        subchecks_status: dict[str, str] = {}
+        missing_artifacts: list[str] = []
 
-    if blockers:
-        return False, prot_data, blockers
-    return True, prot_data, []
+        for ap in ac_entry.get("artifact_paths", []):
+            if not Path(ap).exists():
+                missing_artifacts.append(ap)
+
+        if missing_artifacts:
+            subchecks_status["artifacts"] = "missing"
+            reduction_blockers.append(f"missing-artifacts: {ac_id} is missing artifacts: {missing_artifacts}")
+        else:
+            subchecks_status["artifacts"] = "verified"
+
+        simulated = any(scenarios.get(sn, {}).get("simulated", False) for sn in ac_entry.get("scenarios", [])) or preflight.get("simulated", False)
+        if simulated:
+            subchecks_status["hosted_scenarios"] = "simulated"
+            ac_entry["hosted_proof_status"] = "PENDING"
+            ac_entry["outcome"] = "passed-offline-simulated"
+        else:
+            all_passed = bool(scenarios) and all(
+                scenarios.get(sn, {}).get("outcome") in ("passed", "verified") for sn in ac_entry.get("scenarios", [])
+            )
+            if all_passed and not missing_artifacts and preflight_ok:
+                subchecks_status["hosted_scenarios"] = "verified"
+                ac_entry["hosted_proof_status"] = "VERIFIED"
+                ac_entry["outcome"] = "hosted-verified"
+            else:
+                subchecks_status["hosted_scenarios"] = "unperformed-or-failed"
+                ac_entry["hosted_proof_status"] = "PENDING"
+                ac_entry["outcome"] = "unavailable"
+
+        ac_entry["subchecks"] = subchecks_status
+        if ac_entry["hosted_proof_status"] != "VERIFIED":
+            all_qualified = False
+
+        reduced_index[ac_id] = ac_entry
+
+    return reduced_index, all_qualified, reduction_blockers
 
 
 def build_parent_evidence_index(scenarios: dict[str, Any], factory_rev: str) -> dict[str, Any]:
@@ -147,7 +422,7 @@ def build_parent_evidence_index(scenarios: dict[str, Any], factory_rev: str) -> 
             "base_revision": b_sha,
             "tested_revision": t_sha,
             "landed_revision": l_sha,
-            "outcome": "passed-offline-simulated",
+            "outcome": "passed-offline-simulated" if scenarios else "unavailable",
             "hosted_proof_status": "PENDING",
             "artifact_paths": all_artifacts,
         }
@@ -159,48 +434,100 @@ def run_hosted_qualification(
     live_enabled: bool = False,
     integrator_token: str | None = None,
     competitor_token: str | None = None,
-    base_url: str = "https://api.github.com",
+    base_url: str = HOSTED_API_ORIGIN,
     branch: str = "feature/demo",
+    allow_test_origin: bool = False,
 ) -> dict[str, Any]:
     """Execute hosted qualification or retain explicit blocked/unavailable status without mutation."""
     evidence_dir = Path(evidence_dir)
     evidence_dir.mkdir(parents=True, exist_ok=True)
     f_rev = _factory_rev()
+    tokens = [integrator_token or "", competitor_token or ""]
+    ledger = QualificationLedger(evidence_dir / "operation-ledger.jsonl", tokens)
 
-    auth_ok, auth_msg = check_hosted_authorization(repo_slug, live_enabled)
+    auth_ok, auth_msg = check_hosted_authorization(
+        repo_slug, live_enabled, base_url=base_url, target_branch=branch, allow_test_origin=allow_test_origin,
+    )
     if not auth_ok:
         res = {
             "schema": 1, "role": "hosted-qualification-summary", "factory_revision": f_rev,
             "status": "blocked", "outcome": "unavailable", "qualified": False,
             "repo_slug": repo_slug, "blockers": [auth_msg], "scenarios": {},
-            "parent_evidence_index": {}, "mode": "hosted", "simulated": False,
+            "parent_evidence_index": {}, "mode": "hosted", "simulated": allow_test_origin,
             "recorded_at": approval_mod.now(),
         }
-        atomic_json(evidence_dir / "qualification-summary.json", res, evidence_dir)
+        atomic_json(evidence_dir / "qualification-summary.json", redact_qualification_tokens(res, tokens), evidence_dir)
         return res
 
-    cap_ok, prot_data, cap_blockers = check_credentials_and_capabilities(
-        base_url, repo_slug, branch, integrator_token, competitor_token,
-    )
-    if not cap_ok:
+    if not integrator_token or not competitor_token:
+        blockers = ["missing-credentials: both TURBO_QUAL_INTEGRATOR_TOKEN and TURBO_QUAL_COMPETITOR_TOKEN are required"]
+        unavail = {"status": "unavailable", "reason": "missing-credentials"}
+        preflight_record = {
+            "schema": 1, "role": "hosted-preflight-observations", "repo_slug": repo_slug,
+            "status": "unavailable", "identities": {"integrator": unavail, "competitor": unavail},
+            "topology": unavail, "seed_capabilities": unavail, "blockers": blockers,
+            "simulated": allow_test_origin, "recorded_at": approval_mod.now(),
+        }
         res = {
             "schema": 1, "role": "hosted-qualification-summary", "factory_revision": f_rev,
             "status": "blocked", "outcome": "unavailable", "qualified": False,
-            "repo_slug": repo_slug, "blockers": cap_blockers,
-            "protection_observed": prot_data, "scenarios": {},
-            "parent_evidence_index": {}, "mode": "hosted", "simulated": False,
-            "recorded_at": approval_mod.now(),
+            "repo_slug": repo_slug, "blockers": blockers, "preflight": preflight_record,
+            "scenarios": {}, "parent_evidence_index": {}, "mode": "hosted",
+            "simulated": allow_test_origin, "recorded_at": approval_mod.now(),
         }
-        atomic_json(evidence_dir / "qualification-summary.json", res, evidence_dir)
+        atomic_json(evidence_dir / "preflight-observations.json", redact_qualification_tokens(preflight_record, tokens), evidence_dir)
+        atomic_json(evidence_dir / "qualification-summary.json", redact_qualification_tokens(res, tokens), evidence_dir)
         return res
 
+    # 1. Identity & permissions observations
+    ok_int, obs_int, int_blockers = observe_identity_and_permissions(
+        base_url, repo_slug, integrator_token, expected_login="huyhuyhuy8s",
+        expected_role="admin", role_name="integrator", ledger=ledger,
+    )
+    ok_comp, obs_comp, comp_blockers = observe_identity_and_permissions(
+        base_url, repo_slug, competitor_token, expected_login="cone-orgs",
+        expected_role="write", role_name="competitor", ledger=ledger,
+    )
+
+    # 2. Both-branch protection and topology preflight
+    ok_prot, top_rec, prot_blockers = check_branch_protection_and_topology(
+        base_url, repo_slug, integrator_token, branches=("main", branch), ledger=ledger,
+    )
+
+    # 3. Seed capabilities
+    ok_seed, seed_rec, seed_blockers = check_seed_and_workflow_capabilities(
+        base_url, repo_slug, branch, integrator_token, ledger=ledger,
+    )
+
+    all_preflight_blockers = int_blockers + comp_blockers + prot_blockers + seed_blockers
+    preflight_record = {
+        "schema": 1, "role": "hosted-preflight-observations", "repo_slug": repo_slug,
+        "base_url": base_url, "target_branch": branch,
+        "identities": {"integrator": obs_int, "competitor": obs_comp},
+        "topology": top_rec, "seed_capabilities": seed_rec,
+        "blockers": all_preflight_blockers,
+        "status": "verified" if not all_preflight_blockers else "blocked",
+        "simulated": allow_test_origin,
+        "recorded_at": approval_mod.now(),
+    }
+
+    # 4. Evidence index reduction
+    parent_index = build_parent_evidence_index({}, f_rev)
+    reduced_index, _, red_blockers = reduce_evidence_index(parent_index, preflight_record, {})
+
+    # Hosted scenarios are pending human setup
+    final_blockers = list(all_preflight_blockers) + ["hosted-scenarios-pending-human-setup"]
     res = {
         "schema": 1, "role": "hosted-qualification-summary", "factory_revision": f_rev,
         "status": "blocked", "outcome": "unavailable", "qualified": False,
-        "repo_slug": repo_slug, "blockers": ["hosted-scenarios-pending-human-setup"],
-        "mode": "hosted", "simulated": False, "recorded_at": approval_mod.now(),
+        "repo_slug": repo_slug, "blockers": final_blockers,
+        "preflight": preflight_record, "scenarios": {},
+        "parent_evidence_index": reduced_index, "mode": "hosted",
+        "simulated": allow_test_origin, "recorded_at": approval_mod.now(),
     }
-    atomic_json(evidence_dir / "qualification-summary.json", res, evidence_dir)
+    atomic_json(evidence_dir / "preflight-observations.json", redact_qualification_tokens(preflight_record, tokens), evidence_dir)
+    atomic_json(evidence_dir / "parent-evidence-index.json", redact_qualification_tokens(reduced_index, tokens), evidence_dir)
+    atomic_json(evidence_dir / "qualification-summary.json", redact_qualification_tokens(res, tokens), evidence_dir)
     return res
 
 
@@ -370,16 +697,20 @@ def run_offline_qualification(evidence_dir: Path) -> dict[str, Any]:
         })
 
     parent_index = build_parent_evidence_index(scenarios, f_rev)
+    reduced_index, all_qualified, red_blockers = reduce_evidence_index(
+        parent_index, {"status": "offline-simulated", "simulated": True}, scenarios,
+    )
     summary = {
         "schema": 1, "role": "offline-qualification-summary", "factory_revision": f_rev,
         "status": "preparation-complete", "outcome": "offline-simulated-verified",
         "qualified": False, "mode": "offline-simulated", "simulated": True,
         "disclaimer": "Offline simulated proof; not parent acceptance. Hosted qualification PENDING.",
-        "scenarios": scenarios, "parent_evidence_index": parent_index,
+        "scenarios": scenarios, "parent_evidence_index": reduced_index,
+        "reduction_blockers": red_blockers,
         "recorded_at": approval_mod.now(),
     }
     atomic_json(evidence_dir / "qualification-summary.json", summary, evidence_dir)
-    atomic_json(evidence_dir / "parent-evidence-index.json", parent_index, evidence_dir)
+    atomic_json(evidence_dir / "parent-evidence-index.json", reduced_index, evidence_dir)
     return summary
 
 
