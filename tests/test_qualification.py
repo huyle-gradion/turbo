@@ -1,13 +1,14 @@
 """Tests for protected repository qualification harness (#67)."""
 from __future__ import annotations
 
-import json, os, shutil, tempfile, threading, unittest
+import base64, json, os, shutil, tempfile, threading, unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlparse
 
 from factory.qualification import (
+    CALC_CANDIDATE_SRC, CALC_CANDIDATE_TEST,
     DISPOSABLE_REPO_ALLOWLIST, REQUIRED_SEED_ASSETS, SEED_ASSETS_DIR,
     assert_landed_landing_properties,
     build_parent_evidence_index, check_branch_protection_and_topology,
@@ -58,8 +59,8 @@ class _HostedQualificationFakeServer:
         self.contents = contents if contents is not None else {
             ".github/workflows/ci.yml": {"sha": "wf123", "name": "ci.yml"},
             ".factory/policy.json": {"sha": "pol123", "name": "policy.json"},
-            "src/calc.py": {"sha": "calc123", "name": "calc.py"},
-            "tests/test_calc.py": {"sha": "testcalc123", "name": "test_calc.py"},
+            "src/calc.py": {"sha": "calc123", "name": "calc.py", "content": base64.b64encode(b"def add(a, b): return a + b\ndef multiply(a, b): return a * b\ndef subtract(a, b): return a - b\n").decode()},
+            "tests/test_calc.py": {"sha": "testcalc123", "name": "test_calc.py", "content": base64.b64encode(b"import unittest\nclass T(unittest.TestCase):\n def test_add(self): pass\n def test_multiply(self): pass\n def test_subtract(self): pass\n").decode()},
             "qa/qa-cases.json": {"sha": "qa123", "name": "qa-cases.json"},
         }
         self.reviews = reviews if reviews is not None else {
@@ -136,7 +137,7 @@ class _HostedQualificationFakeServer:
 
                 prefix_cont = "/api/v3/repos/turbo-factory/turbo-qual-67/contents/"
                 if path.startswith(prefix_cont):
-                    cpath = unquote(path[len(prefix_cont):])
+                    cpath = unquote(path[len(prefix_cont):]).split("?")[0]
                     if cpath in outer.contents:
                         return self._send_json(200, outer.contents[cpath])
                     return self._send_json(404, {"message": "File not found"})
@@ -675,6 +676,13 @@ class QualificationCandidatePreparationTest(unittest.TestCase):
                 self.assertEqual(rec["prerequisites"]["github_review"]["state"], "APPROVED")
                 self.assertEqual(rec["builder"]["candidate_sha"], cand_sha)
 
+    def test_candidate_fixture_defines_new_operations_and_tests(self) -> None:
+        """Candidate commit fixture defines genuine operations and executable tests."""
+        for op in ("add", "multiply", "subtract"):
+            self.assertIn(f"def {op}", CALC_CANDIDATE_SRC)
+            self.assertIn(f"def test_{op}", CALC_CANDIDATE_TEST)
+        self.assertIn("class CalcTest", CALC_CANDIDATE_TEST)
+
 
 class HostedScenariosExecutionTest(unittest.TestCase):
     def test_hosted_scenarios_simulated_execution(self) -> None:
@@ -690,10 +698,10 @@ class HostedScenariosExecutionTest(unittest.TestCase):
                     from support import git
                     git(ctx.bare, "update-ref", "refs/heads/feature/demo", ctx.base_sha)
                     gh.branch_heads = {
-                        "feat/qual-cand-sc1": ctx.cand_sha,
-                        "feat/qual-unapproved-201": ctx.cand_sha,
-                        "feat/qual-cand-sc3": ctx.cand_sha,
-                        "feat/qual-adv-sc3": ctx.cand_sha,
+                        "feat/qual-candidate-101": ctx.cand_sha,
+                        "feat/qual-unapp-sc2-r2": ctx.cand_sha,
+                        "feat/qual-cand-sc3-r2": ctx.cand_sha,
+                        "feat/qual-adv-sc3-r2": ctx.cand_sha,
                         "feature/demo": ctx.base_sha,
                     }
                     # Scenario 1: Confirmed landing
@@ -702,7 +710,7 @@ class HostedScenariosExecutionTest(unittest.TestCase):
                         "valid-int-tok", "valid-comp-tok", allow_test_origin=True,
                     )
                     self.assertEqual(s1["scenario"], "confirmed_landing")
-                    self.assertEqual(s1["head_branch"], "feat/qual-cand-sc1")
+                    self.assertEqual(s1["head_branch"], "feat/qual-candidate-101")
 
                     # Scenario 2: Prereq missing and denied
                     s2 = run_scenario_2_prereq_missing_and_denied(
