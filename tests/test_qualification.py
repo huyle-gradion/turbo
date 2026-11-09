@@ -8,11 +8,15 @@ from typing import Any
 from urllib.parse import unquote, urlparse
 
 from factory.qualification import (
-    DISPOSABLE_REPO_ALLOWLIST, build_parent_evidence_index,
-    check_branch_protection_and_topology, check_credentials_and_capabilities,
-    check_hosted_authorization, check_seed_and_workflow_capabilities,
+    DISPOSABLE_REPO_ALLOWLIST, REQUIRED_SEED_ASSETS, SEED_ASSETS_DIR,
+    build_parent_evidence_index, check_branch_protection_and_topology,
+    check_credentials_and_capabilities, check_hosted_authorization,
+    check_qualification_pr_ci, check_seed_and_workflow_capabilities,
+    create_qualification_pull_request, evaluate_qualification_qa,
     get_submitted_review, observe_identity_and_permissions,
-    reduce_evidence_index, run_hosted_qualification, run_offline_qualification,
+    prepare_qualification_candidate, reduce_evidence_index,
+    run_hosted_qualification, run_offline_qualification,
+    submit_qualification_pr_review, verify_qualification_pr_review,
 )
 
 
@@ -50,10 +54,34 @@ class _HostedQualificationFakeServer:
         self.contents = contents if contents is not None else {
             ".github/workflows/ci.yml": {"sha": "wf123", "name": "ci.yml"},
             ".factory/policy.json": {"sha": "pol123", "name": "policy.json"},
+            "src/calc.py": {"sha": "calc123", "name": "calc.py"},
+            "tests/test_calc.py": {"sha": "testcalc123", "name": "test_calc.py"},
+            "qa/qa-cases.json": {"sha": "qa123", "name": "qa-cases.json"},
         }
         self.reviews = reviews if reviews is not None else {
-            42: {"id": 42, "state": "APPROVED", "user": {"login": "cone-orgs"}},
+            42: {"id": 42, "state": "APPROVED", "commit_id": "c1234567890abcdef1234567890abcdef1234567", "user": {"login": "cone-orgs"}},
+            43: {"id": 43, "state": "APPROVED", "commit_id": "c1234567890abcdef1234567890abcdef1234567", "user": {"login": "huyhuyhuy8s"}},
         }
+        self.pulls: dict[int, dict[str, Any]] = {
+            1: {
+                "number": 1,
+                "title": "Existing PR",
+                "state": "open",
+                "head": {"sha": "c1234567890abcdef1234567890abcdef1234567", "ref": "feat/qual-candidate-101"},
+                "base": {"sha": "b1234567890abcdef1234567890abcdef1234567", "ref": "feature/demo"},
+                "user": {"login": "cone-orgs"},
+            }
+        }
+        self.check_runs: list[dict[str, Any]] = [
+            {
+                "id": 501,
+                "name": "build",
+                "status": "completed",
+                "conclusion": "success",
+                "head_sha": "c1234567890abcdef1234567890abcdef1234567",
+                "app": {"slug": "github-actions"},
+            }
+        ]
         self.default_branch = default_branch
         self.requests: list[dict[str, Any]] = []
 
@@ -75,7 +103,7 @@ class _HostedQualificationFakeServer:
                 auth = self.headers.get("Authorization", "")
                 tok = auth.split("Bearer ", 1)[-1] if "Bearer " in auth else auth.split("token ", 1)[-1]
                 path = urlparse(self.path).path
-                outer.requests.append({"path": path, "token": tok})
+                outer.requests.append({"method": "GET", "path": path, "token": tok})
 
                 if path == "/api/v3/user":
                     if tok in outer.users:
@@ -108,12 +136,74 @@ class _HostedQualificationFakeServer:
                         return self._send_json(200, outer.contents[cpath])
                     return self._send_json(404, {"message": "File not found"})
 
-                prefix_rev = "/api/v3/repos/turbo-factory/turbo-qual-67/pulls/1/reviews/"
-                if path.startswith(prefix_rev):
-                    rid = int(path[len(prefix_rev):])
-                    if rid in outer.reviews:
-                        return self._send_json(200, outer.reviews[rid])
+                if "/commits/" in path and path.endswith("/check-runs"):
+                    return self._send_json(200, {"total_count": len(outer.check_runs), "check_runs": outer.check_runs})
+
+                prefix_pr = "/api/v3/repos/turbo-factory/turbo-qual-67/pulls/"
+                if path.startswith(prefix_pr) and not "/reviews" in path:
+                    pr_id_str = path[len(prefix_pr):]
+                    if pr_id_str.isdigit() and int(pr_id_str) in outer.pulls:
+                        return self._send_json(200, outer.pulls[int(pr_id_str)])
+
+                if "/reviews/" in path:
+                    prefix_rev = path[:path.rfind("/reviews/") + len("/reviews/")]
+                    rid_str = path[len(prefix_rev):]
+                    if rid_str.isdigit():
+                        rid = int(rid_str)
+                        if rid in outer.reviews:
+                            return self._send_json(200, outer.reviews[rid])
                     return self._send_json(404, {"message": "Review not found"})
+
+                return self._send_json(404, {"message": "Not Found"})
+
+            def do_POST(self) -> None:
+                auth = self.headers.get("Authorization", "")
+                tok = auth.split("Bearer ", 1)[-1] if "Bearer " in auth else auth.split("token ", 1)[-1]
+                path = urlparse(self.path).path
+                len_hdr = int(self.headers.get("Content-Length", 0))
+                raw_body = self.rfile.read(len_hdr).decode("utf-8") if len_hdr > 0 else "{}"
+                try:
+                    body = json.loads(raw_body)
+                except Exception:
+                    body = {}
+                outer.requests.append({"method": "POST", "path": path, "token": tok, "body": body})
+
+                # Create pull request
+                if path == "/api/v3/repos/turbo-factory/turbo-qual-67/pulls":
+                    pr_num = len(outer.pulls) + 1
+                    user_login = outer.users.get(tok, {}).get("login", "unknown")
+                    pr_obj = {
+                        "number": pr_num,
+                        "title": body.get("title", "Candidate PR"),
+                        "state": "open",
+                        "head": {"sha": "c1234567890abcdef1234567890abcdef1234567", "ref": body.get("head", "")},
+                        "base": {"sha": "b1234567890abcdef1234567890abcdef1234567", "ref": body.get("base", "feature/demo")},
+                        "user": {"login": user_login},
+                    }
+                    outer.pulls[pr_num] = pr_obj
+                    return self._send_json(201, pr_obj)
+
+                # Submit pull request review
+                prefix_pr_rev = "/api/v3/repos/turbo-factory/turbo-qual-67/pulls/"
+                if path.startswith(prefix_pr_rev) and path.endswith("/reviews"):
+                    user_login = outer.users.get(tok, {}).get("login", "unknown")
+                    pr_id_str = path[len(prefix_pr_rev):-len("/reviews")]
+                    pr_id = int(pr_id_str) if pr_id_str.isdigit() else 1
+                    pr_author = outer.pulls.get(pr_id, {}).get("user", {}).get("login", "cone-orgs")
+                    if user_login == pr_author:
+                        return self._send_json(422, {"message": "Unprocessable Entity: Author cannot review own PR"})
+
+                    rev_id = len(outer.reviews) + 100
+                    ev = body.get("event", "APPROVE")
+                    rev_obj = {
+                        "id": rev_id,
+                        "state": "APPROVED" if ev == "APPROVE" else ev,
+                        "commit_id": body.get("commit_id", ""),
+                        "body": body.get("body", ""),
+                        "user": {"login": user_login},
+                    }
+                    outer.reviews[rev_id] = rev_obj
+                    return self._send_json(200, rev_obj)
 
                 return self._send_json(404, {"message": "Not Found"})
 
@@ -401,6 +491,160 @@ class QualificationOfflineExecutionTest(unittest.TestCase):
                 self.assertTrue(len(entry["artifact_paths"]) >= 1)
                 for ap in entry["artifact_paths"]:
                     self.assertTrue(Path(ap).exists(), f"Artifact path {ap} does not exist")
+
+
+class QualificationCandidatePreparationTest(unittest.TestCase):
+    def test_seed_assets_integrity_and_rubric_execution(self) -> None:
+        """Validate seed assets, deterministic QA cases, and rubric execution."""
+        from factory.automated_qa import load_qa_cases_file
+
+        self.assertTrue(SEED_ASSETS_DIR.exists())
+        for path_suffix, desc in REQUIRED_SEED_ASSETS:
+            local_rel = path_suffix.replace(".factory/", "factory/")
+            full_path = SEED_ASSETS_DIR / local_rel
+            self.assertTrue(full_path.exists(), f"Missing required seed asset: {desc} at {local_rel}")
+
+        qa_file = SEED_ASSETS_DIR / "qa" / "qa-cases.json"
+        cases = load_qa_cases_file(qa_file)
+        self.assertEqual(len(cases), 2)
+        self.assertEqual(cases[0].case_id, "QA-CALC-1")
+        self.assertEqual(cases[1].case_id, "QA-CALC-2")
+
+        # Execute QA against seed product fixture
+        ok, qa_rec, blockers = evaluate_qualification_qa(SEED_ASSETS_DIR, qa_cases=cases)
+        self.assertTrue(ok)
+        self.assertEqual(qa_rec["status"], "verified")
+        self.assertTrue(qa_rec["qa_verified"])
+        self.assertEqual(len(blockers), 0)
+
+    def test_qualification_pr_creation_and_actor_separation(self) -> None:
+        """Validate candidate PR creation by competitor and rejection of self-review."""
+        with _HostedQualificationFakeServer() as gh:
+            # Competitor creates candidate PR
+            code, pr_data, msg = create_qualification_pull_request(
+                gh.base_url, "turbo-factory/turbo-qual-67", "feat/candidate-101", "feature/demo",
+                "feat: candidate PR", "Test candidate PR body", "valid-comp-tok",
+            )
+            self.assertEqual(code, 201)
+            pr_num = pr_data["number"]
+            self.assertEqual(pr_data["user"]["login"], "cone-orgs")
+
+            # Competitor attempts to review own PR -> rejected 422
+            code_self, _, _ = submit_qualification_pr_review(
+                gh.base_url, "turbo-factory/turbo-qual-67", pr_num, "c1234567890abcdef1234567890abcdef1234567",
+                "APPROVE", "Self-approval attempt", "valid-comp-tok",
+            )
+            self.assertEqual(code_self, 422)
+
+            # Integrator submits review -> accepted 200
+            code_int, rev_data, _ = submit_qualification_pr_review(
+                gh.base_url, "turbo-factory/turbo-qual-67", pr_num, "c1234567890abcdef1234567890abcdef1234567",
+                "APPROVE", "Independent approval", "valid-int-tok",
+            )
+            self.assertEqual(code_int, 200)
+            self.assertEqual(rev_data["user"]["login"], "huyhuyhuy8s")
+
+    def test_qualification_pr_review_revision_binding_and_verification(self) -> None:
+        """Review readback verifies exact candidate commit_id and independent reviewer."""
+        cand_sha = "c1234567890abcdef1234567890abcdef1234567"
+        with _HostedQualificationFakeServer() as gh:
+            # 1. Matching candidate SHA and expected reviewer
+            ok, data, blockers = verify_qualification_pr_review(
+                gh.base_url, "turbo-factory/turbo-qual-67", 1, 43, cand_sha,
+                expected_reviewer="huyhuyhuy8s", token="valid-int-tok",
+            )
+            self.assertTrue(ok)
+            self.assertEqual(data["commit_id"], cand_sha)
+            self.assertEqual(len(blockers), 0)
+
+            # 2. Candidate SHA drift
+            ok_drift, _, drift_blockers = verify_qualification_pr_review(
+                gh.base_url, "turbo-factory/turbo-qual-67", 1, 43, "stale-sha-9999999999999999999999999999999999999999",
+                expected_reviewer="huyhuyhuy8s", token="valid-int-tok",
+            )
+            self.assertFalse(ok_drift)
+            self.assertTrue(any("review-revision-drift" in b for b in drift_blockers))
+
+            # 3. Wrong reviewer
+            ok_role, _, role_blockers = verify_qualification_pr_review(
+                gh.base_url, "turbo-factory/turbo-qual-67", 1, 43, cand_sha,
+                expected_reviewer="wrong-user", token="valid-int-tok",
+            )
+            self.assertFalse(ok_role)
+            self.assertTrue(any("reviewer-role-violation" in b for b in role_blockers))
+
+    def test_qualification_pr_ci_verification(self) -> None:
+        """Verify CI check run inspection against required context and trusted producer."""
+        cand_sha = "c1234567890abcdef1234567890abcdef1234567"
+        base_sha = "b1234567890abcdef1234567890abcdef1234567"
+        with _HostedQualificationFakeServer() as gh:
+            # 1. Success with trusted producer
+            ok, rec, blockers = check_qualification_pr_ci(
+                gh.base_url, "turbo-factory/turbo-qual-67", cand_sha, base_sha, "valid-int-tok",
+                required_contexts=("build",),
+            )
+            self.assertTrue(ok)
+            self.assertEqual(rec["status"], "verified")
+            self.assertEqual(len(blockers), 0)
+
+            # 2. Missing required context
+            ok_miss, _, miss_blockers = check_qualification_pr_ci(
+                gh.base_url, "turbo-factory/turbo-qual-67", cand_sha, base_sha, "valid-int-tok",
+                required_contexts=("nonexistent-check",),
+            )
+            self.assertFalse(ok_miss)
+            self.assertTrue(any("missing-ci-check" in b for b in miss_blockers))
+
+    def test_prepare_qualification_candidate_missing_reviewer_capability(self) -> None:
+        """Missing supported reviewer executable records unavailable and prevents preparation."""
+        cand_sha = "c1234567890abcdef1234567890abcdef1234567"
+        base_sha = "b1234567890abcdef1234567890abcdef1234567"
+        with _HostedQualificationFakeServer() as gh:
+            with tempfile.TemporaryDirectory() as tmp:
+                ev_dir = Path(tmp) / "ev"
+                rec = prepare_qualification_candidate(
+                    gh.base_url, "turbo-factory/turbo-qual-67", ev_dir,
+                    candidate_sha=cand_sha, base_sha=base_sha,
+                    integrator_token="valid-int-tok", competitor_token="valid-comp-tok",
+                    agy_bin=None, allow_test_origin=True,
+                )
+                self.assertEqual(rec["status"], "blocked")
+                self.assertEqual(rec["outcome"], "unavailable")
+                self.assertTrue(any("unsupported-reviewer-capability" in b for b in rec["blockers"]))
+                self.assertEqual(rec["prerequisites"]["security"]["status"], "unavailable")
+                self.assertEqual(rec["prerequisites"]["independent_review"]["status"], "unavailable")
+                self.assertEqual(rec["builder"]["kind"], "deterministic-qualification-process")
+                self.assertEqual(rec["builder"]["actor"], "cone-orgs")
+
+                # Verify file was written
+                prep_file = ev_dir / "candidate-preparation.json"
+                self.assertTrue(prep_file.exists())
+
+    def test_prepare_qualification_candidate_with_supported_reviewer(self) -> None:
+        """When supported reviewer executable is provided, candidate preparation succeeds."""
+        cand_sha = "c1234567890abcdef1234567890abcdef1234567"
+        base_sha = "b1234567890abcdef1234567890abcdef1234567"
+        with _HostedQualificationFakeServer() as gh:
+            with tempfile.TemporaryDirectory() as tmp:
+                ev_dir = Path(tmp) / "ev"
+                # Create a temporary dummy executable reviewer
+                fake_agy = Path(tmp) / "mock-agy"
+                fake_agy.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+                fake_agy.chmod(0o755)
+
+                rec = prepare_qualification_candidate(
+                    gh.base_url, "turbo-factory/turbo-qual-67", ev_dir,
+                    candidate_sha=cand_sha, base_sha=base_sha,
+                    integrator_token="valid-int-tok", competitor_token="valid-comp-tok",
+                    agy_bin=str(fake_agy), allow_test_origin=True,
+                )
+                self.assertEqual(rec["status"], "prepared")
+                self.assertEqual(rec["outcome"], "prepared")
+                self.assertEqual(len(rec["blockers"]), 0)
+                self.assertTrue(rec["prerequisites"]["qa"]["qa_verified"])
+                self.assertEqual(rec["prerequisites"]["ci"]["status"], "verified")
+                self.assertEqual(rec["prerequisites"]["github_review"]["state"], "APPROVED")
+                self.assertEqual(rec["builder"]["candidate_sha"], cand_sha)
 
 
 if __name__ == "__main__":

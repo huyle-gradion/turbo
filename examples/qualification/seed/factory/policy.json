@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "policy_version": 1,
+  "protected_paths": [
+    ".github",
+    ".factory",
+    "AGENTS.md"
+  ],
+  "required_checks": [
+    "build"
+  ],
+  "cache_policy": {
+    "cache_verification_results_across_revisions": false
+  }
+}

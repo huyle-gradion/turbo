@@ -59,9 +59,93 @@ DEMO_KEEP_EVIDENCE_DIR="$(mktemp -d /tmp/turbo-qual-67.XXXXXX)" \
   bash scripts/qualify-protected-demo.sh --mode hosted
 ```
 
-> **Current status (Slice 2)**: Hosted qualification foundation is implemented: fixed origin/slug/target authorization, two-token identity & permission verification, both-branch protection preflight, capability checks detecting empty contexts and missing seed, redacted operation ledger, and evidence index reduction over explicit subchecks. Hosted scenario execution is **NOT** implemented yet in this slice (`run_hosted_qualification` returns `status: "blocked"` with `hosted-scenarios-pending-human-setup`). No hosted success is claimed.
+> **Current status (Slice 3)**: Seed assets, deterministic QA cases, factory contracts, workflow template, and genuine candidate preparation machinery are implemented under `examples/qualification/seed/` and `factory/qualification.py`. The disposable test repository (`turbo-factory/turbo-qual-67`) has NOT had the seed installed on `feature/demo` and its required check contexts remain empty (`contexts: []`). Hosted qualification preflight honestly reports `status: "blocked"` with `missing-seed` and `empty-required-check-contexts`. No hosted success is claimed until external reviewed installation and check configuration are performed.
 
-## 5. Parent Acceptance Criteria Evidence Index (`#24`)
+## 5. Protected Seed Installation and Required-Context Setup Instructions
+
+Because `feature/demo` enforces strict branch protection (no direct pushes, 1 approving review, stale dismissals, admin enforcement), seed assets must be installed via a reviewed pull request, and required status checks must be configured via repository protection settings:
+
+### Step 1: Create Seed Setup Branch
+Clone `turbo-factory/turbo-qual-67`, fetch the target branch, and create a setup branch:
+```sh
+git clone https://github.com/turbo-factory/turbo-qual-67.git /tmp/turbo-qual-setup
+cd /tmp/turbo-qual-setup
+git checkout feature/demo
+git checkout -b setup/install-disposable-seed
+```
+
+### Step 2: Copy Seed Assets from Turbo Repository
+Copy the complete seed directory from Turbo's `examples/qualification/seed/` into the repository root:
+```sh
+cp -r /path/to/turbo/examples/qualification/seed/.github .
+mkdir -p .factory
+cp /path/to/turbo/examples/qualification/seed/factory/* .factory/
+cp -r /path/to/turbo/examples/qualification/seed/src .
+cp -r /path/to/turbo/examples/qualification/seed/tests .
+cp -r /path/to/turbo/examples/qualification/seed/qa .
+```
+
+Verified seed files installed:
+- `.github/workflows/ci.yml`: CI workflow running tests and uploading `turbo-ci-evidence-build`.
+- `.factory/policy.json`: Factory verification policy defining protected paths and required checks.
+- `.factory/child-contract.json`: Child contract specifying scope and acceptance criteria.
+- `src/calc.py`: Minimal product fixture source.
+- `tests/test_calc.py`: Unit tests for product fixture.
+- `qa/qa-cases.json`: Deterministic QA evaluation rubric and cases.
+
+### Step 3: Commit and Push Seed Setup Branch
+Commit changes with sign-off using writer collaborator credentials (`cone-orgs`):
+```sh
+git add .github .factory src tests qa
+git commit -s -m "setup: install disposable qualification seed assets (#67)"
+git push -u origin setup/install-disposable-seed
+```
+
+### Step 4: Open and Approve Seed Pull Request
+Open PR targeting `feature/demo`:
+```sh
+gh pr create \
+  --repo turbo-factory/turbo-qual-67 \
+  --base feature/demo \
+  --head setup/install-disposable-seed \
+  --title "setup: install disposable qualification seed assets" \
+  --body "Installs seed CI workflow, factory policy, product fixture, and QA cases. Refs #67"
+```
+
+Submit approving review using independent administrator identity (`huyhuyhuy8s`):
+```sh
+gh pr review <PR_NUMBER> \
+  --repo turbo-factory/turbo-qual-67 \
+  --approve \
+  --body "Seed assets verified against Turbo qualification contract."
+```
+
+### Step 5: Merge PR into `feature/demo`
+Merge the approved PR into `feature/demo`:
+```sh
+gh pr merge <PR_NUMBER> \
+  --repo turbo-factory/turbo-qual-67 \
+  --squash
+```
+
+### Step 6: Configure Nonempty Required Status Check Contexts
+Once the CI workflow has run on the PR or merge commit, the `build` check context is registered. Update branch protection on `feature/demo` to require `build`:
+```sh
+gh api \
+  --method PUT \
+  -H "Accept: application/vnd.github+json" \
+  "/repos/turbo-factory/turbo-qual-67/branches/feature/demo/protection/required_status_checks" \
+  -f strict=true \
+  -f "contexts[]=build"
+```
+
+Verify nonempty contexts:
+```sh
+gh api "/repos/turbo-factory/turbo-qual-67/branches/feature/demo/protection/required_status_checks"
+# Expected response: {"strict": true, "contexts": ["build"], ...}
+```
+
+## 6. Parent Acceptance Criteria Evidence Index (`#24`)
 
 | Parent AC | Summary | Scenarios | Status | Outcome |
 | :--- | :--- | :--- | :--- | :--- |
