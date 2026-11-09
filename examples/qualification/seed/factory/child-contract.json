@@ -1,0 +1,21 @@
+{
+  "schema": 1,
+  "gid": "qual-child-101",
+  "name": "Add arithmetic operations to calculator",
+  "head_branch": "feat/qual-candidate-101",
+  "base_branch": "feature/demo",
+  "target_feature_branch": "feature/demo",
+  "repo_slug": "turbo-factory/turbo-qual-67",
+  "scope": {
+    "in_scope": "src/calc.py tests/test_calc.py",
+    "out_of_scope": ".github .factory AGENTS.md",
+    "constraints": "do not modify protected paths"
+  },
+  "acceptance_criteria": [
+    {
+      "id": "CRIT-CALC-1",
+      "description": "Calculator provides basic arithmetic functions",
+      "verification": "python3 -m unittest discover -s tests -p 'test_*.py'"
+    }
+  ]
+}

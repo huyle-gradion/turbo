@@ -1,0 +1,58 @@
+name: CI
+on:
+  pull_request:
+    branches: ['feature/**']
+jobs:
+  build:
+    name: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Run tests
+        id: test_run
+        run: |
+          python3 -m unittest discover -s tests -p 'test_*.py' -v
+      - name: Generate CI evidence
+        if: always()
+        env:
+          CANDIDATE_SHA: ${{ github.event.pull_request.head.sha }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          TESTED_SHA: ${{ github.sha }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          REPO: ${{ github.repository }}
+          OUTCOME: ${{ steps.test_run.outcome }}
+        run: |
+          mkdir -p ci-ev
+          python3 -c "
+          import os, json
+          rec = {
+              'candidate_sha': os.environ.get('CANDIDATE_SHA', ''),
+              'base_sha': os.environ.get('BASE_SHA', ''),
+              'tested_sha': os.environ.get('TESTED_SHA', ''),
+              'policy_sha': os.environ.get('BASE_SHA', ''),
+              'revision_kind': 'integration-merge',
+              'check_name': 'build',
+              'kind': 'test',
+              'command': 'python3 -m unittest discover -s tests -p test_*.py -v',
+              'exit_code': 0 if os.environ.get('OUTCOME') == 'success' else 1,
+              'conclusion': 'success' if os.environ.get('OUTCOME') == 'success' else 'failure',
+              'html_url': f'https://github.com/{os.environ.get(\"REPO\")}/actions/runs/{os.environ.get(\"RUN_ID\")}',
+              'log_text': 'Unit test execution completed',
+          }
+          manifest = {
+              'schema': 1,
+              'workflow_run_id': int(os.environ.get('RUN_ID', '1')),
+              'run_attempt': int(os.environ.get('RUN_ATTEMPT', '1')),
+              'checks': {'build': rec},
+          }
+          with open('ci-ev/turbo-ci-evidence.json', 'w') as f:
+              json.dump(manifest, f, indent=2)
+          "
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: turbo-ci-evidence-build
+          path: ci-ev/turbo-ci-evidence.json

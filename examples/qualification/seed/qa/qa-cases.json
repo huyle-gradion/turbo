@@ -1,0 +1,38 @@
+{
+  "cases": [
+    {
+      "case_id": "QA-CALC-1",
+      "criterion_id": "CRIT-CALC-1",
+      "description": "Verify calculation adds two positive integers correctly",
+      "command": "python3 -c \"import sys; sys.path.insert(0, 'src'); from calc import add; assert add(2, 3) == 5\"",
+      "rubric": {
+        "rubric_id": "RUBRIC-CALC-1",
+        "summary": "Calculator add function must add positive integers correctly",
+        "required_checks": [
+          "exits 0 on positive addition"
+        ],
+        "expected_exit_code": 0,
+        "required_output_tokens": [],
+        "forbidden_output_tokens": [],
+        "requested_correction": "Implement add(a, b) in src/calc.py to return a + b."
+      }
+    },
+    {
+      "case_id": "QA-CALC-2",
+      "criterion_id": "CRIT-CALC-1",
+      "description": "Verify calculation multiplies two positive integers correctly",
+      "command": "python3 -c \"import sys; sys.path.insert(0, 'src'); from calc import multiply; assert multiply(3, 4) == 12\"",
+      "rubric": {
+        "rubric_id": "RUBRIC-CALC-2",
+        "summary": "Calculator multiply function must multiply positive integers correctly",
+        "required_checks": [
+          "exits 0 on positive multiplication"
+        ],
+        "expected_exit_code": 0,
+        "required_output_tokens": [],
+        "forbidden_output_tokens": [],
+        "requested_correction": "Implement multiply(a, b) in src/calc.py to return a * b."
+      }
+    }
+  ]
+}

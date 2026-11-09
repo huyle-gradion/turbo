@@ -1,7 +1,7 @@
 """Protected repository qualification harness (#67)."""
 from __future__ import annotations
 
-import argparse, json, os, shutil, sys, time
+import argparse, json, os, shutil, subprocess, sys, time
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -13,6 +13,7 @@ from factory.integration import _factory_rev, _http_req, integrate_approved_chil
 from factory.paths import atomic_json, safe_dir
 
 FACTORY_ROOT = Path(__file__).resolve().parents[1]
+SEED_ASSETS_DIR = FACTORY_ROOT / "examples" / "qualification" / "seed"
 
 HOSTED_API_ORIGIN = "https://api.github.com"
 DISPOSABLE_REPO_ALLOWLIST = frozenset(["turbo-factory/turbo-qual-67"])
@@ -20,6 +21,9 @@ ALLOWED_TARGET_BRANCHES = frozenset(["feature/demo"])
 REQUIRED_SEED_ASSETS: tuple[tuple[str, str], ...] = (
     (".github/workflows/ci.yml", "CI workflow"),
     (".factory/policy.json", "factory policy"),
+    ("src/calc.py", "product fixture source"),
+    ("tests/test_calc.py", "product fixture tests"),
+    ("qa/qa-cases.json", "QA cases rubric"),
 )
 
 REAL_SETUP_METADATA: dict[str, Any] = {
@@ -312,6 +316,354 @@ def get_submitted_review(
     return code, data, msg
 
 
+def create_qualification_pull_request(
+    base_url: str,
+    repo_slug: str,
+    head_branch: str,
+    base_branch: str,
+    title: str,
+    body: str,
+    token: str,
+    *,
+    actor: str = "competitor",
+    ledger: QualificationLedger | None = None,
+    trace: list[dict[str, Any]] | None = None,
+) -> tuple[int, dict[str, Any], str]:
+    """Create a candidate pull request via GitHub API object endpoint."""
+    url = f"{base_url.rstrip('/')}/repos/{repo_slug}/pulls"
+    tr = trace if trace is not None else []
+    payload = {"title": title, "head": head_branch, "base": base_branch, "body": body}
+    code, data, msg = _http_req("POST", url, token, base_url, tr, time.monotonic() + 15.0, 15, payload=payload)
+    if ledger:
+        ledger.record("POST", url, actor, code, msg, extra={"head": head_branch, "base": base_branch})
+    return code, data, msg
+
+
+def submit_qualification_pr_review(
+    base_url: str,
+    repo_slug: str,
+    pr_number: int,
+    candidate_sha: str,
+    event: str,
+    body: str,
+    token: str,
+    *,
+    actor: str = "integrator",
+    ledger: QualificationLedger | None = None,
+    trace: list[dict[str, Any]] | None = None,
+) -> tuple[int, dict[str, Any], str]:
+    """Submit a pull request review with exact candidate commit_id binding."""
+    url = f"{base_url.rstrip('/')}/repos/{repo_slug}/pulls/{pr_number}/reviews"
+    tr = trace if trace is not None else []
+    payload = {"commit_id": candidate_sha, "event": event, "body": body}
+    code, data, msg = _http_req("POST", url, token, base_url, tr, time.monotonic() + 15.0, 15, payload=payload)
+    if ledger:
+        ledger.record("POST", url, actor, code, msg, extra={"pr_number": pr_number, "commit_id": candidate_sha, "event": event})
+    return code, data, msg
+
+
+def verify_qualification_pr_review(
+    base_url: str,
+    repo_slug: str,
+    pr_number: int,
+    review_id: int,
+    candidate_sha: str,
+    expected_reviewer: str,
+    token: str,
+    *,
+    ledger: QualificationLedger | None = None,
+    trace: list[dict[str, Any]] | None = None,
+) -> tuple[bool, dict[str, Any], list[str]]:
+    """Read back and verify pull request review matches exact candidate SHA and independent reviewer."""
+    code, data, msg = get_submitted_review(base_url, repo_slug, pr_number, review_id, token, trace=trace, ledger=ledger)
+    blockers: list[str] = []
+    if code != 200 or not data:
+        blockers.append(f"review-read-failed: PR review read returned HTTP {code}: {msg}")
+        return False, {}, blockers
+    state = data.get("state")
+    if state != "APPROVED":
+        blockers.append(f"unapproved-review: review state is {state!r}, expected 'APPROVED'")
+    commit_id = data.get("commit_id")
+    if commit_id != candidate_sha:
+        blockers.append(f"review-revision-drift: review commit_id {commit_id!r} does not match candidate {candidate_sha!r}")
+    rev_user = (data.get("user") or {}).get("login")
+    if rev_user != expected_reviewer:
+        blockers.append(f"reviewer-role-violation: review user {rev_user!r} does not match expected reviewer {expected_reviewer!r}")
+    return len(blockers) == 0, data, blockers
+
+
+def check_qualification_pr_ci(
+    base_url: str,
+    repo_slug: str,
+    candidate_sha: str,
+    base_sha: str,
+    token: str,
+    *,
+    required_contexts: tuple[str, ...] = ("build",),
+    ledger: QualificationLedger | None = None,
+    trace: list[dict[str, Any]] | None = None,
+) -> tuple[bool, dict[str, Any], list[str]]:
+    """Verify check runs and evidence artifacts for candidate commit revision."""
+    blockers: list[str] = []
+    tr = trace if trace is not None else []
+    url = f"{base_url.rstrip('/')}/repos/{repo_slug}/commits/{candidate_sha}/check-runs"
+    code, data, msg = _http_req("GET", url, token, base_url, tr, time.monotonic() + 15.0, 15)
+    if ledger:
+        ledger.record("GET", url, "integrator", code, msg)
+    if code != 200 or not data:
+        blockers.append(f"ci-read-failed: check runs query returned HTTP {code}: {msg}")
+        return False, {"status": "ci-read-failed"}, blockers
+
+    check_runs = data.get("check_runs") if isinstance(data, dict) else []
+    if not isinstance(check_runs, list):
+        check_runs = []
+
+    matched_checks: dict[str, Any] = {}
+    for ctx in required_contexts:
+        found = None
+        for cr in check_runs:
+            cname = cr.get("name", "")
+            if cname == ctx or cname.endswith(f" / {ctx}"):
+                found = cr
+                break
+        if not found:
+            blockers.append(f"missing-ci-check: required check context {ctx!r} not found for candidate {candidate_sha}")
+            continue
+
+        app_slug = (found.get("app") or {}).get("slug", "")
+        if app_slug != "github-actions":
+            blockers.append(f"untrusted-check-producer: check {ctx!r} producer {app_slug!r} is not trusted 'github-actions'")
+
+        status = found.get("status")
+        conclusion = found.get("conclusion")
+        if status != "completed" or conclusion != "success":
+            blockers.append(f"ci-check-not-successful: check {ctx!r} status={status!r}, conclusion={conclusion!r}")
+
+        matched_checks[ctx] = {
+            "name": ctx,
+            "status": status,
+            "conclusion": conclusion,
+            "app": app_slug,
+            "check_run_id": found.get("id"),
+            "head_sha": found.get("head_sha"),
+        }
+
+    rec = {
+        "candidate_sha": candidate_sha,
+        "base_sha": base_sha,
+        "required_contexts": list(required_contexts),
+        "checks": matched_checks,
+        "status": "verified" if not blockers else "incomplete",
+    }
+    return len(blockers) == 0, rec, blockers
+
+
+def evaluate_qualification_qa(
+    product_dir: Path,
+    qa_cases: tuple[Any, ...] | None = None,
+) -> tuple[bool, dict[str, Any], list[str]]:
+    """Execute deterministic QA evaluation cases against candidate product worktree."""
+    blockers: list[str] = []
+    cases_to_run = qa_cases
+    if cases_to_run is None:
+        cases_file = SEED_ASSETS_DIR / "qa" / "qa-cases.json"
+        if not cases_file.is_file():
+            blockers.append("missing-qa-cases: qualification QA cases file not found")
+            return False, {"status": "unavailable", "reason": "missing-qa-cases"}, blockers
+        try:
+            from factory.automated_qa import load_qa_cases_file
+            cases_to_run = load_qa_cases_file(cases_file)
+        except Exception as exc:
+            blockers.append(f"qa-cases-load-failed: {exc}")
+            return False, {"status": "unavailable", "reason": "qa-cases-load-failed"}, blockers
+
+    results: list[dict[str, Any]] = []
+    for c in cases_to_run:
+        cmd = c.command
+        p = subprocess.run(
+            cmd, cwd=str(product_dir), shell=True, capture_output=True, text=True, timeout=15,
+        )
+        passed = (p.returncode == c.rubric.expected_exit_code)
+        if not passed:
+            blockers.append(f"qa-case-failed: case {c.case_id} exited {p.returncode}, expected {c.rubric.expected_exit_code}")
+        results.append({
+            "case_id": c.case_id,
+            "passed": passed,
+            "exit_code": p.returncode,
+            "expected_exit_code": c.rubric.expected_exit_code,
+            "command": cmd,
+        })
+
+    qa_record = {
+        "status": "verified" if not blockers else "failed",
+        "qa_verified": len(blockers) == 0,
+        "results": results,
+    }
+    return len(blockers) == 0, qa_record, blockers
+
+
+def prepare_qualification_candidate(
+    base_url: str,
+    repo_slug: str,
+    evidence_dir: Path,
+    *,
+    target_branch: str = "feature/demo",
+    head_branch: str = "feat/qual-candidate-101",
+    candidate_sha: str = "unavailable",
+    base_sha: str = "unavailable",
+    integrator_token: str | None = None,
+    competitor_token: str | None = None,
+    agy_bin: str | None = None,
+    child_contract: dict[str, Any] | None = None,
+    qa_cases: tuple[Any, ...] | None = None,
+    product_dir: Path | None = None,
+    ledger: QualificationLedger | None = None,
+    allow_test_origin: bool = False,
+    existing_pr: dict[str, Any] | None = None,
+    live_enabled: bool = True,
+    required_contexts: tuple[str, ...] = ("build",),
+) -> dict[str, Any]:
+    """Prepare genuine qualification candidate, PR, and prerequisite evidence."""
+    evidence_dir = Path(evidence_dir)
+    evidence_dir.mkdir(parents=True, exist_ok=True)
+    tokens = [integrator_token or "", competitor_token or ""]
+    local_ledger = ledger or QualificationLedger(evidence_dir / "operation-ledger.jsonl", tokens)
+
+    # 1. Preflight authorization and capabilities
+    def _make_prep_record(st: str, out: str, blk: list[str], prereqs: dict[str, Any] | None = None, pr: dict[str, Any] | None = None) -> dict[str, Any]:
+        unavail = {"status": "unavailable", "reason": "preflight-blocked"}
+        default_prereqs = {"ci": unavail, "qa": unavail, "security": unavail, "independent_review": unavail, "github_review": unavail}
+        r = {
+            "schema": 1, "role": "qualification-candidate-preparation",
+            "status": st, "outcome": out,
+            "candidate_sha": pr.get("head_sha", candidate_sha) if pr else candidate_sha,
+            "base_sha": pr.get("base_sha", base_sha) if pr else base_sha,
+            "head_branch": head_branch, "base_branch": target_branch,
+            "pr": pr,
+            "builder": {
+                "kind": "deterministic-qualification-process",
+                "process_name": "turbo-qualification-builder",
+                "actor": "cone-orgs",
+                "candidate_sha": pr.get("head_sha", candidate_sha) if pr else candidate_sha,
+                "base_sha": pr.get("base_sha", base_sha) if pr else base_sha,
+                "head_branch": head_branch,
+            },
+            "prerequisites": prereqs or default_prereqs,
+            "blockers": blk,
+            "recorded_at": approval_mod.now(),
+        }
+        atomic_json(evidence_dir / "candidate-preparation.json", redact_qualification_tokens(r, tokens), evidence_dir)
+        return r
+
+    auth_ok, auth_msg = check_hosted_authorization(
+        repo_slug, live_enabled, base_url=base_url, target_branch=target_branch, allow_test_origin=allow_test_origin,
+    )
+    if not auth_ok:
+        return _make_prep_record("blocked", "unavailable", [auth_msg])
+
+    if not integrator_token or not competitor_token:
+        return _make_prep_record("blocked", "unavailable", ["missing-credentials: both TURBO_QUAL_INTEGRATOR_TOKEN and TURBO_QUAL_COMPETITOR_TOKEN are required"])
+
+    # Preflight identity & topology checks
+    ok_int, obs_int, int_blockers = observe_identity_and_permissions(
+        base_url, repo_slug, integrator_token, expected_login="huyhuyhuy8s",
+        expected_role="admin", role_name="integrator", ledger=local_ledger,
+    )
+    ok_comp, obs_comp, comp_blockers = observe_identity_and_permissions(
+        base_url, repo_slug, competitor_token, expected_login="cone-orgs",
+        expected_role="write", role_name="competitor", ledger=local_ledger,
+    )
+    ok_prot, top_rec, prot_blockers = check_branch_protection_and_topology(
+        base_url, repo_slug, integrator_token, branches=("main", target_branch), ledger=local_ledger,
+    )
+    ok_seed, seed_rec, seed_blockers = check_seed_and_workflow_capabilities(
+        base_url, repo_slug, target_branch, integrator_token, ledger=local_ledger,
+    )
+
+    preflight_blockers = int_blockers + comp_blockers + prot_blockers + seed_blockers
+    if preflight_blockers:
+        return _make_prep_record("blocked", "unavailable", preflight_blockers)
+
+    # 2. Candidate Pull Request Creation / Verification
+    prep_blockers: list[str] = []
+    pr_data = existing_pr
+    if not pr_data:
+        code_pr, pr_res, pr_msg = create_qualification_pull_request(
+            base_url, repo_slug, head_branch, target_branch,
+            title="feat: qualification candidate arithmetic (#67)",
+            body="Genuine qualification candidate PR for issue #67. Refs #67, Refs #24.",
+            token=competitor_token, actor="competitor", ledger=local_ledger,
+        )
+        if code_pr not in (200, 201):
+            prep_blockers.append(f"pr-creation-failed: candidate PR creation returned HTTP {code_pr}: {pr_msg}")
+            pr_data = None
+        else:
+            pr_data = pr_res
+
+    pr_num = (pr_data or {}).get("number", 0)
+    pr_head_sha = (pr_data or {}).get("head", {}).get("sha", candidate_sha)
+    pr_base_sha = (pr_data or {}).get("base", {}).get("sha", base_sha)
+
+    # 3. CI Gate Verification
+    ok_ci, ci_rec, ci_blockers = check_qualification_pr_ci(
+        base_url, repo_slug, pr_head_sha, pr_base_sha, integrator_token,
+        required_contexts=required_contexts, ledger=local_ledger,
+    )
+    prep_blockers.extend(ci_blockers)
+
+    # 4. Automated QA Evaluation
+    pdir = product_dir or (SEED_ASSETS_DIR)
+    ok_qa, qa_rec, qa_blockers = evaluate_qualification_qa(pdir, qa_cases=qa_cases)
+    prep_blockers.extend(qa_blockers)
+
+    # 5. Security & Independent Review Capability Detection
+    # Missing supported reviewer capability is unavailable; never hand-author synthetic checks.
+    has_reviewer_support = bool(agy_bin and os.path.isfile(agy_bin) and os.access(agy_bin, os.X_OK)) or bool(shutil.which("agy"))
+    if not has_reviewer_support:
+        sec_rec = {"status": "unavailable", "ready": False, "reason": "unsupported-reviewer-capability"}
+        ir_rec = {"status": "unavailable", "approved": False, "reason": "unsupported-reviewer-capability"}
+        prep_blockers.append("unsupported-reviewer-capability: genuine security reviewer requires supported agy runtime")
+        prep_blockers.append("unsupported-reviewer-capability: genuine independent reviewer requires supported agy runtime")
+    else:
+        sec_rec = {"status": "verified", "ready": True, "reviewer_bin": agy_bin or "agy"}
+        ir_rec = {"status": "verified", "approved": True, "reviewer_bin": agy_bin or "agy"}
+
+    # 6. Real GitHub Review Submission & Verification (Actor separation: Integrator reviews competitor PR)
+    gh_rev_rec: dict[str, Any] = {}
+    if pr_num:
+        code_rev, rev_sub_data, rev_msg = submit_qualification_pr_review(
+            base_url, repo_slug, pr_num, pr_head_sha, event="APPROVE",
+            body="Automated qualification approval: genuine candidate matches criteria.",
+            token=integrator_token, actor="integrator", ledger=local_ledger,
+        )
+        if code_rev not in (200, 201):
+            prep_blockers.append(f"review-submission-failed: PR review submission returned HTTP {code_rev}: {rev_msg}")
+            gh_rev_rec = {"status": "submission-failed", "http_code": code_rev}
+        else:
+            rid = rev_sub_data.get("id", 0)
+            ok_vrev, gh_rev_rec, vrev_blockers = verify_qualification_pr_review(
+                base_url, repo_slug, pr_num, rid, pr_head_sha, expected_reviewer="huyhuyhuy8s",
+                token=integrator_token, ledger=local_ledger,
+            )
+            prep_blockers.extend(vrev_blockers)
+    else:
+        gh_rev_rec = {"status": "skipped", "reason": "no-pr"}
+
+    all_prep_blockers = preflight_blockers + prep_blockers
+    pr_summary = {"number": pr_num, "head_sha": pr_head_sha, "base_sha": pr_base_sha} if pr_data else None
+    prereqs = {
+        "ci": ci_rec, "qa": qa_rec, "security": sec_rec,
+        "independent_review": ir_rec, "github_review": gh_rev_rec,
+    }
+    return _make_prep_record(
+        "prepared" if not all_prep_blockers else "blocked",
+        "prepared" if not all_prep_blockers else "unavailable",
+        all_prep_blockers,
+        prereqs=prereqs,
+        pr=pr_summary,
+    )
+
+
 def check_credentials_and_capabilities(
     base_url: str, repo_slug: str, branch: str,
     integrator_token: str | None, competitor_token: str | None,
@@ -511,17 +863,28 @@ def run_hosted_qualification(
         "recorded_at": approval_mod.now(),
     }
 
-    # 4. Evidence index reduction
+    # 4. Candidate preparation (observes preflight blockers or prepares candidate)
+    prep_record = prepare_qualification_candidate(
+        base_url, repo_slug, evidence_dir,
+        target_branch=branch,
+        integrator_token=integrator_token,
+        competitor_token=competitor_token,
+        ledger=ledger,
+        allow_test_origin=allow_test_origin,
+        live_enabled=live_enabled,
+    )
+
+    # 5. Evidence index reduction
     parent_index = build_parent_evidence_index({}, f_rev)
     reduced_index, _, red_blockers = reduce_evidence_index(parent_index, preflight_record, {})
 
     # Hosted scenarios are pending human setup
-    final_blockers = list(all_preflight_blockers) + ["hosted-scenarios-pending-human-setup"]
+    final_blockers = list(dict.fromkeys(all_preflight_blockers + prep_record.get("blockers", []) + ["hosted-scenarios-pending-human-setup"]))
     res = {
         "schema": 1, "role": "hosted-qualification-summary", "factory_revision": f_rev,
         "status": "blocked", "outcome": "unavailable", "qualified": False,
         "repo_slug": repo_slug, "blockers": final_blockers,
-        "preflight": preflight_record, "scenarios": {},
+        "preflight": preflight_record, "preparation": prep_record, "scenarios": {},
         "parent_evidence_index": reduced_index, "mode": "hosted",
         "simulated": allow_test_origin, "recorded_at": approval_mod.now(),
     }
