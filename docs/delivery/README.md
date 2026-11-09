@@ -75,7 +75,7 @@ The script demonstrates, in order:
 
 ## Repeatable Protected Qualification Harness (`#67`)
 
-Protected repository qualification exercises delivery and integration against allowlisted disposable repository `huyle-gradion/turbo-qual-67`. See [`docs/delivery/qualification-setup.md`](qualification-setup.md) for complete setup, token capability requirements, and the parent `#24` evidence index:
+Protected repository qualification exercises delivery and integration against allowlisted disposable repository `turbo-factory/turbo-qual-67`. See [`docs/delivery/qualification-setup.md`](qualification-setup.md) for complete setup, token capability requirements, and the parent `#24` evidence index:
 
 ```sh
 DEMO_KEEP_EVIDENCE_DIR="$(mktemp -d /tmp/turbo-qual-67.XXXXXX)" \

@@ -14,14 +14,20 @@ from factory.paths import atomic_json, safe_dir
 
 FACTORY_ROOT = Path(__file__).resolve().parents[1]
 
-DISPOSABLE_REPO_ALLOWLIST = frozenset(["huyle-gradion/turbo-qual-67"])
+DISPOSABLE_REPO_ALLOWLIST = frozenset(["turbo-factory/turbo-qual-67"])
 
 REAL_SETUP_METADATA: dict[str, Any] = {
-    "repo_slug": "huyle-gradion/turbo-qual-67",
+    "repo_slug": "turbo-factory/turbo-qual-67",
     "identities": {
-        "integrator": "huyhuyhuy8s",
-        "competitor": "cone-orgs",
-        "restricted_reader": "huyle-turbo",
+        "integrator": "huyhuyhuy8s",  # Admin on the org repo
+        "competitor": "cone-orgs",    # Write collaborator
+        "restricted_reader": "huyle-turbo",  # Read-only identity
+    },
+    "tokens": {
+        "type": "classic_pat",
+        "integrator_scope": "repo",
+        "competitor_scope": "repo (extra workflow scope also present, harmless)",
+        "restricted_reader_scope": "none (public read-only)",
     },
     "protection_config": {
         "strict": True,
@@ -30,20 +36,13 @@ REAL_SETUP_METADATA: dict[str, Any] = {
         "dismiss_stale_reviews": True,
         "allow_force_pushes": False,
         "allow_deletions": False,
+        "contexts": [],
     },
-    "token_permissions_required": [
-        "Contents: Read and write",
-        "Pull requests: Read and write",
-        "Actions: Read-only",
-        "Commit statuses: Read-only",
-        "Checks: Read-only",
-        "Administration: Read-only",
+    "known_gaps": [
+        "feature/demo currently holds only README.md; seed CI workflow, product fixture, and factory policy are not yet installed.",
+        "Branch protection required status check contexts are empty (contexts: []); nonempty check contexts pending setup in a later slice.",
+        "Hosted qualification execution is not implemented yet; run_hosted_qualification returns blocked / hosted-scenarios-pending-human-setup.",
     ],
-    "known_gap": (
-        "Integrator and competitor fine-grained tokens cannot read branch protection (HTTP 403) "
-        "because Administration: Read-only permission is pending. Step 7 in "
-        "factory.integration halts with denied-permissions until updated."
-    ),
 }
 
 PARENT_AC_DESCRIPTIONS: dict[str, str] = {
@@ -69,7 +68,7 @@ def check_credentials_and_capabilities(
     base_url: str, repo_slug: str, branch: str,
     integrator_token: str | None, competitor_token: str | None,
 ) -> tuple[bool, dict[str, Any], list[str]]:
-    """Detect missing credentials and unavailable protection capabilities (Administration: Read-only gap)."""
+    """Detect missing credentials and unavailable protection capabilities."""
     blockers: list[str] = []
     if not integrator_token or not competitor_token:
         blockers.append("missing-credentials: both TURBO_QUAL_INTEGRATOR_TOKEN and TURBO_QUAL_COMPETITOR_TOKEN are required")
@@ -83,7 +82,7 @@ def check_credentials_and_capabilities(
     if code in (401, 403):
         blockers.append(
             f"unavailable-protection-capability: branch protection read returned HTTP {code} "
-            f"({err_msg or 'Administration: Read-only fine-grained permission required'})"
+            f"({err_msg or 'protection read permission required'})"
         )
         return False, {}, blockers
     if code != 200 or not prot_data:
@@ -223,7 +222,7 @@ def run_offline_qualification(evidence_dir: Path) -> dict[str, Any]:
     scenarios: dict[str, Any] = {}
 
     with setup_disposable_delivery_context(ws_root) as ctx:
-        ctx.gh.owner = "huyle-gradion"
+        ctx.gh.owner = "turbo-factory"
         ctx.gh.repo = "turbo-qual-67"
         main_sha_before = git(ctx.bare, "rev-parse", "refs/heads/main")
         b_branch = str(ctx.intake_rec["parent"]["target_feature_branch"])
@@ -234,8 +233,8 @@ def run_offline_qualification(evidence_dir: Path) -> dict[str, Any]:
             git(ctx.bare, "branch", "-f", h_branch, cand_s)
             git(ctx.repo, "fetch", "origin")
             if 1 in ctx.gh.pulls:
-                ctx.gh.pulls[1]["head"]["repo"]["full_name"] = "huyle-gradion/turbo-qual-67"
-                ctx.gh.pulls[1]["base"]["repo"]["full_name"] = "huyle-gradion/turbo-qual-67"
+                ctx.gh.pulls[1]["head"]["repo"]["full_name"] = "turbo-factory/turbo-qual-67"
+                ctx.gh.pulls[1]["base"]["repo"]["full_name"] = "turbo-factory/turbo-qual-67"
                 ctx.gh.pulls[1]["base"]["ref"] = b_branch
                 ctx.gh.pulls[1]["head"]["ref"] = h_branch
                 ctx.gh.pulls[1]["base"]["sha"] = base_s
@@ -277,7 +276,7 @@ def run_offline_qualification(evidence_dir: Path) -> dict[str, Any]:
             repo=ctx.repo, home=ctx.home, child_dir=ctx.child_dir, child=ctx.child_contract,
             conf=ctx.conf, pr_number=1, candidate_sha=ctx.cand_sha, base_sha=ctx.base_sha,
             head_branch=h_branch, base_branch=b_branch, approval_record=gate1,
-            repo_slug="huyle-gradion/turbo-qual-67", base_url=ctx.gh.base_url, token="disp-tok",
+            repo_slug="turbo-factory/turbo-qual-67", base_url=ctx.gh.base_url, token="disp-tok",
         )
         scenarios["confirmed_landing"] = _snap_sc("confirmed_landing", r1, {
             "delivery_approved": gate1.get("delivery_approved", False),
@@ -293,7 +292,7 @@ def run_offline_qualification(evidence_dir: Path) -> dict[str, Any]:
             repo=ctx.repo, home=ctx.home, child_dir=ctx.child_dir, child=ctx.child_contract,
             conf=ctx.conf, pr_number=1, candidate_sha=ctx.cand_sha, base_sha=ctx.base_sha,
             head_branch=h_branch, base_branch=b_branch, approval_record=gate1,
-            repo_slug="huyle-gradion/turbo-qual-67", base_url=ctx.gh.base_url, token="disp-tok",
+            repo_slug="turbo-factory/turbo-qual-67", base_url=ctx.gh.base_url, token="disp-tok",
         )
         ctx.gh.merge_status = 200
         scenarios["prereq_missing_and_denied"] = _snap_sc("prereq_missing_and_denied", r2, {})
@@ -312,7 +311,7 @@ def run_offline_qualification(evidence_dir: Path) -> dict[str, Any]:
             repo=ctx.repo, home=ctx.home, child_dir=ctx.child_dir, child=ctx.child_contract,
             conf=ctx.conf, pr_number=1, candidate_sha=ctx.cand_sha, base_sha=ctx.base_sha,
             head_branch=h_branch, base_branch=b_branch, approval_record=gate1,
-            repo_slug="huyle-gradion/turbo-qual-67", base_url=ctx.gh.base_url, token="disp-tok",
+            repo_slug="turbo-factory/turbo-qual-67", base_url=ctx.gh.base_url, token="disp-tok",
             on_before_merge=_adv_competitor,
         )
         scenarios["competing_base_rejection"] = _snap_sc("competing_base_rejection", r3, {})
@@ -333,7 +332,7 @@ def run_offline_qualification(evidence_dir: Path) -> dict[str, Any]:
             repo=ctx.repo, home=ctx.home, child_dir=ctx.child_dir, child=ctx.child_contract,
             conf=ctx.conf, pr_number=1, candidate_sha=ctx.cand_sha, base_sha=ctx.base_sha,
             head_branch=h_branch, base_branch=b_branch, approval_record=gate1,
-            repo_slug="huyle-gradion/turbo-qual-67", base_url=ctx.gh.base_url, token="disp-tok",
+            repo_slug="turbo-factory/turbo-qual-67", base_url=ctx.gh.base_url, token="disp-tok",
         )
         scenarios["renewed_verification_after_base_change"] = _snap_sc("renewed_verification_after_base_change", r4, {
             "advanced_base_sha": adv_base, "stale_base_prevented": True,
@@ -348,7 +347,7 @@ def run_offline_qualification(evidence_dir: Path) -> dict[str, Any]:
             repo=ctx.repo, home=ctx.home, child_dir=ctx.child_dir, child=ctx.child_contract,
             conf=ctx.conf, pr_number=1, candidate_sha=ctx.cand_sha, base_sha=ctx.base_sha,
             head_branch=h_branch, base_branch=b_branch, approval_record=gate1,
-            repo_slug="huyle-gradion/turbo-qual-67", base_url=ctx.gh.base_url, token="disp-tok",
+            repo_slug="turbo-factory/turbo-qual-67", base_url=ctx.gh.base_url, token="disp-tok",
         )
         ctx.gh.merge_status = 200
         scenarios["concurrency_and_uncertain_reconciliation"] = _snap_sc("concurrency_and_uncertain_reconciliation", r5, {
@@ -363,7 +362,7 @@ def run_offline_qualification(evidence_dir: Path) -> dict[str, Any]:
             repo=ctx.repo, home=ctx.home, child_dir=ctx.child_dir, child=ctx.child_contract,
             conf=ctx.conf, pr_number=1, candidate_sha=ctx.cand_sha, base_sha=ctx.base_sha,
             head_branch=h_branch, base_branch="main", approval_record=gate1,
-            repo_slug="huyle-gradion/turbo-qual-67", base_url=ctx.gh.base_url, token="disp-tok",
+            repo_slug="turbo-factory/turbo-qual-67", base_url=ctx.gh.base_url, token="disp-tok",
         )
         main_sha_after = git(ctx.bare, "rev-parse", "refs/heads/main")
         scenarios["wrong_target_rejected"] = _snap_sc("wrong_target_rejected", r6, {
@@ -389,7 +388,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Turbo Issue #67 Protected Repository Qualification")
     parser.add_argument("--mode", choices=["offline", "hosted"], default="offline")
     parser.add_argument("--evidence-dir", type=Path, default=None)
-    parser.add_argument("--repo-slug", default="huyle-gradion/turbo-qual-67")
+    parser.add_argument("--repo-slug", default="turbo-factory/turbo-qual-67")
     parser.add_argument("--branch", default="feature/demo")
     parser.add_argument("--base-url", default="https://api.github.com")
     args = parser.parse_args(argv)
