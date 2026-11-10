@@ -36,9 +36,9 @@ def _command_text(entry: dict) -> str:
     return " ".join(map(str, cmd)) if isinstance(cmd, (list, tuple)) else str(cmd)
 
 
-def _run_main(argv: list[str]) -> int:
+def _run_main(argv: list[str], main=None) -> int:
     with contextlib.redirect_stdout(io.StringIO()):
-        return qualification.main(argv)
+        return (main or qualification.main)(argv)
 
 
 def _rejected_result() -> SimpleNamespace:
@@ -84,8 +84,8 @@ def _hosted_fakes(*, failing: str | None = None, prep_blockers: list[str] = (), 
         st.enter_context(mock.patch(q + "check_branch_protection_and_topology", return_value=(True, {}, [])))
         st.enter_context(mock.patch(q + "check_seed_and_workflow_capabilities", return_value=(True, {}, [])))
         st.enter_context(mock.patch(q + "prepare_qualification_candidate", return_value=prep))
-        st.enter_context(mock.patch("support_deliver.setup_disposable_delivery_context",
-                                    lambda root: contextlib.nullcontext(SimpleNamespace(repo=Path(root)))))
+        st.enter_context(mock.patch(q + "hosted_scenario_context",
+                                    lambda *a, **k: contextlib.nullcontext(SimpleNamespace())))
         for fn, name in (("run_scenario_1_confirmed_landing", "confirmed_landing"),
                          ("run_scenario_2_prereq_missing_and_denied", "prereq_missing_and_denied"),
                          ("run_scenario_3_competing_base_rejection", "competing_base_rejection"),
@@ -102,9 +102,6 @@ class EvidenceIndexOutcomeTest(unittest.TestCase):
 
     def test_index_records_real_command_exit_and_mode_of_a_failing_run(self) -> None:
         """AC1/AC2: a failed scenario yields a `failed` entry carrying the run's real command and non-zero exit."""
-        import support_deliver  # noqa: F401  (patch target must be importable)
-
-        real_integrate = qualification.integrate_approved_child
         calls: list[int] = []
 
         def first_attempt_fails(*a, **k):
@@ -113,8 +110,11 @@ class EvidenceIndexOutcomeTest(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             ev = Path(tmp) / "ev-offline"
-            with self.subTest(mode="offline"), mock.patch("factory.qualification.integrate_approved_child", first_attempt_fails):
-                rc = _run_main(["--mode", "offline", "--evidence-dir", str(ev)])
+            with self.subTest(mode="offline"):
+                import qualification_offline  # offline simulation lives in tests/ (#97)
+                real_integrate = qualification_offline.integrate_approved_child
+                with mock.patch.object(qualification_offline, "integrate_approved_child", first_attempt_fails):
+                    rc = _run_main(["--mode", "offline", "--evidence-dir", str(ev)], qualification_offline.main)
                 index, summary = self._load(ev)
                 self.assertNotEqual(rc, 0, "a failed confirmed-landing scenario must fail the offline command")
                 for ac in ("AC1", "AC5"):  # both include confirmed_landing
@@ -157,8 +157,9 @@ class EvidenceIndexOutcomeTest(unittest.TestCase):
 
             # Reruns into the same evidence directory must not leave an earlier run's claims behind.
             ev = Path(tmp) / "ev-rerun"
+            import qualification_offline  # offline simulation lives in tests/ (#97)
             with self.subTest(rerun="passing-offline"):
-                rc = _run_main(["--mode", "offline", "--evidence-dir", str(ev)])
+                rc = _run_main(["--mode", "offline", "--evidence-dir", str(ev)], qualification_offline.main)
                 self.assertEqual(rc, 0, "a fully passing offline run must exit 0")
                 self.assertEqual(self._load(ev)[1]["exit_status"], 0)
             ev_raise = Path(tmp) / "ev-rerun-raise"
@@ -172,10 +173,12 @@ class EvidenceIndexOutcomeTest(unittest.TestCase):
                 for ac, entry in self._persisted(ev)[1].items():
                     self.assertEqual(entry.get("exit_status"), rc, f"stale {ac} index entry beside the hosted summary")
             with self.subTest(rerun="then-raising-offline"), \
-                    mock.patch("factory.qualification.integrate_approved_child", side_effect=RuntimeError("forced crash")):
-                with contextlib.suppress(Exception):
-                    _run_main(["--mode", "offline", "--evidence-dir", str(ev_raise)])
+                    mock.patch.object(qualification_offline, "integrate_approved_child", side_effect=RuntimeError("forced crash")):
+                with self.assertRaises(RuntimeError):  # the crash propagates after evidence is recorded
+                    _run_main(["--mode", "offline", "--evidence-dir", str(ev_raise)], qualification_offline.main)
                 summary, index = self._persisted(ev_raise)
+                self.assertEqual(summary.get("exit_status"), 1, "a crashed offline run records exit_status 1")
+                self.assertEqual(summary.get("outcome"), "failed")
                 for where, rec in [("summary", summary), *index.items()]:
                     if rec:
                         self.assertNotEqual(rec.get("exit_status"), 0, f"stale {where} claims exit 0")

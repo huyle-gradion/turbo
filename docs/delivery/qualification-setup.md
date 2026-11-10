@@ -50,6 +50,8 @@ DEMO_KEEP_EVIDENCE_DIR="$(mktemp -d /tmp/turbo-qual-67.XXXXXX)" \
   bash scripts/qualify-protected-demo.sh --mode offline
 ```
 
+The offline simulation is built on test fakes, so it lives in `tests/qualification_offline.py`, not in `factory/`. The script's offline mode (the default) runs it as `python3 -m qualification_offline`; hosted mode runs `python3 -m factory.qualification`, which is hosted-only. Run the offline harness directly with `PYTHONPATH=tests:. python3 -m qualification_offline`.
+
 ### Hosted Qualification (Hosted Safety and Evidence Foundation / Scenarios Not Implemented)
 ```sh
 # Credentials must be pre-set in the launch environment (TURBO_QUAL_INTEGRATOR_TOKEN, TURBO_QUAL_COMPETITOR_TOKEN).
@@ -64,7 +66,7 @@ DEMO_KEEP_EVIDENCE_DIR="$(mktemp -d /tmp/turbo-qual-67.XXXXXX)" \
 - The script keeps the evidence directory by default. Without `DEMO_KEEP_EVIDENCE_DIR` or `EVIDENCE`, it creates one with `mktemp -d "${TMPDIR:-/tmp}/turbo-qual-67.XXXXXX"` and prints its path to stderr. Set `DEMO_DELETE_EVIDENCE=1` to delete that generated directory on exit; a directory you name is never deleted.
 - Each run first removes any earlier `qualification-summary.json` and `parent-evidence-index.json` from the evidence directory, so both files describe only the current run. If the run raises, the summary records `outcome: "failed"` with `exit_status: 1` and the error is re-raised.
 - Exit status: offline mode exits `0` only when the summary outcome is `offline-simulated-verified`, otherwise `2`. Hosted mode exits `0` only when `qualified` is true, otherwise `2`.
-- Every parent evidence index entry records `mode` (`offline-simulated` or `hosted`), `command` (the invocation, `python3 -m factory.qualification` plus the arguments `main()` received) and `exit_status` (that run's exit status). Both are `null` when the run functions are called directly without `main()`.
+- Every parent evidence index entry records `mode` (`offline-simulated` or `hosted`), `command` (the invocation, `python3 -m qualification_offline` or `python3 -m factory.qualification` plus the arguments `main()` received) and `exit_status` (that run's exit status). Both are `null` when the run functions are called directly without `main()`.
 - An index entry is `failed` when any of its scenarios failed, and `unavailable` when a scenario is missing, a scenario recorded no artifact or a missing/empty one, or a preflight or preparation blocker exists. Fully observed simulated entries read `passed-offline-simulated` offline and `passed-simulated` when hosted mode ran against a test origin. `qualified` stays false in every one of these cases.
 - Offline scenario results record `outcome: "verified"` when the integration produced the expected status (`expected_status`) and `"failed"` otherwise; the integration's own outcome is kept in `integration_outcome`.
 - Hosted scenarios 2 and 3 read `main` from the provider before and after the attempt; `main_preserved` is `null` when either read fails. Provider messages are recorded verbatim or as `null`.
