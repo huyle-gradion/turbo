@@ -6,9 +6,11 @@ Offline only: every git subprocess and GitHub request is replaced by a recorder.
 from __future__ import annotations
 
 import ast
+import base64
 import contextlib
 import io
 import logging
+import os
 import subprocess
 import tempfile
 import traceback
@@ -22,13 +24,20 @@ TOKEN = "ghp_FAKE_SECRET_TOKEN_95"
 SLUG = "example-org/example-repo"
 API = "https://api.github.com"
 SOURCE = Path(qualification.__file__)
+BASIC = base64.b64encode(f"x-access-token:{TOKEN}".encode()).decode()
+SECRET_FORMS = (TOKEN, BASIC, TOKEN[:20], TOKEN[-20:])
+HEADER_KEY = "http.https://github.com/.extraheader"
+CALLER_GIT_CONFIG = {"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "core.foo", "GIT_CONFIG_VALUE_0": "bar"}
+# Failing git stderr longer than 500 chars, with the token straddling the 500-char tail boundary.
+LONG_STDERR = "fatal: " + "x" * 600 + TOKEN + "y" * 488 + "\n"
 
 
 class _GitRecorder:
     """Stand-in for subprocess.run/Popen: records argv and env, fakes git."""
 
-    def __init__(self, fail: bool) -> None:
+    def __init__(self, fail: bool, stderr_text: str | None = None) -> None:
         self.fail = fail
+        self.stderr_text = stderr_text
         self.calls: list[tuple[list[str], dict | None]] = []
 
     def _record(self, args, kwargs) -> list[str]:
@@ -37,6 +46,8 @@ class _GitRecorder:
         return argv
 
     def _stderr(self, argv: list[str]) -> bytes:
+        if self.stderr_text is not None:
+            return self.stderr_text.encode()
         # Real git echoes the remote URL it was given when it fails.
         return ("fatal: unable to access '" + " ".join(argv) + "': Could not resolve host\n").encode()
 
@@ -85,8 +96,25 @@ class QualificationCredentialSafetyTests(unittest.TestCase):
         yield "fetch_remote_repo", lambda: qualification.fetch_remote_repo(dest, SLUG, TOKEN)
         yield "clone_remote_repo", lambda: qualification.clone_remote_repo(dest / "clone", SLUG, TOKEN)
 
-    def _run_recorded(self, op, fail: bool):
-        rec = _GitRecorder(fail=fail)
+    def _assert_no_secret(self, text: str, where: str) -> None:
+        for form in SECRET_FORMS:
+            self.assertNotIn(form, text, f"secret form {form[:6]}... in {where}")
+
+    def _assert_env_credential(self, env: dict | None) -> None:
+        """The git child gets the token as an http.extraheader via GIT_CONFIG_*, keeping caller entries."""
+        self.assertIsNotNone(env, "git started without an explicit environment")
+        count = int(env.get("GIT_CONFIG_COUNT", "0"))
+        pairs = [(env.get(f"GIT_CONFIG_KEY_{i}"), env.get(f"GIT_CONFIG_VALUE_{i}")) for i in range(count)]
+        self.assertGreaterEqual(count, 2, f"GIT_CONFIG_COUNT={count}: caller entry or credential missing")
+        self.assertEqual(pairs[0], ("core.foo", "bar"), "caller GIT_CONFIG_* entry not preserved at index 0")
+        headers = [v for k, v in pairs if k == HEADER_KEY]
+        self.assertEqual(len(headers), 1, f"no single {HEADER_KEY} entry within GIT_CONFIG_COUNT")
+        prefix = "AUTHORIZATION: basic "
+        self.assertTrue(headers[0].startswith(prefix))
+        self.assertEqual(base64.b64decode(headers[0][len(prefix):]).decode(), f"x-access-token:{TOKEN}")
+
+    def _run_recorded(self, op, fail: bool, stderr_text: str | None = None):
+        rec = _GitRecorder(fail=fail, stderr_text=stderr_text)
         stderr, log_buf = io.StringIO(), io.StringIO()
         handler = logging.StreamHandler(log_buf)
         handler.setLevel(logging.DEBUG)
@@ -99,6 +127,7 @@ class QualificationCredentialSafetyTests(unittest.TestCase):
             with mock.patch.object(qualification.subprocess, "run", rec.run), \
                  mock.patch.object(qualification.subprocess, "Popen", rec.popen), \
                  mock.patch.object(qualification.time, "sleep", lambda _s: None), \
+                 mock.patch.dict(os.environ, CALLER_GIT_CONFIG), \
                  contextlib.redirect_stderr(stderr):
                 try:
                     op()
@@ -118,22 +147,32 @@ class QualificationCredentialSafetyTests(unittest.TestCase):
                     self.assertIsNone(raised, f"{name} raised on a successful git run: {raised!r}")
                     self.assertTrue(rec.calls, f"{name} started no git subprocess")
                     for argv, _env in rec.calls:
-                        self.assertNotIn(TOKEN, " ".join(argv), f"token on argv of {argv[:3]}")
+                        self._assert_no_secret(" ".join(argv), f"argv of {argv[:3]}")
+                    remote = [env for argv, env in rec.calls if any("github.com" in a for a in argv)]
+                    self.assertTrue(remote, f"{name} never contacted github.com")
+                    for env in remote:
+                        self._assert_env_credential(env)
 
     def test_hosted_git_failure_does_not_leak_token(self) -> None:
         """AC1 (failure): a failing fetch/clone raises without the token in exception, stderr or logs."""
+        fragments = [TOKEN[i:i + 8] for i in range(len(TOKEN) - 7)]
         with tempfile.TemporaryDirectory() as tmp:
             for name, op in self._git_ops(Path(tmp)):
-                with self.subTest(function=name):
-                    rec, raised, err, logs = self._run_recorded(op, fail=True)
-                    self.assertNotIsInstance(raised, AttributeError, f"{name} is missing: {raised!r}")
-                    self.assertTrue(rec.calls, f"{name} started no git subprocess")
-                    self.assertIsNotNone(raised, f"{name} hid a failed git run")
-                    self.assertNotIn(TOKEN, _exception_text(raised))
-                    self.assertNotIn(TOKEN, err)
-                    self.assertNotIn(TOKEN, logs)
-                    for argv, _env in rec.calls:
-                        self.assertNotIn(TOKEN, " ".join(argv))
+                for case, stderr_text in (("echoed-url", None), ("long-stderr-token-at-tail-boundary", LONG_STDERR)):
+                    with self.subTest(function=name, stderr=case):
+                        rec, raised, err, logs = self._run_recorded(op, fail=True, stderr_text=stderr_text)
+                        self.assertNotIsInstance(raised, AttributeError, f"{name} is missing: {raised!r}")
+                        self.assertTrue(rec.calls, f"{name} started no git subprocess")
+                        self.assertIsNotNone(raised, f"{name} hid a failed git run")
+                        exc_text = _exception_text(raised)
+                        self._assert_no_secret(exc_text, "exception text")
+                        self._assert_no_secret(err, "stderr")
+                        self._assert_no_secret(logs, "logs")
+                        for argv, _env in rec.calls:
+                            self._assert_no_secret(" ".join(argv), "argv")
+                        if stderr_text is not None:
+                            leaked = [f for f in fragments if f in exc_text]
+                            self.assertEqual(leaked, [], "token fragment survived stderr truncation")
 
     def test_ref_writes_limited_to_candidate_prefix(self) -> None:
         """AC3: refs outside feat/qual- are refused locally with no HTTP request; candidates still write."""
