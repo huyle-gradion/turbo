@@ -1073,13 +1073,25 @@ def reduce_evidence_index(
         subchecks_status: dict[str, str] = {}
         artifact_paths = list(ac_entry.get("artifact_paths", []))
         missing_artifacts = [ap for ap in artifact_paths if not _artifact_present(ap)]
+        artifact_blockers: list[str] = []
+        if missing_artifacts:
+            artifact_blockers.append(f"missing-artifacts: {ac_id} is missing artifacts: {missing_artifacts}")
+        elif not artifact_paths:
+            artifact_blockers.append(f"missing-artifacts: {ac_id} recorded no artifacts")
+        for sn in ac_entry.get("scenarios", []):
+            if sn not in scenarios:
+                continue  # a missing scenario is reported by the scenario verdict
+            sc_arts = list(scenarios[sn].get("artifacts") or [])
+            sc_missing = [ap for ap in sc_arts if not _artifact_present(ap)]
+            if not sc_arts or sc_missing:
+                artifact_blockers.append(
+                    f"missing-artifacts: {ac_id} scenario {sn} "
+                    + (f"is missing artifacts: {sc_missing}" if sc_missing else "recorded no artifacts")
+                )
 
-        if missing_artifacts or not artifact_paths:
+        if artifact_blockers:
             subchecks_status["artifacts"] = "missing"
-            reduction_blockers.append(
-                f"missing-artifacts: {ac_id} is missing artifacts: {missing_artifacts}" if missing_artifacts
-                else f"missing-artifacts: {ac_id} recorded no artifacts"
-            )
+            reduction_blockers.extend(artifact_blockers)
         else:
             subchecks_status["artifacts"] = "verified"
 
@@ -1093,7 +1105,8 @@ def reduce_evidence_index(
             ac_entry["outcome"] = "failed"
         elif simulated:
             subchecks_status["hosted_scenarios"] = "simulated"
-            ac_entry["outcome"] = "passed-offline-simulated" if complete else "unavailable"
+            sim_label = "passed-simulated" if ac_entry.get("mode") == "hosted" else "passed-offline-simulated"
+            ac_entry["outcome"] = sim_label if complete else "unavailable"
         elif complete and preflight_ok:
             subchecks_status["hosted_scenarios"] = "verified"
             ac_entry["hosted_proof_status"] = "VERIFIED"
@@ -1866,21 +1879,35 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     command = ["python3", "-m", "factory.qualification", *argv]
 
-    ev_dir = args.evidence_dir or Path(os.environ.get("DEMO_KEEP_EVIDENCE_DIR", "/tmp/turbo-issue-67-evidence"))
+    ev_dir = Path(args.evidence_dir or os.environ.get("DEMO_KEEP_EVIDENCE_DIR", "/tmp/turbo-issue-67-evidence"))
+    for stale in ("qualification-summary.json", "parent-evidence-index.json"):
+        (ev_dir / stale).unlink(missing_ok=True)  # persisted results describe only this run
     tokens: list[str] = []
-    if args.mode == "hosted":
-        live_enabled = os.environ.get("TURBO_LIVE_QUALIFICATION") == "1"
-        tokens = [os.environ.get("TURBO_QUAL_INTEGRATOR_TOKEN") or "", os.environ.get("TURBO_QUAL_COMPETITOR_TOKEN") or ""]
-        res = run_hosted_qualification(
-            args.repo_slug, ev_dir, live_enabled=live_enabled,
-            integrator_token=tokens[0] or None, competitor_token=tokens[1] or None,
-            base_url=args.base_url, branch=args.branch,
-        )
-        rc = 0 if res.get("qualified") else 2
-    else:
-        res = run_offline_qualification(ev_dir)
-        rc = 0 if res.get("outcome") == "offline-simulated-verified" else 2
-    _record_invocation(Path(ev_dir), res, command, rc, tokens)
+    try:
+        if args.mode == "hosted":
+            live_enabled = os.environ.get("TURBO_LIVE_QUALIFICATION") == "1"
+            tokens = [os.environ.get("TURBO_QUAL_INTEGRATOR_TOKEN") or "", os.environ.get("TURBO_QUAL_COMPETITOR_TOKEN") or ""]
+            res = run_hosted_qualification(
+                args.repo_slug, ev_dir, live_enabled=live_enabled,
+                integrator_token=tokens[0] or None, competitor_token=tokens[1] or None,
+                base_url=args.base_url, branch=args.branch,
+            )
+            rc = 0 if res.get("qualified") else 2
+        else:
+            res = run_offline_qualification(ev_dir)
+            rc = 0 if res.get("outcome") == "offline-simulated-verified" else 2
+    except BaseException as exc:
+        ev_dir.mkdir(parents=True, exist_ok=True)
+        (ev_dir / "parent-evidence-index.json").unlink(missing_ok=True)
+        crashed = {
+            "schema": 1, "role": "qualification-summary", "mode": "hosted" if args.mode == "hosted" else "offline-simulated",
+            "status": "failed", "outcome": "failed", "qualified": False,
+            "blockers": [f"qualification-run-raised: {type(exc).__name__}: {exc}"],
+            "recorded_at": approval_mod.now(),
+        }
+        _record_invocation(ev_dir, crashed, command, 1, tokens)
+        raise
+    _record_invocation(ev_dir, res, command, rc, tokens)
     print(json.dumps(res, indent=2))
     return rc
 
