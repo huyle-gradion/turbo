@@ -11,7 +11,7 @@
     "out_of_scope": ".github .factory AGENTS.md",
     "constraints": "do not modify protected paths"
   },
-  "acceptance_criteria": [
+  "criteria": [
     {
       "id": "CRIT-CALC-1",
       "description": "Calculator provides basic arithmetic functions",
