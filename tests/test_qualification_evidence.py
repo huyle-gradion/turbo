@@ -10,6 +10,7 @@ import io
 import json
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -48,12 +49,13 @@ def _rejected_result() -> SimpleNamespace:
 
 
 @contextlib.contextmanager
-def _hosted_fakes(*, failing: str | None = None, prep_blockers: list[str] = (), with_artifacts: bool = True):
+def _hosted_fakes(*, failing: str | None = None, prep_blockers: list[str] = (), with_artifacts: bool = True,
+                  artifactless: str | None = None):
     """Run hosted qualification through main() with preflight, preparation and scenarios faked."""
     def scenario(name: str):
         def run(base_url, repo_slug, evidence_dir, *args, **kwargs):
             arts = []
-            if with_artifacts:
+            if with_artifacts and name != artifactless:
                 art = Path(evidence_dir) / "scenarios" / name / "scenario-result.json"
                 art.parent.mkdir(parents=True, exist_ok=True)
                 art.write_text("{}", encoding="utf-8")
@@ -129,6 +131,7 @@ class EvidenceIndexOutcomeTest(unittest.TestCase):
                 "failed-scenario": dict(failing="prereq_missing_and_denied"),
                 "preparation-blocker": dict(prep_blockers=["ci-poll-timeout: required check never completed"]),
                 "empty-artifacts": dict(with_artifacts=False),
+                "mixed-artifacts": dict(artifactless="prereq_missing_and_denied"),
             }
             for label, kw in variants.items():
                 ev = Path(tmp) / f"ev-hosted-{label}"
@@ -145,10 +148,46 @@ class EvidenceIndexOutcomeTest(unittest.TestCase):
                     if label == "failed-scenario":
                         self.assertEqual(index["AC1"]["outcome"], "failed")
                         self.assertEqual(index["AC4"]["outcome"], "failed")
+                    elif label == "mixed-artifacts":  # AC1 = confirmed_landing (artifact) + prereq (none)
+                        self.assertIn(index["AC1"]["outcome"], NOT_PASSING, f"AC1 claims {index['AC1']['outcome']!r}")
                     else:  # a run-wide blocker, or AC5's only scenario without artifacts
                         self.assertIn(index["AC5"]["outcome"], NOT_PASSING, f"{label}: AC5 claims {index['AC5']['outcome']!r}")
                     if label == "preparation-blocker":
                         self.assertIn(kw["prep_blockers"][0], summary["blockers"])
+
+            # Reruns into the same evidence directory must not leave an earlier run's claims behind.
+            ev = Path(tmp) / "ev-rerun"
+            with self.subTest(rerun="passing-offline"):
+                rc = _run_main(["--mode", "offline", "--evidence-dir", str(ev)])
+                self.assertEqual(rc, 0, "a fully passing offline run must exit 0")
+                self.assertEqual(self._load(ev)[1]["exit_status"], 0)
+            ev_raise = Path(tmp) / "ev-rerun-raise"
+            shutil.copytree(ev, ev_raise)
+            with self.subTest(rerun="then-blocked-hosted"), mock.patch.dict(os.environ):
+                for k in [k for k in os.environ if k.startswith(("TURBO_LIVE", "TURBO_QUAL"))]:
+                    del os.environ[k]
+                rc = _run_main(["--mode", "hosted", "--evidence-dir", str(ev)])
+                self.assertNotEqual(rc, 0)
+                self.assertEqual(self._persisted(ev)[0]["exit_status"], rc)
+                for ac, entry in self._persisted(ev)[1].items():
+                    self.assertEqual(entry.get("exit_status"), rc, f"stale {ac} index entry beside the hosted summary")
+            with self.subTest(rerun="then-raising-offline"), \
+                    mock.patch("factory.qualification.integrate_approved_child", side_effect=RuntimeError("forced crash")):
+                with contextlib.suppress(Exception):
+                    _run_main(["--mode", "offline", "--evidence-dir", str(ev_raise)])
+                summary, index = self._persisted(ev_raise)
+                for where, rec in [("summary", summary), *index.items()]:
+                    if rec:
+                        self.assertNotEqual(rec.get("exit_status"), 0, f"stale {where} claims exit 0")
+                        out = str(rec.get("outcome"))
+                        self.assertFalse("verified" in out or "passed" in out, f"stale {where} claims {out!r}")
+
+    def _persisted(self, ev: Path) -> tuple[dict, dict]:
+        """(summary, index) as persisted; an absent file reads as empty."""
+        def read(name: str) -> dict:
+            p = ev / name
+            return json.loads(p.read_text(encoding="utf-8")) if p.is_file() else {}
+        return read("qualification-summary.json"), read("parent-evidence-index.json")
 
     def test_reducer_never_passes_failed_missing_or_artifactless_outcomes(self) -> None:
         """AC2: the reducer reports failed/unavailable instead of trusting simulation or an empty artifact list."""
@@ -165,6 +204,16 @@ class EvidenceIndexOutcomeTest(unittest.TestCase):
                 "no-artifacts-simulated": (offline, {"s1": {"outcome": "verified", "simulated": True}}, []),
                 "no-artifacts-hosted": (hosted, {"s1": {"outcome": "verified", "simulated": False}}, []),
             }
+            for label, preflight in (("mixed-artifacts-simulated", offline), ("mixed-artifacts-hosted", hosted)):
+                with self.subTest(label):
+                    sim = preflight is offline
+                    index = {"AC1": {"ac_id": "AC1", "scenarios": ["s1", "artifactless_scenario"], "artifact_paths": [str(art)]}}
+                    scenarios = {"s1": {"outcome": "verified", "simulated": sim, "artifacts": [str(art)]},
+                                 "artifactless_scenario": {"outcome": "verified", "simulated": sim, "artifacts": []}}
+                    reduced, qualified, blockers = qualification.reduce_evidence_index(index, preflight, scenarios)
+                    self.assertFalse(qualified)
+                    self.assertIn(reduced["AC1"]["outcome"], NOT_PASSING, label)
+                    self.assertTrue(any("artifactless_scenario" in b for b in blockers), blockers)
             for label, (preflight, scenarios, arts) in cases.items():
                 with self.subTest(label):
                     index = {"AC1": {"ac_id": "AC1", "scenarios": ["s1"], "artifact_paths": arts}}
@@ -198,26 +247,30 @@ class ProviderObservationTest(unittest.TestCase):
     def test_main_preserved_compares_provider_main_before_and_after(self) -> None:
         """AC3: a provider whose `main` moves during the scenario yields main_preserved false."""
         real_http = qualification._http_req
-        for label in ("prereq_missing_and_denied", "competing_base_rejection"):
+        for label, provider in (("prereq_missing_and_denied", "moves"), ("competing_base_rejection", "moves"),
+                                ("prereq_missing_and_denied", "read-fails")):
             reads: list[str] = []
 
-            def moving_main(method, url, *a, **k):
+            def moving_main(method, url, *a, provider=provider, reads=reads, **k):
                 if method == "GET" and _MAIN_READ.search(unquote(urlparse(url).path)):
+                    if provider == "read-fails":
+                        reads.append("")
+                        return 503, {}, ""
                     sha = "a" * 40 if not reads else "e" * 40
                     reads.append(sha)
                     return 200, {"sha": sha, "commit": {"sha": sha}, "object": {"sha": sha, "type": "commit"},
                                  "name": "main", "ref": "refs/heads/main"}, ""
                 return real_http(method, url, *a, **k)
 
-            ev = self._tmp / f"ev-ac3-{label}"
-            with self.subTest(label), mock.patch("factory.qualification._http_req", moving_main):
+            ev = self._tmp / f"ev-ac3-{label}-{provider}"
+            with self.subTest(label, provider=provider), mock.patch("factory.qualification._http_req", moving_main):
                 args = (self.ctx.gh.base_url, SLUG, ev, self.ctx, "disp-tok", "comp-tok")
                 if label == "prereq_missing_and_denied":
                     sc = qualification.run_scenario_2_prereq_missing_and_denied(*args, allow_test_origin=True)
                 else:
                     sc = qualification.run_scenario_3_competing_base_rejection(*args, allow_test_origin=True)[0]
                 self.assertGreaterEqual(len(reads), 2, "remote main was not read from the provider before and after")
-                self.assertIs(sc["main_preserved"], False)
+                self.assertIs(sc["main_preserved"], None if provider == "read-fails" else False)
                 self.assertEqual(sc["outcome"], "failed")
 
     def test_provider_messages_are_verbatim_or_null(self) -> None:
