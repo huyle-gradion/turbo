@@ -2,11 +2,17 @@
 
 from __future__ import annotations
 
+import atexit
+import functools
 import json
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 ROOT = Path(__file__).resolve().parents[1]
 TIMEOUT = 120
@@ -94,6 +100,57 @@ def commit_probe(repo: Path, value: int, message: str) -> str:
     return commit(repo, "tests/test_probe.py", PROBE_TEST, message + " test")
 
 
+_HOME_TEMPLATES: dict[tuple[object, ...], tuple[Path, str, str, bool]] = {}
+
+
+def _bound(path: Path, resolved: bool) -> str:
+    return str(path.resolve() if resolved else path)
+
+
+def _reused_home(build):
+    """Configure a home through the real CLI once per argument set, then copy it.
+
+    The first call in a test process runs the CLI. A later call with the same
+    arguments in the same ISO week copies that home and rebinds its recorded
+    repo and home paths, which are the only path-bound fields. Only the
+    timestamps differ from a fresh run. Configuration behaviour itself is
+    covered by the tests that drive `init` and `configure` directly.
+    """
+    @functools.wraps(build)
+    def wrapper(repo: Path, home: Path, **kwargs: object) -> None:
+        try:
+            week = datetime.now(ZoneInfo(str(kwargs.get("timezone", "UTC")))).isocalendar()[:2]
+        except (KeyError, ValueError):
+            build(repo, home, **kwargs)
+            return
+        key = (build.__name__, repr(sorted(kwargs.items())), week)
+        cached = _HOME_TEMPLATES.get(key)
+        if cached is None or home.exists():
+            fresh = not home.exists()
+            build(repo, home, **kwargs)
+            if cached is None and fresh:
+                payload = json.loads((home / "config.json").read_text(encoding="utf-8"))
+                template = Path(tempfile.mkdtemp(prefix="turbo-home-template-")) / "home"
+                atexit.register(shutil.rmtree, template.parent, True)
+                shutil.copytree(home, template, symlinks=True)
+                resolved = payload["repo"] != str(repo)
+                assert (payload["repo"], payload["home"]) == (_bound(repo, resolved), _bound(home, resolved)), payload
+                _HOME_TEMPLATES[key] = (template, payload["repo"], payload["home"], resolved)
+            return
+        template, old_repo, old_home, resolved = cached
+        new_repo, new_home = _bound(repo, resolved), _bound(home, resolved)
+        shutil.copytree(template, home, symlinks=True)
+        target = home / "config.json"
+        text = target.read_text(encoding="utf-8")
+        text = text.replace(json.dumps(old_repo), json.dumps(new_repo)).replace(json.dumps(old_home), json.dumps(new_home))
+        target.write_text(text, encoding="utf-8")
+        payload = json.loads(text)
+        assert (payload["repo"], payload["home"]) == (new_repo, new_home), payload
+
+    return wrapper
+
+
+@_reused_home
 def config(repo: Path, home: Path, *, gate1: list[str] | None = None, gate2: list[str] | None = None,
            protected: list[str] | None = None, timezone: str = "UTC", spend: float | None = 12.5,
            source: str = "test export") -> None:
@@ -150,6 +207,7 @@ def to_ready(repo: Path, home: Path, **kwargs: object) -> None:
     assert result.returncode == 0, result.stdout + result.stderr
 
 
+@_reused_home
 def configure_turbo(
     repo: Path,
     home: Path,
