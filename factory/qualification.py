@@ -721,19 +721,25 @@ def create_qualification_candidate_commit(
         tree_entries.append({"path": fpath, "mode": "100644", "type": "blob", "sha": b_sha})
     _, t_sha, _ = create_remote_tree(base_url, repo_slug, base_tree_sha, tree_entries, token, actor=actor, ledger=ledger)
     _, commit_sha, _ = create_remote_commit(base_url, repo_slug, t_sha, [base_sha], message, token, actor=actor, ledger=ledger)
-    set_remote_branch_ref(base_url, repo_slug, branch_name, commit_sha, token, actor=actor, ledger=ledger)
+    r_code, _, r_msg = set_remote_branch_ref(base_url, repo_slug, branch_name, commit_sha, token, actor=actor, ledger=ledger)
+    if r_code not in (200, 201):
+        if ledger and r_code == 0:
+            ledger.record("REFUSED", f"refs/heads/{branch_name}", actor, 0, r_msg)
+        return "", t_sha  # ref not updated: callers must not use the branch content
     return commit_sha, t_sha
 
 
 def _hosted_git(args: list[str], repo_slug: str, token: str, cwd: Path | None = None) -> None:
     """Run git against github.com with the token passed only through the environment, never argv or .git/config."""
     basic = base64.b64encode(f"x-access-token:{token}".encode()).decode()
-    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_CONFIG_COUNT": "1",
-           "GIT_CONFIG_KEY_0": "http.https://github.com/.extraheader",
-           "GIT_CONFIG_VALUE_0": f"AUTHORIZATION: basic {basic}"}
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_TRACE") and k != "GIT_CURL_VERBOSE"}
+    n = int(env.get("GIT_CONFIG_COUNT", "0") or 0)  # keep caller GIT_CONFIG_* entries, append ours
+    env.update({"GIT_TERMINAL_PROMPT": "0", "GIT_CONFIG_COUNT": str(n + 1),
+                f"GIT_CONFIG_KEY_{n}": "http.https://github.com/.extraheader",
+                f"GIT_CONFIG_VALUE_{n}": f"AUTHORIZATION: basic {basic}"})
     p = subprocess.run(["git", *args], cwd=cwd, env=env, capture_output=True, text=True, check=False)
     if p.returncode != 0:
-        err = redact_qualification_tokens((p.stderr or "").strip()[-500:], [token, basic])
+        err = str(redact_qualification_tokens((p.stderr or "").strip(), [token, basic]))[-500:]
         raise RuntimeError(f"git {args[0]} failed for {repo_slug} (exit {p.returncode}): {err}")
 
 
@@ -908,7 +914,9 @@ def prepare_qualification_candidate(
                 message=f"feat: qualification candidate on {head_branch} (#67)",
                 actor="integrator", ledger=local_ledger,
             )
-            pr_head_sha = c_sha
+            pr_head_sha = c_sha or "unavailable"
+            if not c_sha:
+                prep_blockers.append(f"candidate-ref-update-failed: {head_branch} was not updated to the candidate commit")
 
         _, cf_src, _ = get_remote_file_content(base_url, repo_slug, "src/calc.py", head_branch, integrator_token, ledger=local_ledger)
         _, tf_tst, _ = get_remote_file_content(base_url, repo_slug, "tests/test_calc.py", head_branch, integrator_token, ledger=local_ledger)
@@ -1270,7 +1278,7 @@ def run_scenario_2_prereq_missing_and_denied(
         )
         code_chk, pr_chk_data, _ = _http_req("GET", f"{base_url.rstrip('/')}/repos/{repo_slug}/pulls/{unapp_pr_num}", integrator_token, base_url, [], time.monotonic() + 15.0, 15)
         pr_still_open = (pr_chk_data.get("state") == "open" and pr_chk_data.get("merged") is not True) if code_chk == 200 else True
-        protection_denial_observed = (unapp_res.status != "confirmed" and unapp_res.mutation_outcome != "succeeded" and pr_still_open)
+        protection_denial_observed = (_denial_source(unapp_res) == "provider" and pr_still_open)
         prot_res = {"status": unapp_res.status, "blockers": unapp_res.blockers, "denial_source": _denial_source(unapp_res)}
         perm_code, perm_data, perm_msg = _http_req("GET", f"{base_url.rstrip('/')}/repos/{repo_slug}/actions/permissions", competitor_token, base_url, [], time.monotonic() + 15.0, 15)
         sc_ledger.record("GET", f"{base_url.rstrip('/')}/repos/{repo_slug}/actions/permissions", "competitor", perm_code, perm_msg)
