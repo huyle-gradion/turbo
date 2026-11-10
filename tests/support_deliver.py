@@ -204,19 +204,19 @@ _SHARED: list[_SharedDeliveryWorkspace] = []
 
 
 @contextmanager
-def setup_disposable_delivery_context(root: Path):
+def setup_disposable_delivery_context(root: Path, *, shared_ok: bool = True):
     """Yield a disposable product workspace with all 4 prerequisites fully valid.
 
-    The workspace is built once per test process and restored for each use, so
-    `ctx.root` is a private directory, not `root`. A nested use builds its own
-    workspace under `root`. The disposable service variables are set only
-    inside the block.
+    With `shared_ok`, the workspace is built once per test process and
+    restored for each use, so `ctx.root` is a private directory, not `root`.
+    Without it, or in a nested use, the workspace is built under `root` and
+    kept there. The disposable service variables are set only inside the block.
     """
-    if not _SHARED:
+    if shared_ok and not _SHARED:
         _SHARED.append(_SharedDeliveryWorkspace())
-    shared = _SHARED[0]
+    shared = _SHARED[0] if shared_ok else None
     with ExitStack() as stack:
-        if shared.in_use:
+        if shared is None or shared.in_use:
             ctx = _build_delivery_context(root, stack)
         else:
             ctx = shared.fresh()
@@ -525,7 +525,8 @@ def run_integration_demo(evidence_dir: Path) -> dict[str, Any]:
     factory_rev_res = gitio.git(Path(__file__).resolve().parents[1], "rev-parse", "HEAD")
     factory_rev = factory_rev_res.output.strip() if factory_rev_res.ok else "unknown"
 
-    with setup_disposable_delivery_context(ws_root) as ctx:
+    with setup_disposable_delivery_context(ws_root, shared_ok=False) as ctx:
+        assert ctx.repo == ws_root / "repo" and ctx.repo.is_dir(), ctx.repo  # evidence is retained under evidence_dir
         b_branch, h_branch = str(ctx.intake_rec["parent"]["target_feature_branch"]), ctx.head_branch
         gate = deliver_module.enforce_delivery_approval(
             candidate_sha=ctx.cand_sha, base_sha=ctx.base_sha, repo=ctx.repo, home=ctx.home,
@@ -603,7 +604,8 @@ def run_delivery_integration_demo(evidence_dir: Path) -> dict[str, Any]:
     factory_rev_res = gitio.git(Path(__file__).resolve().parents[1], "rev-parse", "HEAD")
     factory_rev = factory_rev_res.output.strip() if factory_rev_res.ok else "unknown"
 
-    with setup_disposable_delivery_context(ws_root) as ctx:
+    with setup_disposable_delivery_context(ws_root, shared_ok=False) as ctx:
+        assert ctx.repo == ws_root / "repo" and ctx.repo.is_dir(), ctx.repo  # evidence is retained under evidence_dir
         main_sha_before = git(ctx.bare, "rev-parse", "refs/heads/main")
         commands_log: list[dict[str, Any]] = []
 

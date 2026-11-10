@@ -7,6 +7,7 @@ import functools
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -63,6 +64,15 @@ def git(repo: Path, *args: str) -> str:
     return result.stdout.strip()
 
 
+def _step_name(step) -> str:
+    return f"{step.__module__}.{step.__qualname__}"
+
+
+def _environment() -> int:
+    """The steps' CLI children inherit os.environ, so a snapshot is only reused under the same environment."""
+    return hash(tuple(sorted(os.environ.items())))
+
+
 def _week(kwargs: dict[str, object]) -> tuple[int, int] | None:
     """The ISO week of the budget timezone; recorded spend is only valid within it."""
     try:
@@ -80,14 +90,18 @@ class _Workspace:
         self.active = False
         self.depth = 0
         self.history: tuple[object, ...] | None = None
-        self.fingerprint: list[tuple[str, int, int]] = []
+        self.fingerprint: list[tuple[object, ...]] = []
 
-    def scan(self) -> list[tuple[str, int, int]]:
+    def scan(self) -> list[tuple[object, ...]]:
+        """Every file, directory and symlink with its mode; file size and mtime; link target."""
         found = []
-        for root, _dirs, files in os.walk(self.path):
-            for name in files:
-                status = os.lstat(os.path.join(root, name))
-                found.append((os.path.join(root, name), status.st_size, status.st_mtime_ns))
+        for root, dirs, files in os.walk(self.path):
+            for name in (*dirs, *files):
+                path = os.path.join(root, name)
+                status = os.lstat(path)
+                is_file, is_link = stat.S_ISREG(status.st_mode), stat.S_ISLNK(status.st_mode)
+                found.append((path, status.st_mode, status.st_size if is_file else 0,
+                              status.st_mtime_ns if is_file else 0, os.readlink(path) if is_link else None))
         return sorted(found)
 
 
@@ -100,7 +114,7 @@ def workspace():
     """A temporary directory in which fixture steps are restored from snapshots.
 
     Inside it, make_repo and the run-building helpers run for real once per
-    sequence of calls and arguments in a test process. A later identical
+    sequence of calls, arguments and environment in a test process. A later identical
     sequence restores the tree snapshotted after each step at the same
     absolute path, so path-bound evidence and digests stay valid. A change the
     test makes between steps ends snapshot use for the rest of the block. A
@@ -136,7 +150,7 @@ def snapshotted(step):
                 return step(first, *args, **kwargs)
             finally:
                 ws.depth -= 1
-        key = (*ws.history, (step.__name__, repr(args), repr(sorted(kwargs.items())), week))
+        key = (*ws.history, (_step_name(step), repr(args), repr(sorted(kwargs.items())), week, _environment()))
         snapshot = ws.snapshots.get(key)
         if snapshot is not None and time.time() - snapshot[2] < SNAPSHOT_MAX_AGE:
             shutil.rmtree(ws.path)
@@ -209,7 +223,7 @@ def _reused_home(build):
     """Configure a home through the real CLI once per argument set, then copy it.
 
     The first call in a test process runs the CLI. A later call with the same
-    arguments in the same ISO week copies that home and rebinds its recorded
+    arguments and environment in the same ISO week copies that home and rebinds its recorded
     repo and home paths, which are the only path-bound fields. Only the
     timestamps differ from a fresh run. Configuration behaviour itself is
     covered by the tests that drive `init` and `configure` directly.
@@ -220,7 +234,7 @@ def _reused_home(build):
         if week is None:
             build(repo, home, **kwargs)
             return
-        key = (build.__name__, repr(sorted(kwargs.items())), week)
+        key = (_step_name(build), repr(sorted(kwargs.items())), week, _environment())
         cached = _HOME_TEMPLATES.get(key)
         if cached is None or home.exists():
             fresh = not home.exists()
