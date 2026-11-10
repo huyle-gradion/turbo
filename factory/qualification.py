@@ -9,6 +9,7 @@ from typing import Any
 from urllib.parse import quote, urlparse
 
 from factory import automated_qa, ci_gate, config as config_module, deliver as deliver_module, gitio
+from factory.ci_selection import build_required_ci_checks
 from factory.deliver_checks import collect_redaction_secrets, git_timed
 from factory.errors import UsageError
 from factory.independent_review import approval as approval_mod
@@ -1600,6 +1601,71 @@ class _ScenarioContextUnavailable(Exception):
     """The hosted repository cannot supply a scenario context; the reason is recorded as a blocker."""
 
 
+def _policy_conf(paths: RuntimePaths, policy: dict[str, Any]) -> config_module.Config:
+    """Factory config the gate uses for a seeded repository: gate 3 guards the policy's protected paths."""
+    return config_module.with_gate(
+        config_module.skeleton(paths), "3",
+        config_module.GateConfig(kind="protected-paths", label="protected paths", paths=tuple(policy.get("protected_paths", ()))),
+    )
+
+
+def plan_seed_install(repo_slug: str, branch: str) -> dict[str, Any]:
+    """Seed files (factory/X -> .factory/X) and the target branch's required contexts = the gate's check names."""
+    if repo_slug not in DISPOSABLE_REPO_ALLOWLIST:
+        raise UsageError(f"repo-disallowed: {repo_slug!r} is not in disposable allowlist {sorted(DISPOSABLE_REPO_ALLOWLIST)}")
+    if branch not in ALLOWED_TARGET_BRANCHES:
+        raise UsageError(f"target-branch-disallowed: {branch!r} is not an allowed seed target {sorted(ALLOWED_TARGET_BRANCHES)}")
+    files: dict[str, str] = {}
+    for f in sorted(p for p in SEED_ASSETS_DIR.rglob("*") if p.is_file()):
+        rel = f.relative_to(SEED_ASSETS_DIR).as_posix()
+        files[".factory/" + rel.removeprefix("factory/") if rel.startswith("factory/") else rel] = f.read_text(encoding="utf-8")
+    policy, child = json.loads(files[".factory/policy.json"]), json.loads(files[".factory/child-contract.json"])
+    conf = _policy_conf(RuntimePaths(repo=SEED_ASSETS_DIR, home=SEED_ASSETS_DIR), policy)
+    contexts = [r["name"] for r in build_required_ci_checks(child, conf)]
+    return {"repo_slug": repo_slug, "branch": branch, "files": files, "required_status_contexts": contexts}
+
+
+def install_seed(
+    base_url: str, repo_slug: str, branch: str, token: str, *, dry_run: bool,
+    files_token: str | None = None, allow_test_origin: bool = False,
+) -> dict[str, Any]:
+    """Dry run returns the plan with no request. Apply opens a candidate-prefix PR with the seed files into the
+    target branch and sets that branch's required status contexts; `main` and other branches are never touched.
+    `files_token` (default `token`) authors the seed branch and PR; it needs the `workflow` scope for ci.yml."""
+    plan = plan_seed_install(repo_slug, branch)
+    if dry_run:
+        return {"dry_run": True, "plan": plan}
+    if not allow_test_origin and base_url.rstrip("/") != HOSTED_API_ORIGIN:
+        raise UsageError(f"wrong-origin: {base_url!r} is not {HOSTED_API_ORIGIN}")
+    head, steps = f"{CANDIDATE_BRANCH_PREFIX}seed-install", []
+    res: dict[str, Any] = {"dry_run": False, "plan": plan, "head_branch": head, "steps": steps, "status": "failed"}
+    ftok = files_token or token
+    code, base_c, msg = get_remote_commit(base_url, repo_slug, branch, token)
+    base_sha = str(base_c.get("sha") or "") if code == 200 else ""
+    steps.append({"step": "read-target-head", "http": code, "sha": base_sha or None, "message": msg})
+    if not base_sha:
+        return res
+    commit_sha, _ = create_qualification_candidate_commit(
+        base_url, repo_slug, base_sha, head, ftok, plan["files"], "setup: install gate-compatible qualification seed (#109)")
+    steps.append({"step": "seed-commit", "branch": head, "sha": commit_sha or None})
+    if not commit_sha:
+        return res
+    p_code, pr, p_msg = create_qualification_pull_request(
+        base_url, repo_slug, head, branch, "setup: install gate-compatible qualification seed",
+        "Installs the seed from turbo examples/qualification/seed (#109).", ftok)
+    if p_code not in (200, 201):  # an open seed PR from an earlier apply is reused; the branch now holds the new commit
+        pr = next(iter(get_remote_pulls(base_url, repo_slug, head, ftok)), {})
+    steps.append({"step": "seed-pr", "http": p_code, "number": pr.get("number"), "html_url": pr.get("html_url"), "message": p_msg})
+    if not pr.get("number"):
+        return res
+    url = f"{base_url.rstrip('/')}/repos/{repo_slug}/branches/{quote(branch, safe='')}/protection/required_status_checks"
+    c_code, c_data, c_msg = _http_req("PATCH", url, token, base_url, [], time.monotonic() + 15.0, 15,
+                                      payload={"strict": True, "contexts": plan["required_status_contexts"]})
+    steps.append({"step": "required-contexts", "http": c_code, "contexts": c_data.get("contexts"), "message": c_msg})
+    res["status"] = "applied" if c_code == 200 else "failed"
+    return res
+
+
 @contextlib.contextmanager
 def hosted_scenario_context(
     ws_root: Path, repo_slug: str, token: str, *,
@@ -1621,10 +1687,7 @@ def hosted_scenario_context(
     if not contract.is_file():
         (blockers if blockers is not None else []).append("scenario-context-unavailable: hosted repository has no .factory/child-contract.json")
         raise _ScenarioContextUnavailable(".factory/child-contract.json missing")
-    conf = config_module.with_gate(
-        config_module.skeleton(RuntimePaths(repo=repo, home=home)), "3",
-        config_module.GateConfig(kind="protected-paths", label="protected paths", paths=tuple(policy.get("protected_paths", ()))),
-    )
+    conf = _policy_conf(RuntimePaths(repo=repo, home=home), policy)
     yield SimpleNamespace(
         repo=repo, home=home, conf=conf, child_contract=json.loads(contract.read_text(encoding="utf-8")),
         child_dir=safe_dir(home / "child", create=True),
@@ -1800,13 +1863,26 @@ def run_hosted_qualification(
 def main(argv: list[str] | None = None) -> int:
     """Repeatable qualification command entrypoint."""
     parser = argparse.ArgumentParser(description="Turbo Issue #67 Protected Repository Qualification")
-    parser.add_argument("--mode", choices=["hosted"], default="hosted")  # offline simulation: tests/qualification_offline.py
+    parser.add_argument("--mode", choices=["hosted", "install-seed"], default="hosted")  # offline simulation: tests/qualification_offline.py
     parser.add_argument("--evidence-dir", type=Path, default=None)
     parser.add_argument("--repo-slug", default="turbo-factory/turbo-qual-67")
     parser.add_argument("--branch", default="feature/demo")
     parser.add_argument("--base-url", default="https://api.github.com")
+    parser.add_argument("--dry-run", action="store_true", help="install-seed: print the plan only (the default)")
+    parser.add_argument("--apply", action="store_true", help="install-seed: perform the plan (needs live enablement)")
     argv = list(sys.argv[1:] if argv is None else argv)
     args = parser.parse_args(argv)
+    if args.mode == "install-seed":
+        token, ftok = os.environ.get("TURBO_QUAL_INTEGRATOR_TOKEN") or "", os.environ.get("TURBO_QUAL_COMPETITOR_TOKEN") or None
+        try:
+            if args.apply and (args.dry_run or os.environ.get("TURBO_LIVE_QUALIFICATION") != "1" or not token):
+                raise UsageError("install-seed --apply requires TURBO_LIVE_QUALIFICATION=1 and TURBO_QUAL_INTEGRATOR_TOKEN, without --dry-run")
+            res = install_seed(args.base_url, args.repo_slug, args.branch, token, dry_run=not args.apply, files_token=ftok)
+        except UsageError as exc:
+            print(f"install-seed refused: {exc}", file=sys.stderr)
+            return 2
+        print(json.dumps(redact_qualification_tokens(res, [token, ftok or ""]), indent=2))
+        return 0 if res["dry_run"] or res.get("status") == "applied" else 2
     command = ["python3", "-m", "factory.qualification", *argv]
 
     ev_dir = Path(args.evidence_dir or os.environ.get("DEMO_KEEP_EVIDENCE_DIR", "/tmp/turbo-issue-67-evidence"))

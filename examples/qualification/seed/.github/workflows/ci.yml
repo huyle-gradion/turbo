@@ -1,58 +1,101 @@
+# One job per check the factory CI gate requires (ci_selection.build_required_ci_checks): the job `name:` is the
+# check name. Each job tests the PR merge commit (github.sha, parents [base, head]) and uploads its own
+# turbo-ci-evidence.json; policy_sha is the base revision whose .factory policy and contract define the check.
 name: CI
 on:
   pull_request:
-    branches: ['feature/**']
+    branches: ['feature/demo']
+permissions:
+  contents: read
 jobs:
-  build:
-    name: build
+  guard-gate-3:
+    name: guard/gate-3
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: Run tests
-        id: test_run
-        run: |
-          python3 -m unittest discover -s tests -p 'test_*.py' -v
-      - name: Generate CI evidence
-        if: always()
-        env:
-          CANDIDATE_SHA: ${{ github.event.pull_request.head.sha }}
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          TESTED_SHA: ${{ github.sha }}
-          RUN_ID: ${{ github.run_id }}
-          RUN_ATTEMPT: ${{ github.run_attempt }}
-          REPO: ${{ github.repository }}
-          OUTCOME: ${{ steps.test_run.outcome }}
+      - name: Protected-paths guard (base policy protected_paths unchanged by the PR)
+        id: check
         run: |
           mkdir -p ci-ev
-          python3 -c "
-          import os, json
-          rec = {
-              'candidate_sha': os.environ.get('CANDIDATE_SHA', ''),
-              'base_sha': os.environ.get('BASE_SHA', ''),
-              'tested_sha': os.environ.get('TESTED_SHA', ''),
-              'policy_sha': os.environ.get('BASE_SHA', ''),
-              'revision_kind': 'integration-merge',
-              'check_name': 'build',
-              'kind': 'test',
-              'command': 'python3 -m unittest discover -s tests -p test_*.py -v',
-              'exit_code': 0 if os.environ.get('OUTCOME') == 'success' else 1,
-              'conclusion': 'success' if os.environ.get('OUTCOME') == 'success' else 'failure',
-              'html_url': f'https://github.com/{os.environ.get(\"REPO\")}/actions/runs/{os.environ.get(\"RUN_ID\")}',
-              'log_text': 'Unit test execution completed',
-          }
-          manifest = {
-              'schema': 1,
-              'workflow_run_id': int(os.environ.get('RUN_ID', '1')),
-              'run_attempt': int(os.environ.get('RUN_ATTEMPT', '1')),
-              'checks': {'build': rec},
-          }
-          with open('ci-ev/turbo-ci-evidence.json', 'w') as f:
-              json.dump(manifest, f, indent=2)
-          "
+          set +e
+          python3 - > ci-ev/log.txt 2>&1 <<'PY'
+          import json, subprocess, sys
+          base = subprocess.check_output(["git", "rev-parse", "HEAD^1"], text=True).strip()
+          paths = json.loads(subprocess.check_output(["git", "show", f"{base}:.factory/policy.json"]))["protected_paths"]
+          changed = subprocess.check_output(["git", "diff", "--name-only", base, "HEAD", "--", *paths], text=True).split()
+          print(f"protected paths (base {base}): {paths}")
+          print(f"changed protected files: {changed or 'none'}")
+          sys.exit(1 if changed else 0)
+          PY
+          rc=$?
+          cat ci-ev/log.txt
+          echo "exit_code=$rc" >> "$GITHUB_OUTPUT"
+          exit $rc
+      - name: Write CI evidence
+        if: always()
+        env:
+          CHECK_NAME: guard/gate-3
+          COMMAND: "protected-paths: git diff --name-only <base> <tested> -- <base .factory/policy.json protected_paths>"
+          EXIT_CODE: ${{ steps.check.outputs.exit_code }}
+        run: |
+          python3 - <<'PY'
+          import json, os, subprocess
+          sha = lambda rev: subprocess.check_output(["git", "rev-parse", rev], text=True).strip()
+          rc = int(os.environ.get("EXIT_CODE") or 1)
+          rec = {"check_name": os.environ["CHECK_NAME"], "candidate_sha": sha("HEAD^2"), "base_sha": sha("HEAD^1"),
+                 "tested_sha": sha("HEAD"), "policy_sha": sha("HEAD^1"), "workflow_path": ".github/workflows/ci.yml",
+                 "command": os.environ["COMMAND"], "exit_code": rc, "conclusion": "success" if rc == 0 else "failure",
+                 "log_text": open("ci-ev/log.txt", encoding="utf-8", errors="replace").read()[-500000:]}
+          manifest = {"schema": 1, "workflow_run_id": int(os.environ["GITHUB_RUN_ID"]),
+                      "run_attempt": int(os.environ["GITHUB_RUN_ATTEMPT"]), "checks": {rec["check_name"]: rec}}
+          json.dump(manifest, open("ci-ev/turbo-ci-evidence.json", "w"), indent=2)
+          PY
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: turbo-ci-evidence-build
+          name: turbo-ci-evidence-guard-gate-3
+          path: ci-ev/turbo-ci-evidence.json
+
+  criterion-crit-calc-1:
+    name: criterion/CRIT-CALC-1
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Criterion CRIT-CALC-1 verification (child contract command)
+        id: check
+        run: |
+          mkdir -p ci-ev
+          set +e
+          python3 -m unittest discover -s tests -p 'test_*.py' > ci-ev/log.txt 2>&1
+          rc=$?
+          cat ci-ev/log.txt
+          echo "exit_code=$rc" >> "$GITHUB_OUTPUT"
+          exit $rc
+      - name: Write CI evidence
+        if: always()
+        env:
+          CHECK_NAME: criterion/CRIT-CALC-1
+          COMMAND: "python3 -m unittest discover -s tests -p 'test_*.py'"
+          EXIT_CODE: ${{ steps.check.outputs.exit_code }}
+        run: |
+          python3 - <<'PY'
+          import json, os, subprocess
+          sha = lambda rev: subprocess.check_output(["git", "rev-parse", rev], text=True).strip()
+          rc = int(os.environ.get("EXIT_CODE") or 1)
+          rec = {"check_name": os.environ["CHECK_NAME"], "candidate_sha": sha("HEAD^2"), "base_sha": sha("HEAD^1"),
+                 "tested_sha": sha("HEAD"), "policy_sha": sha("HEAD^1"), "workflow_path": ".github/workflows/ci.yml",
+                 "command": os.environ["COMMAND"], "exit_code": rc, "conclusion": "success" if rc == 0 else "failure",
+                 "log_text": open("ci-ev/log.txt", encoding="utf-8", errors="replace").read()[-500000:]}
+          manifest = {"schema": 1, "workflow_run_id": int(os.environ["GITHUB_RUN_ID"]),
+                      "run_attempt": int(os.environ["GITHUB_RUN_ATTEMPT"]), "checks": {rec["check_name"]: rec}}
+          json.dump(manifest, open("ci-ev/turbo-ci-evidence.json", "w"), indent=2)
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: turbo-ci-evidence-criterion-crit-calc-1
           path: ci-ev/turbo-ci-evidence.json

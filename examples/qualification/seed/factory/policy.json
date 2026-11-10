@@ -7,7 +7,8 @@
     "AGENTS.md"
   ],
   "required_checks": [
-    "build"
+    "guard/gate-3",
+    "criterion/CRIT-CALC-1"
   ],
   "cache_policy": {
     "cache_verification_results_across_revisions": false
