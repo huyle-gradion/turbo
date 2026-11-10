@@ -1,10 +1,11 @@
 """Tests for protected repository qualification harness (#67)."""
 from __future__ import annotations
 
-import base64, json, os, shutil, tempfile, threading, unittest
+import base64, json, os, shutil, subprocess, tempfile, threading, unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+from unittest import mock
 from urllib.parse import unquote, urlparse
 
 from factory.qualification import (
@@ -18,7 +19,7 @@ from factory.qualification import (
     get_submitted_review, observe_identity_and_permissions,
     prepare_qualification_candidate, reduce_evidence_index,
     resolve_agy_bin,
-    run_hosted_qualification, run_offline_qualification,
+    run_hosted_qualification,
     run_scenario_1_confirmed_landing, run_scenario_2_prereq_missing_and_denied,
     run_scenario_3_competing_base_rejection, run_scenario_4_renewed_verification_after_base_change,
     submit_qualification_pr_review, verify_qualification_pr_review,
@@ -481,10 +482,19 @@ class QualificationSafetyAndCapabilityTest(unittest.TestCase):
 
 class QualificationOfflineExecutionTest(unittest.TestCase):
     def test_offline_qualification_scenarios_and_evidence(self) -> None:
-        """Execute all six parent #24 scenarios through actual A+B implementation and verify evidence."""
+        """The script's offline mode runs the tests-side harness through all six parent #24 scenarios (#97)."""
         with tempfile.TemporaryDirectory() as tmp:
             ev_dir = Path(tmp) / "ev"
-            summary = run_offline_qualification(ev_dir)
+            root = Path(__file__).resolve().parents[1]
+            env = {k: v for k, v in os.environ.items() if not k.startswith(("TURBO_", "DEMO_"))}
+            env["EVIDENCE"] = str(ev_dir)
+            proc = subprocess.run(
+                ["bash", str(root / "scripts" / "qualify-protected-demo.sh"), "--mode", "offline"],
+                cwd=root, env=env, capture_output=True, text=True, timeout=300,
+            )
+            self.assertTrue((ev_dir / "qualification-summary.json").is_file(), proc.stderr[-1000:])
+            summary = json.loads((ev_dir / "qualification-summary.json").read_text(encoding="utf-8"))
+            self.assertIn("qualification_offline", " ".join(summary["command"]), "offline mode must run the moved harness")
 
             self.assertEqual(summary["status"], "preparation-complete")
             self.assertFalse(summary["qualified"], "Qualification cannot be claimed until hosted proof runs")
@@ -632,52 +642,35 @@ class QualificationCandidatePreparationTest(unittest.TestCase):
             self.assertTrue(any("missing-ci-check" in b for b in miss_blockers))
 
     def test_prepare_qualification_candidate_reviewer_capability(self) -> None:
-        """Missing reviewer executable records unavailable and blocks preparation; a supported one prepares."""
+        """No runnable reviewer, or a stub executable that reviews nothing, records no verified review and blocks (#97 AC2)."""
         cand_sha = "c1234567890abcdef1234567890abcdef1234567"
         base_sha = "b1234567890abcdef1234567890abcdef1234567"
-        with _HostedQualificationFakeServer() as gh:
-            with tempfile.TemporaryDirectory() as tmp:
-                ev_dir = Path(tmp) / "ev"
-                rec = prepare_qualification_candidate(
-                    gh.base_url, "turbo-factory/turbo-qual-67", ev_dir,
-                    candidate_sha=cand_sha, base_sha=base_sha,
-                    integrator_token="valid-int-tok", competitor_token="valid-comp-tok",
-                    agy_bin=None, allow_test_origin=True,
-                )
-                self.assertEqual(rec["status"], "blocked")
-                self.assertEqual(rec["outcome"], "unavailable")
-                self.assertTrue(any("unsupported-reviewer-capability" in b for b in rec["blockers"]))
-                self.assertEqual(rec["prerequisites"]["security"]["status"], "unavailable")
-                self.assertEqual(rec["prerequisites"]["independent_review"]["status"], "unavailable")
-                self.assertEqual(rec["builder"]["kind"], "deterministic-qualification-process")
-                self.assertEqual(rec["builder"]["actor"], "cone-orgs")
-
-                # Verify file was written
-                prep_file = ev_dir / "candidate-preparation.json"
-                self.assertTrue(prep_file.exists())
-
-        # When supported reviewer executable is provided, candidate preparation succeeds
-        with _HostedQualificationFakeServer() as gh:
-            with tempfile.TemporaryDirectory() as tmp:
-                ev_dir = Path(tmp) / "ev"
-                # Create a temporary dummy executable reviewer
-                fake_agy = Path(tmp) / "mock-agy"
-                fake_agy.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-                fake_agy.chmod(0o755)
-
-                rec = prepare_qualification_candidate(
-                    gh.base_url, "turbo-factory/turbo-qual-67", ev_dir,
-                    candidate_sha=cand_sha, base_sha=base_sha,
-                    integrator_token="valid-int-tok", competitor_token="valid-comp-tok",
-                    agy_bin=str(fake_agy), allow_test_origin=True,
-                )
-                self.assertEqual(rec["status"], "prepared")
-                self.assertEqual(rec["outcome"], "prepared")
-                self.assertEqual(len(rec["blockers"]), 0)
-                self.assertTrue(rec["prerequisites"]["qa"]["qa_verified"])
-                self.assertEqual(rec["prerequisites"]["ci"]["status"], "verified")
-                self.assertEqual(rec["prerequisites"]["github_review"]["state"], "APPROVED")
-                self.assertEqual(rec["builder"]["candidate_sha"], cand_sha)
+        with tempfile.TemporaryDirectory() as tmp:
+            stub = Path(tmp) / "mock-agy"
+            stub.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            stub.chmod(0o755)
+            for label, agy in (("none", None), ("stub-exits-0", str(stub))):
+                with self.subTest(label), _HostedQualificationFakeServer() as gh:
+                    ev_dir = Path(tmp) / f"ev-{label}"
+                    with mock.patch("factory.qualification.resolve_agy_bin", return_value=agy):
+                        rec = prepare_qualification_candidate(
+                            gh.base_url, "turbo-factory/turbo-qual-67", ev_dir,
+                            candidate_sha=cand_sha, base_sha=base_sha,
+                            integrator_token="valid-int-tok", competitor_token="valid-comp-tok",
+                            agy_bin=agy, allow_test_origin=True,
+                        )
+                    self.assertEqual(rec["status"], "blocked")
+                    self.assertEqual(rec["outcome"], "unavailable")
+                    for key in ("security", "independent_review"):
+                        self.assertNotEqual(rec["prerequisites"][key]["status"], "verified", key)
+                    self.assertNotEqual(rec["prerequisites"]["github_review"].get("state"), "APPROVED")
+                    if agy is None:
+                        self.assertTrue(any("unsupported-reviewer-capability" in b for b in rec["blockers"]))
+                        self.assertEqual(rec["prerequisites"]["security"]["status"], "unavailable")
+                        self.assertEqual(rec["prerequisites"]["independent_review"]["status"], "unavailable")
+                    self.assertEqual(rec["builder"]["kind"], "deterministic-qualification-process")
+                    self.assertEqual(rec["builder"]["actor"], "cone-orgs")
+                    self.assertTrue((ev_dir / "candidate-preparation.json").exists())
 
 
 class HostedScenariosExecutionTest(unittest.TestCase):
