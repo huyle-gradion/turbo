@@ -1,11 +1,10 @@
 import hashlib
-import tempfile
 import unittest
 from pathlib import Path
 
 from support import (
     PROBE_TEST, cli, commit, commit_probe, config, git, home_dir, make_repo,
-    prepare, red, run_state, staged,
+    prepare, red, run_state, staged, workspace,
 )
 
 SLOW_WHEN_FIXED = (
@@ -17,7 +16,7 @@ SLOW_WHEN_FIXED = (
 
 class ReplayTest(unittest.TestCase):
     def test_green_requires_a_recorded_replay_of_the_red_command(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             sha = staged(repo, home)
@@ -39,7 +38,7 @@ class ReplayTest(unittest.TestCase):
         self.assertEqual(after["replay"]["exit"], 0)
 
     def test_replay_records_the_exact_red_argv_and_test_identity(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             staged(repo, home)
@@ -68,7 +67,7 @@ class ReplayTest(unittest.TestCase):
         self.assertEqual(record["output_sha256"], digest)
 
     def test_replay_timeout_is_recorded_and_never_passes(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             config(repo, home)
@@ -89,7 +88,7 @@ class ReplayTest(unittest.TestCase):
         self.assertIn("timed out", text)
 
     def test_replay_execution_failure_is_recorded_and_never_passes(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             config(repo, home)
@@ -119,7 +118,7 @@ class ReplayTest(unittest.TestCase):
         self.assertEqual(record["exit"], 127)
 
     def test_replay_refuses_a_dirty_tree(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             staged(repo, home)
@@ -131,7 +130,7 @@ class ReplayTest(unittest.TestCase):
         self.assertIsNone(state.get("replay"))
 
     def test_replay_refuses_a_moved_head(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             staged(repo, home)
@@ -141,7 +140,7 @@ class ReplayTest(unittest.TestCase):
         self.assertIn("staged", result.stderr.lower())
 
     def test_stage_refuses_a_commit_that_does_not_descend_from_the_red_commit(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             staged(repo, home)

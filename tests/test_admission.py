@@ -1,14 +1,13 @@
 import json
-import tempfile
 import unittest
 from pathlib import Path
 
-from support import cli, config, git, home_dir, make_repo, prepare, run_state, spend_record, to_ready
+from support import cli, config, git, home_dir, make_repo, prepare, run_state, spend_record, to_ready, workspace
 
 
 class AdmissionTest(unittest.TestCase):
     def test_prepare_without_config_is_refused_without_state(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             self.assertEqual(cli(repo, home, "init").returncode, 0)
@@ -19,7 +18,7 @@ class AdmissionTest(unittest.TestCase):
         self.assertIn("config", result.stderr.lower())
 
     def test_missing_gates_stop_admission_instead_of_ready(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             self.assertEqual(cli(repo, home, "init").returncode, 0)
@@ -33,7 +32,7 @@ class AdmissionTest(unittest.TestCase):
         self.assertNotEqual(state["phase"], "ready")
 
     def test_unknown_spend_is_unpriced_and_stops_admission(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             config(repo, home, spend=None)
@@ -46,7 +45,7 @@ class AdmissionTest(unittest.TestCase):
         self.assertIn("UNPRICED", result.stdout + result.stderr)
 
     def test_known_spend_admits_a_ready_run(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             config(repo, home, spend=12.5)
@@ -62,7 +61,7 @@ class AdmissionTest(unittest.TestCase):
         self.assertTrue(state["admitted_at"].endswith("Z"))
 
     def test_bug_quota_leaves_only_bug_work_between_the_two_lines(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             config(repo, home, spend=165)
@@ -73,7 +72,7 @@ class AdmissionTest(unittest.TestCase):
         self.assertEqual(state["phase"], "ready")
 
     def test_weekly_stop_blocks_every_kind(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             config(repo, home, spend=200)
@@ -83,7 +82,7 @@ class AdmissionTest(unittest.TestCase):
         self.assertEqual(state["stop_reason"], "budget")
 
     def test_gate_one_requires_an_explicit_host_deny_declaration(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             self.assertEqual(cli(repo, home, "init").returncode, 0)
@@ -94,7 +93,7 @@ class AdmissionTest(unittest.TestCase):
         self.assertNotIn("1", saved["gates"])
 
     def test_model_account_attestation_is_required(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             config(repo, home)
@@ -103,7 +102,7 @@ class AdmissionTest(unittest.TestCase):
         self.assertIn("attest", result.stderr.lower())
 
     def test_invalid_limits_are_rejected(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             config(repo, home)
@@ -113,7 +112,7 @@ class AdmissionTest(unittest.TestCase):
         self.assertEqual(missing.returncode, 2)
 
     def test_dirty_tree_blocks_prepare(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             config(repo, home)
@@ -123,7 +122,7 @@ class AdmissionTest(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
 
     def test_existing_run_branch_blocks_prepare(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             config(repo, home)
@@ -134,7 +133,7 @@ class AdmissionTest(unittest.TestCase):
         self.assertEqual(state["stop_reason"], "missing")
 
     def test_second_prepare_on_a_ready_run_is_refused(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             to_ready(repo, home)

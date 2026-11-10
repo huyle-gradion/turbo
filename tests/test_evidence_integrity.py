@@ -1,8 +1,7 @@
-import tempfile
 import unittest
 from pathlib import Path
 
-from support import cli, git, home_dir, make_repo, run_state, to_green
+from support import cli, git, home_dir, make_repo, run_state, to_green, workspace
 
 
 def replay_then_gates(repo: Path, home: Path) -> None:
@@ -15,7 +14,7 @@ def replay_then_gates(repo: Path, home: Path) -> None:
 
 class GreenArtifactTest(unittest.TestCase):
     def test_green_refuses_a_deleted_red_artifact(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             from support import staged
@@ -30,7 +29,7 @@ class GreenArtifactTest(unittest.TestCase):
         self.assertIsNone(state["green"])
 
     def test_green_refuses_a_modified_red_artifact(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             from support import staged
@@ -45,7 +44,7 @@ class GreenArtifactTest(unittest.TestCase):
         self.assertEqual(state["phase"], "gates")
 
     def test_green_refuses_a_symlinked_gate_artifact(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             from support import staged
@@ -61,7 +60,7 @@ class GreenArtifactTest(unittest.TestCase):
         self.assertIn("symlink", result.stderr.lower())
 
     def test_green_refuses_a_missing_replay_artifact(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             from support import staged
@@ -76,7 +75,7 @@ class GreenArtifactTest(unittest.TestCase):
 
     def test_green_refuses_an_artifact_path_outside_the_private_home(self):
         import json
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             from support import staged
@@ -95,7 +94,7 @@ class GreenArtifactTest(unittest.TestCase):
 
 class RepeatedGreenTest(unittest.TestCase):
     def test_repeated_green_revalidates_the_staged_head(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             sha = to_green(repo, home)
@@ -108,7 +107,7 @@ class RepeatedGreenTest(unittest.TestCase):
         self.assertEqual(state["green_sha"], sha)
 
     def test_repeated_green_refuses_a_dirty_tree(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             to_green(repo, home)
@@ -120,7 +119,7 @@ class RepeatedGreenTest(unittest.TestCase):
         self.assertEqual(state["phase"], "green")
 
     def test_repeated_green_refuses_when_a_gate_artifact_changed(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             to_green(repo, home)
@@ -133,7 +132,7 @@ class RepeatedGreenTest(unittest.TestCase):
 
 class ManifestArtifactTest(unittest.TestCase):
     def test_manifest_refuses_a_modified_gate_artifact(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             to_green(repo, home)
@@ -146,7 +145,7 @@ class ManifestArtifactTest(unittest.TestCase):
         self.assertFalse(manifest.exists())
 
     def test_manifest_refuses_a_corrupt_existing_manifest(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             to_green(repo, home)
@@ -159,7 +158,7 @@ class ManifestArtifactTest(unittest.TestCase):
         self.assertEqual(content, "{not json")
 
     def test_manifest_refuses_a_partial_existing_manifest(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             to_green(repo, home)
@@ -171,7 +170,7 @@ class ManifestArtifactTest(unittest.TestCase):
         self.assertEqual(content, '{"schema": 1}')
 
     def test_manifest_refuses_a_symlinked_manifest(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             to_green(repo, home)
@@ -186,7 +185,7 @@ class ManifestArtifactTest(unittest.TestCase):
         self.assertEqual(content, "{}\n")
 
     def test_manifest_refuses_to_recreate_a_deleted_manifest(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             to_green(repo, home)

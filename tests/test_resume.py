@@ -1,8 +1,7 @@
-import tempfile
 import unittest
 from pathlib import Path
 
-from support import cli, git, home_dir, make_repo, run_state, spend_record, to_green, to_red
+from support import cli, git, home_dir, make_repo, run_state, spend_record, to_green, to_red, workspace
 
 
 def resume(repo: Path, home: Path, pr: str | None = None, extra_path: str | None = None):
@@ -14,7 +13,7 @@ def resume(repo: Path, home: Path, pr: str | None = None, extra_path: str | None
 
 class ResumeTest(unittest.TestCase):
     def test_default_pr_state_is_unknown_and_refuses(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             to_red(repo, home)
@@ -25,7 +24,7 @@ class ResumeTest(unittest.TestCase):
         self.assertIn("pr-unknown", entry["reasons"])
 
     def test_pr_none_and_consistent_head_resumes_appends_history_without_gh(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             to_red(repo, home)
@@ -48,7 +47,7 @@ class ResumeTest(unittest.TestCase):
         self.assertFalse(marker.exists())
 
     def test_dirty_tree_refuses_and_preserves_work(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             to_red(repo, home)
@@ -61,7 +60,7 @@ class ResumeTest(unittest.TestCase):
         self.assertEqual(content, "# uncommitted\n")
 
     def test_head_mismatch_refuses(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             to_red(repo, home)
@@ -72,7 +71,7 @@ class ResumeTest(unittest.TestCase):
         self.assertIn("head-mismatch", entry["reasons"])
 
     def test_remote_ref_mismatch_refuses(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             to_red(repo, home)
@@ -90,7 +89,7 @@ class ResumeTest(unittest.TestCase):
         self.assertEqual(local, red_sha)
 
     def test_cancelled_lane_stays_stopped(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             to_red(repo, home)
@@ -102,7 +101,7 @@ class ResumeTest(unittest.TestCase):
         self.assertEqual(state["stop_reason"], "cancelled")
 
     def test_budget_stop_recovers_only_with_no_pr_and_keeps_counters(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             to_red(repo, home)
@@ -121,7 +120,7 @@ class ResumeTest(unittest.TestCase):
         self.assertEqual(state["counters"]["operations_used"], 1)
 
     def test_local_verified_run_resumes_consistently(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             to_green(repo, home)
@@ -133,7 +132,7 @@ class ResumeTest(unittest.TestCase):
         self.assertEqual(state["resume_history"][-1]["verdict"], "consistent")
 
     def test_missing_run_is_refused(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             self.assertEqual(cli(repo, home, "init").returncode, 0)
@@ -141,7 +140,7 @@ class ResumeTest(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
 
     def test_prepare_does_not_discard_a_mid_run_stop(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             to_red(repo, home)

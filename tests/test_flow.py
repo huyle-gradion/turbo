@@ -1,18 +1,17 @@
 import hashlib
 import json
-import tempfile
 import unittest
 from pathlib import Path
 
 from support import (
     cli, commit, commit_probe, git, home_dir, make_repo,
-    private_mode, red, run_state, staged, to_green, to_ready,
+    private_mode, red, run_state, staged, to_green, to_ready, workspace,
 )
 
 
 class FlowTest(unittest.TestCase):
     def test_full_flow_reaches_local_verified_idempotently(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             sha = to_green(repo, home)
@@ -56,7 +55,7 @@ class FlowTest(unittest.TestCase):
         self.assertEqual(mode, 0o600)
 
     def test_red_rejects_a_passing_test(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             to_ready(repo, home)
@@ -70,7 +69,7 @@ class FlowTest(unittest.TestCase):
         self.assertEqual(state["phase"], "stopped")
 
     def test_red_rejects_a_wrong_failure_reason(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             to_ready(repo, home)
@@ -83,7 +82,7 @@ class FlowTest(unittest.TestCase):
         self.assertIsNone(state["red"])
 
     def test_red_marker_is_language_agnostic(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             to_ready(repo, home)
@@ -96,7 +95,7 @@ class FlowTest(unittest.TestCase):
         self.assertEqual(state["red"]["test"]["file"], "tests/failure.txt")
 
     def test_red_requires_a_clean_committed_test_snapshot(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             to_ready(repo, home)
@@ -109,7 +108,7 @@ class FlowTest(unittest.TestCase):
         self.assertIsNone(state["red"])
 
     def test_red_test_must_be_committed_at_head(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             to_ready(repo, home)
@@ -122,7 +121,7 @@ class FlowTest(unittest.TestCase):
         self.assertIsNone(state["red"])
 
     def test_red_and_green_must_be_different_commits(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             to_ready(repo, home)
@@ -137,7 +136,7 @@ class FlowTest(unittest.TestCase):
         self.assertIsNone(state["expected_green_sha"])
 
     def test_green_refuses_a_dirty_working_tree(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             staged(repo, home)

@@ -1,14 +1,13 @@
 """Final fix round: stage limits, active resume limits, replay integrity, manifest contract, state bounds."""
 
 import json
-import tempfile
 import time
 import unittest
 from pathlib import Path
 
 from support import (
     cli, commit_probe, config, git, home_dir, make_repo, prepare, red,
-    run_state, spend_record, staged, to_green, to_ready, to_red,
+    run_state, spend_record, staged, to_green, to_ready, to_red, workspace,
 )
 
 ISSUE = "7"
@@ -24,7 +23,7 @@ def stage(repo: Path, home: Path, commit: str):
 
 class StageLimitTest(unittest.TestCase):
     def test_stage_refuses_after_the_operation_limit_is_spent(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             config(repo, home)
@@ -47,7 +46,7 @@ class StageLimitTest(unittest.TestCase):
         self.assertEqual(later.returncode, 2)
 
     def test_stage_refuses_after_the_time_limit_expires(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             config(repo, home)
@@ -71,7 +70,7 @@ class StageLimitTest(unittest.TestCase):
 
 class ActiveLimitResumeTest(unittest.TestCase):
     def test_resume_refuses_an_expired_ready_run_as_superseded(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             config(repo, home)
@@ -94,7 +93,7 @@ class ActiveLimitResumeTest(unittest.TestCase):
         self.assertIn("new issue", prompt.stdout.lower())
 
     def test_resume_refuses_an_operation_exhausted_red_run(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             config(repo, home)
@@ -110,7 +109,7 @@ class ActiveLimitResumeTest(unittest.TestCase):
         self.assertEqual(state["counters"]["operations_used"], 1)
 
     def test_resume_refuses_an_operation_exhausted_gated_run(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             config(repo, home)
@@ -133,7 +132,7 @@ class ActiveLimitResumeTest(unittest.TestCase):
 
 class ReplayIntegrityTest(unittest.TestCase):
     def test_green_phase_replay_refuses_a_missing_artifact(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             to_green(repo, home)
@@ -144,7 +143,7 @@ class ReplayIntegrityTest(unittest.TestCase):
         self.assertNotIn("already recorded", result.stdout)
 
     def test_local_verified_replay_refuses_a_modified_artifact(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             to_green(repo, home)
@@ -157,7 +156,7 @@ class ReplayIntegrityTest(unittest.TestCase):
         self.assertNotIn("already recorded", result.stdout)
 
     def test_staged_replay_refuses_a_missing_artifact(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             staged(repo, home)
@@ -179,7 +178,7 @@ class ManifestContractTest(unittest.TestCase):
             (("budget", "usd"), 0.0),
             (("budget_admission", "source"), "someone else"),
         )
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             to_green(repo, home)
@@ -201,7 +200,7 @@ class ManifestContractTest(unittest.TestCase):
                     self.assertEqual(target.read_bytes(), written)
 
     def test_new_spend_after_manifest_keeps_the_recorded_snapshot_valid(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             to_green(repo, home)
@@ -218,7 +217,7 @@ class ManifestContractTest(unittest.TestCase):
 
 class RunStateBoundsTest(unittest.TestCase):
     def test_malformed_state_is_a_clean_usage_failure(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             to_ready(repo, home)
@@ -245,7 +244,7 @@ class RunStateBoundsTest(unittest.TestCase):
                 "stop_reason",
             ),
         )
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             to_ready(repo, home)

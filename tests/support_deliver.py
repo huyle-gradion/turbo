@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
-import copy, json, os, shutil, sys, time, unittest.mock
+import atexit, copy, dataclasses, json, os, shutil, sys, tempfile, time, unittest.mock
 from pathlib import Path
 from typing import Any
 
@@ -70,9 +70,15 @@ class DeliveryContext:
         self.gh.protection_status = 200
 
 
-@contextmanager
-def setup_disposable_delivery_context(root: Path):
-    """Build a disposable product workspace with all 4 prerequisites fully valid."""
+_ENV_KEYS = ("TURBO_ASANA_API_URL", "ASANA_ACCESS_TOKEN", "TURBO_GITHUB_API_URL", "TURBO_GITHUB_TOKEN")
+
+
+def _disposable_env(asana: _DisposableAsanaServer, gh: _DisposableGitHubServer) -> dict[str, str]:
+    return dict(zip(_ENV_KEYS, (asana.base_url, "disposable-asana-token", gh.base_url, "disposable-gh-token")))
+
+
+def _build_delivery_context(root: Path, stack: ExitStack) -> DeliveryContext:
+    """Run a fake delivery, QA, security review and independent review to make all 4 prerequisites valid."""
     repo, home, bare = _make_disposable_product_workspace(root)
     paths = RuntimePaths(repo=repo, home=home)
     conf = config_module.load(paths)
@@ -81,16 +87,9 @@ def setup_disposable_delivery_context(root: Path):
     ir_agy = _make_fake_agy(root, "agy-ir", _make_staged_reviewer_script())
     spec = deliver_module.DeliverSpec(task_ref="900", time_limit_seconds=60, agy_bin=str(builder_agy))
 
-    with ExitStack() as stack:
-        asana = stack.enter_context(_DisposableAsanaServer(PARENT_TASK, [{"data": [READY_CHILD], "next_page": None}]))
-        gh = stack.enter_context(_DisposableGitHubServer(bare_repo=bare))
-        stack.enter_context(unittest.mock.patch.dict(os.environ, {
-            "TURBO_ASANA_API_URL": asana.base_url,
-            "ASANA_ACCESS_TOKEN": "disposable-asana-token",
-            "TURBO_GITHUB_API_URL": gh.base_url,
-            "TURBO_GITHUB_TOKEN": "disposable-gh-token",
-        }))
-
+    asana = stack.enter_context(_DisposableAsanaServer(PARENT_TASK, [{"data": [READY_CHILD], "next_page": None}]))
+    gh = stack.enter_context(_DisposableGitHubServer(bare_repo=bare))
+    with unittest.mock.patch.dict(os.environ, _disposable_env(asana, gh)):
         r_ci = deliver_module.deliver_feature(paths, spec)
         assert r_ci.status == "qa-missing" and r_ci.ci_verified and not r_ci.delivery_approved, r_ci
         cand_sha, base_sha = str(r_ci.candidate_sha), str(r_ci.base_sha)
@@ -147,6 +146,83 @@ def setup_disposable_delivery_context(root: Path):
             child_contract=child_contract, valid_snapshots=valid_snapshots,
             builder_agy=builder_agy, sec_agy=sec_agy, ir_agy=ir_agy,
         )
+        return ctx
+
+
+_SERVER_HANDLES = ("_server", "_thread")
+
+
+def _server_state(server: Any) -> dict[str, Any]:
+    return copy.deepcopy({k: v for k, v in vars(server).items() if k not in _SERVER_HANDLES})
+
+
+def _restore_server_state(server: Any, state: dict[str, Any]) -> None:
+    for key in [k for k in vars(server) if k not in _SERVER_HANDLES]:
+        delattr(server, key)
+    for key, value in copy.deepcopy(state).items():
+        setattr(server, key, value)
+
+
+class _SharedDeliveryWorkspace:
+    """One built delivery workspace per test process, restored to its built state for each use.
+
+    The workspace is restored byte-for-byte at the same absolute path, and the
+    disposable servers keep their ports, so the path- and port-bound evidence stays
+    valid. Server request logs and settings are reset to their state after the build.
+    """
+
+    def __init__(self) -> None:
+        self.stack = ExitStack()
+        base = Path(tempfile.mkdtemp(prefix="turbo-delivery-"))
+        self.stack.callback(shutil.rmtree, base, True)
+        try:
+            (base / "ws").mkdir()
+            self.ctx = _build_delivery_context(base / "ws", self.stack)
+            self.snapshot = base / "snapshot"
+            shutil.copytree(self.ctx.root, self.snapshot, symlinks=True)
+        except BaseException:
+            self.stack.close()
+            raise
+        self.servers = {"asana": _server_state(self.ctx.asana), "gh": _server_state(self.ctx.gh)}
+        self.in_use = False
+        atexit.register(self.stack.close)
+
+    def fresh(self) -> DeliveryContext:
+        ctx = self.ctx
+        shutil.rmtree(ctx.root)
+        shutil.copytree(self.snapshot, ctx.root, symlinks=True)
+        _restore_server_state(ctx.asana, self.servers["asana"])
+        _restore_server_state(ctx.gh, self.servers["gh"])
+        intake_rec = copy.deepcopy(ctx.intake_rec)
+        return dataclasses.replace(
+            ctx, conf=config_module.load(ctx.paths), intake_rec=intake_rec,
+            child_contract=intake_rec["children"][0], valid_snapshots=copy.deepcopy(ctx.valid_snapshots),
+        )
+
+
+_SHARED: list[_SharedDeliveryWorkspace] = []
+
+
+@contextmanager
+def setup_disposable_delivery_context(root: Path, *, shared_ok: bool = True):
+    """Yield a disposable product workspace with all 4 prerequisites fully valid.
+
+    With `shared_ok`, the workspace is built once per test process and
+    restored for each use, so `ctx.root` is a private directory, not `root`.
+    Without it, or in a nested use, the workspace is built under `root` and
+    kept there. The disposable service variables are set only inside the block.
+    """
+    if shared_ok and not _SHARED:
+        _SHARED.append(_SharedDeliveryWorkspace())
+    shared = _SHARED[0] if shared_ok else None
+    with ExitStack() as stack:
+        if shared is None or shared.in_use:
+            ctx = _build_delivery_context(root, stack)
+        else:
+            ctx = shared.fresh()
+            shared.in_use = True
+            stack.callback(setattr, shared, "in_use", False)
+        stack.enter_context(unittest.mock.patch.dict(os.environ, _disposable_env(ctx.asana, ctx.gh)))
         yield ctx
 
 
@@ -449,7 +525,8 @@ def run_integration_demo(evidence_dir: Path) -> dict[str, Any]:
     factory_rev_res = gitio.git(Path(__file__).resolve().parents[1], "rev-parse", "HEAD")
     factory_rev = factory_rev_res.output.strip() if factory_rev_res.ok else "unknown"
 
-    with setup_disposable_delivery_context(ws_root) as ctx:
+    with setup_disposable_delivery_context(ws_root, shared_ok=False) as ctx:
+        assert ctx.repo == ws_root / "repo" and ctx.repo.is_dir(), ctx.repo  # evidence is retained under evidence_dir
         b_branch, h_branch = str(ctx.intake_rec["parent"]["target_feature_branch"]), ctx.head_branch
         gate = deliver_module.enforce_delivery_approval(
             candidate_sha=ctx.cand_sha, base_sha=ctx.base_sha, repo=ctx.repo, home=ctx.home,
@@ -527,7 +604,8 @@ def run_delivery_integration_demo(evidence_dir: Path) -> dict[str, Any]:
     factory_rev_res = gitio.git(Path(__file__).resolve().parents[1], "rev-parse", "HEAD")
     factory_rev = factory_rev_res.output.strip() if factory_rev_res.ok else "unknown"
 
-    with setup_disposable_delivery_context(ws_root) as ctx:
+    with setup_disposable_delivery_context(ws_root, shared_ok=False) as ctx:
+        assert ctx.repo == ws_root / "repo" and ctx.repo.is_dir(), ctx.repo  # evidence is retained under evidence_dir
         main_sha_before = git(ctx.bare, "rev-parse", "refs/heads/main")
         commands_log: list[dict[str, Any]] = []
 

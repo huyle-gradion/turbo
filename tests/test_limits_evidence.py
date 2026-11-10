@@ -1,18 +1,17 @@
 import json
-import tempfile
 import time
 import unittest
 from pathlib import Path
 
 from support import (
     cli, commit_probe, config, git, home_dir, make_repo, prepare,
-    private_mode, run_state, spend_record, to_ready,
+    private_mode, run_state, spend_record, to_ready, workspace,
 )
 
 
 class LimitTest(unittest.TestCase):
     def test_operation_limit_stops_before_the_next_child_command(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             config(repo, home)
@@ -39,7 +38,7 @@ class LimitTest(unittest.TestCase):
         self.assertIn("operation", (result.stdout + result.stderr).lower())
 
     def test_time_limit_is_enforced_from_admission(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             config(repo, home)
@@ -60,7 +59,7 @@ class LimitTest(unittest.TestCase):
         self.assertIn("time", (result.stdout + result.stderr).lower())
 
     def test_status_reports_supervision_limits_as_unenforced(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             config(repo, home)
@@ -82,7 +81,7 @@ class LimitTest(unittest.TestCase):
 
 class EvidenceTest(unittest.TestCase):
     def test_state_and_evidence_files_are_private(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             to_ready(repo, home)
@@ -103,7 +102,7 @@ class EvidenceTest(unittest.TestCase):
             self.assertEqual(private_mode(output), 0o600)
 
     def test_spend_record_is_explicitly_operator_declared(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             self.assertEqual(cli(repo, home, "init").returncode, 0)
@@ -126,7 +125,7 @@ class EvidenceTest(unittest.TestCase):
 
 class DoctorTest(unittest.TestCase):
     def test_doctor_passes_a_complete_synthetic_configuration(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             config(repo, home)
@@ -134,7 +133,7 @@ class DoctorTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_doctor_reports_gate_drift_for_an_admitted_run(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             to_ready(repo, home)
@@ -146,7 +145,7 @@ class DoctorTest(unittest.TestCase):
         self.assertIn("digest", (result.stdout + result.stderr).lower())
 
     def test_doctor_fails_closed_and_status_works_after_a_stop_without_gate_config(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             self.assertEqual(cli(repo, home, "init").returncode, 0)
@@ -162,7 +161,7 @@ class DoctorTest(unittest.TestCase):
 
 class PromptTest(unittest.TestCase):
     def test_prompt_prints_git_instructions_without_creating_the_branch(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             to_ready(repo, home)
@@ -173,7 +172,7 @@ class PromptTest(unittest.TestCase):
         self.assertEqual(branches, "")
 
     def test_invalid_stop_reason_is_a_usage_error(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             to_ready(repo, home)

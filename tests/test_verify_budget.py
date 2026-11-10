@@ -1,13 +1,12 @@
 """Completed-run revalidation must stay read-only while the live budget still admits it."""
 
 import json
-import tempfile
 import unittest
 from pathlib import Path
 
 from support import (
     cli, commit_probe, configure_turbo, evidence_files, git, home_dir,
-    make_repo, prepare, red, run_state, spend_record,
+    make_repo, prepare, red, run_state, snapshotted, spend_record, workspace,
 )
 
 ISSUE = "7"
@@ -22,6 +21,7 @@ def manifest_cli(repo: Path, home: Path, issue: str = ISSUE):
     return cli(repo, home, "manifest", "--issue", issue)
 
 
+@snapshotted
 def completed(repo: Path, home: Path, *, kind: str = "feature") -> None:
     configure_turbo(repo, home)
     admitted = prepare(repo, home, kind=kind, operations=5)
@@ -60,7 +60,7 @@ def rewrite_run(home: Path, update: dict[str, object]) -> bytes:
 
 class CompletedSpendRefreshTest(unittest.TestCase):
     def test_repeated_spend_updates_below_the_threshold_leave_the_completed_snapshot_alone(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             completed(repo, home)
@@ -96,7 +96,7 @@ class CompletedSpendRefreshTest(unittest.TestCase):
 
 class CompletedTimeTest(unittest.TestCase):
     def test_an_aged_completed_run_revalidates_without_a_child_or_state_change(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             completed(repo, home)
@@ -124,7 +124,7 @@ class CompletedTimeTest(unittest.TestCase):
 
 class CompletedRefusalTest(unittest.TestCase):
     def test_a_feature_at_the_bugfix_line_refuses_without_mutating_the_completed_run(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             completed(repo, home)
@@ -144,7 +144,7 @@ class CompletedRefusalTest(unittest.TestCase):
         self.assertEqual(future.returncode, 1, future.stdout + future.stderr)
 
     def test_a_bug_run_revalidates_at_the_bugfix_line_and_refuses_at_the_weekly_stop_read_only(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             completed(repo, home, kind="bug")
@@ -171,7 +171,7 @@ class CompletedRefusalTest(unittest.TestCase):
         self.assertEqual(after["state"]["counters"], before["state"]["counters"])
 
     def test_an_unpriced_week_refuses_as_policy_not_corruption(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             completed(repo, home)
@@ -191,7 +191,7 @@ class CompletedRefusalTest(unittest.TestCase):
         self.assertEqual(before["run_bytes"], after["run_bytes"])
 
     def test_profile_drift_still_refuses_without_mutating_the_completed_run(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             completed(repo, home)
@@ -207,7 +207,7 @@ class CompletedRefusalTest(unittest.TestCase):
 
 class CompletedIntegrityTest(unittest.TestCase):
     def test_a_tampered_manifest_still_refuses_and_is_not_rewritten(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             completed(repo, home)
@@ -225,7 +225,7 @@ class CompletedIntegrityTest(unittest.TestCase):
         self.assertEqual(before["run_bytes"], after["run_bytes"])
 
     def test_a_completed_run_without_a_manifest_records_gains_nothing(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             completed(repo, home)
