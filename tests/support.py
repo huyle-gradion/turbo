@@ -149,7 +149,7 @@ def snapshotted(step):
                 result = step(first, *args, **kwargs)
             finally:
                 ws.depth -= 1
-            target = ws.base / f"snapshot-{len(ws.snapshots)}"
+            target = Path(tempfile.mkdtemp(dir=ws.base)) / "tmp"
             shutil.copytree(ws.path, target, symlinks=True)
             ws.snapshots[key] = (target, result, time.time())
         ws.history, ws.fingerprint = key, ws.scan()
