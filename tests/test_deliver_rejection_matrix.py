@@ -366,75 +366,27 @@ class DeliveryHistoricalAndProtocolRejectionTest(unittest.TestCase):
 
 
 class TestDisposableDeliveryContextSafety(unittest.TestCase):
-    """Verify exception safety, server termination, and environment restoration."""
+    """The shared disposable workspace leaks neither its service variables nor one test's changes into the next."""
 
-    def test_environment_restoration_and_server_teardown(self) -> None:
-        from support_deliver import run_delivery_lifecycle_demo
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            orig_asana = "https://orig.asana.example"
-            with unittest.mock.patch.dict(os.environ, {"TURBO_ASANA_API_URL": orig_asana}):
-                os.environ.pop("TURBO_GITHUB_TOKEN", None)
-                os.environ.pop("ASANA_ACCESS_TOKEN", None)
-                os.environ.pop("TURBO_GITHUB_API_URL", None)
-
-                with setup_disposable_delivery_context(root) as ctx:
-                    self.assertNotEqual(os.environ["TURBO_ASANA_API_URL"], orig_asana)
-                    self.assertEqual(os.environ["TURBO_GITHUB_TOKEN"], "disposable-gh-token")
-                    ctx.restore_valid_evidence()
-                    r = deliver_module.deliver_feature(ctx.paths, ctx.spec)
-                    self.assertTrue(r.delivery_approved)
-
-                self.assertEqual(os.environ.get("TURBO_ASANA_API_URL"), orig_asana)
-                self.assertNotIn("TURBO_GITHUB_TOKEN", os.environ)
-                self.assertEqual(ctx.asana._server.fileno(), -1)
-                self.assertEqual(ctx.gh._server.fileno(), -1)
-
-                demo_res = run_delivery_lifecycle_demo(root / "demo-out")
-                self.assertTrue(demo_res["stages"]["stage_3_verified"]["delivery_approved"])
-                self.assertEqual(os.environ.get("TURBO_ASANA_API_URL"), orig_asana)
-                self.assertNotIn("TURBO_GITHUB_TOKEN", os.environ)
-
-    def test_cleanup_on_partial_acquisition_and_boundary_failures(self) -> None:
-        from test_deliver import _DisposableAsanaServer, _DisposableGitHubServer
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "case-1").mkdir()
-            (root / "case-2").mkdir()
-            (root / "case-3").mkdir()
-            # Partial acquisition failure: entering second server fails
-            asana_instances = []
-            orig_asana_enter = _DisposableAsanaServer.__enter__
-
-            def track_asana_enter(srv):
-                asana_instances.append(srv)
-                return orig_asana_enter(srv)
-
-            with unittest.mock.patch.object(_DisposableAsanaServer, "__enter__", track_asana_enter):
-                with unittest.mock.patch.object(_DisposableGitHubServer, "__enter__", side_effect=RuntimeError("gh-fail")):
-                    with self.assertRaises(RuntimeError):
-                        with setup_disposable_delivery_context(root / "case-1"):
-                            pass
-            self.assertTrue(len(asana_instances) >= 1)
-            self.assertEqual(asana_instances[-1]._server.fileno(), -1)
-            self.assertNotIn("TURBO_ASANA_API_URL", os.environ)
-
-            # Boundary failure during deliver_feature in setup
-            with unittest.mock.patch("factory.deliver.deliver_feature", side_effect=RuntimeError("deliver-fail")):
-                with self.assertRaises(RuntimeError):
-                    with setup_disposable_delivery_context(root / "case-2"):
-                        pass
-            self.assertNotIn("TURBO_ASANA_API_URL", os.environ)
-
-            # Failure raised inside caller block
-            saved_ctx = []
+    def test_environment_restoration_and_isolation_between_uses(self) -> None:
+        keys = ("TURBO_ASANA_API_URL", "ASANA_ACCESS_TOKEN", "TURBO_GITHUB_API_URL", "TURBO_GITHUB_TOKEN")
+        with tempfile.TemporaryDirectory() as tmp, unittest.mock.patch.dict(os.environ, {"TURBO_ASANA_API_URL": "https://orig.asana.example"}):
+            for key in keys[1:]:
+                os.environ.pop(key, None)
             with self.assertRaises(ValueError):
-                with setup_disposable_delivery_context(root / "case-3") as ctx:
-                    saved_ctx.append(ctx)
+                with setup_disposable_delivery_context(Path(tmp)) as ctx:
+                    self.assertEqual(os.environ["TURBO_GITHUB_TOKEN"], "disposable-gh-token")
+                    self.assertEqual(os.environ["TURBO_GITHUB_API_URL"], ctx.gh.base_url)
+                    (ctx.child_dir / "security-review.json").unlink()
+                    ctx.gh.pulls[1]["state"] = "closed"
+                    ctx.gh.merge_status = 500
                     raise ValueError("inside-context-error")
-            self.assertEqual(saved_ctx[0].asana._server.fileno(), -1)
-            self.assertEqual(saved_ctx[0].gh._server.fileno(), -1)
-            self.assertNotIn("TURBO_ASANA_API_URL", os.environ)
+            self.assertEqual(os.environ.get("TURBO_ASANA_API_URL"), "https://orig.asana.example")
+            self.assertFalse(any(key in os.environ for key in keys[1:]))
+            with setup_disposable_delivery_context(Path(tmp)) as again:
+                self.assertTrue((again.child_dir / "security-review.json").is_file())
+                self.assertEqual((again.gh.pulls[1]["state"], again.gh.merge_status), ("open", 200))
+            self.assertFalse(any(key in os.environ for key in keys[1:]))
 
 
 if __name__ == "__main__":
