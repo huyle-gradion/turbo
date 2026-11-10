@@ -1,7 +1,7 @@
 """Hosted qualification records only real prerequisite evidence (#97)."""
 from __future__ import annotations
 
-import ast, os, re, shutil, tempfile, unittest
+import ast, contextlib, os, re, shutil, tempfile, unittest
 from pathlib import Path
 from unittest import mock
 
@@ -144,6 +144,26 @@ class QualificationRealPrerequisiteTest(unittest.TestCase):
             qa = rec["prerequisites"]["qa"]
             self.assertIsNot(qa.get("qa_verified"), True, qa)
             self.assertNotEqual(qa.get("status"), "verified", qa)
+        with self.subTest("hosted: a leftover, locally modified candidate-checkout is not reused"):
+            case = Path(tempfile.mkdtemp(dir=self.tmp))
+            repo, _, cand = _candidate_checkout(case, FAILING_SRC)
+            (case / "ev").mkdir()
+            git(case, "clone", "-q", str(repo), str(case / "ev" / "candidate-checkout"))  # at cand, then dirtied
+            (case / "ev" / "candidate-checkout" / "src" / "calc.py").write_text(PASSING_SRC, encoding="utf-8")
+            fakes = {"check_hosted_authorization": dict(return_value=(True, "")), "fetch_remote_repo": {},
+                     "get_remote_pulls": dict(return_value=[{"number": 1, "head": {"sha": cand}, "base": {"sha": BASE_SHA}}]),
+                     "get_remote_file_content": dict(return_value=(200, "subtract test_subtract", "")),
+                     "get_remote_commit": dict(return_value=(200, {"sha": BASE_SHA}, "")),
+                     "poll_ci_check": dict(return_value=(True, {"status": "verified", "candidate_sha": cand}, [])),
+                     "resolve_agy_bin": dict(return_value=None),
+                     "clone_remote_repo": dict(side_effect=lambda dest, *a: git(Path(dest).parent, "clone", "-q", str(repo), str(dest)))}
+            with contextlib.ExitStack() as st, _HostedQualificationFakeServer() as gh:
+                for name, kw in fakes.items():
+                    st.enter_context(mock.patch("factory.qualification." + name, **kw))
+                rec = prepare_qualification_candidate(
+                    gh.base_url, REPO, case / "ev", head_branch=HEAD_BRANCH, base_sha=BASE_SHA,
+                    integrator_token="valid-int-tok", competitor_token="valid-comp-tok", allow_test_origin=False)
+            self.assertIsNot(rec["prerequisites"]["qa"].get("qa_verified"), True, rec["prerequisites"]["qa"])
 
     def test_no_approval_when_prerequisite_not_passed(self) -> None:
         """AC4: no APPROVE review request is sent for a head whose prerequisites failed or are unavailable."""
@@ -163,6 +183,23 @@ class QualificationRealPrerequisiteTest(unittest.TestCase):
                 ]
                 self.assertEqual(approvals, [], f"{name}: approval submitted despite unmet prerequisite")
                 self.assertEqual(rec["status"], "blocked")
+        # Scenario 1 credits CI and approval only when they were recorded for the SHA it lands (ctx.cand_sha).
+        from support_deliver import setup_disposable_delivery_context
+        (self.tmp / "ws").mkdir()
+        with _HostedQualificationFakeServer() as gh, setup_disposable_delivery_context(self.tmp / "ws") as ctx:
+            git(ctx.bare, "update-ref", "refs/heads/feature/demo", ctx.base_sha)
+            gh.branch_heads = {HEAD_BRANCH: ctx.cand_sha, "feature/demo": ctx.base_sha}
+            for label, sha, want in (("other-head", "f" * 40, False), ("landed-head", ctx.cand_sha, True)):
+                with self.subTest(f"scenario-1 evidence for {label}"):
+                    prep = {"prerequisites": {"ci": {"status": "verified", "candidate_sha": sha},
+                                              "github_review": {"state": "APPROVED", "commit_id": sha}}}
+                    sc = qualification.run_scenario_1_confirmed_landing(
+                        gh.base_url, REPO, self.tmp / f"ev-sc1-{label}", ctx, "valid-int-tok", "valid-comp-tok",
+                        allow_test_origin=True, prep_record=prep)
+                    self.assertIs(sc["ci_verified"], want, sc)
+                    self.assertIs(sc["competitor_approved"], want, sc)
+                    if not want:
+                        self.assertEqual(sc["outcome"], "failed")
 
 
 if __name__ == "__main__":
