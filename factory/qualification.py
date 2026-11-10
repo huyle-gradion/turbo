@@ -976,8 +976,8 @@ def prepare_qualification_candidate(
     if pdir is None and not allow_test_origin and pr_head_sha != "unavailable":
         pdir = evidence_dir / "candidate-checkout"
         try:
-            if not pdir.exists():
-                clone_remote_repo(pdir, repo_slug, integrator_token)
+            shutil.rmtree(pdir, ignore_errors=True)  # never reuse a leftover checkout
+            clone_remote_repo(pdir, repo_slug, integrator_token)
             fetch_remote_repo(pdir, repo_slug, integrator_token)
             subprocess.run(["git", "checkout", "-q", "--detach", pr_head_sha], cwd=pdir, check=True, capture_output=True)
         except (RuntimeError, subprocess.CalledProcessError) as exc:
@@ -1247,11 +1247,6 @@ def run_scenario_1_confirmed_landing(
     main_sha_before = gitio.remote_ref(ctx.repo, "main") or gitio.commit_sha(ctx.repo, "refs/heads/main")
     sc1_child = safe_dir(ctx.home / "attempt-sc1", create=True)
     pr_num, cand_sha = 1, ctx.cand_sha
-    prereqs = (prep_record or {}).get("prerequisites") or {}
-    ci_ok = (prereqs.get("ci") or {}).get("status") == "verified"
-    ok_rev = (prereqs.get("github_review") or {}).get("state") == "APPROVED"
-    ci_blks = [] if ci_ok else ["ci-not-verified: candidate preparation recorded no verified CI"]
-    rev_blks = [] if ok_rev else ["approval-not-recorded: candidate preparation recorded no operator-account approval"]
     if not allow_test_origin:
         code_pr, pr_live, _ = _http_req("GET", f"{base_url.rstrip('/')}/repos/{repo_slug}/pulls/5", integrator_token, base_url, [], time.monotonic() + 15.0, 15)
         if code_pr == 200 and pr_live.get("state") == "closed" and pr_live.get("merged") is True:
@@ -1265,6 +1260,12 @@ def run_scenario_1_confirmed_landing(
             "candidate_sha": cand_sha, "base_sha": base_sha,
         }, ctx.home)
         fetch_remote_repo(ctx.repo, repo_slug, integrator_token)
+    pre = (prep_record or {}).get("prerequisites") or {}
+    ci, rev = pre.get("ci") or {}, pre.get("github_review") or {}  # credited only for the SHA this scenario lands
+    ci_ok = ci.get("status") == "verified" and ci.get("candidate_sha") == cand_sha
+    ok_rev = rev.get("state") == "APPROVED" and rev.get("commit_id") == cand_sha
+    ci_blks = [] if ci_ok else [f"ci-not-verified: candidate preparation recorded no verified CI for {cand_sha}"]
+    rev_blks = [] if ok_rev else [f"approval-not-recorded: candidate preparation recorded no operator-account approval for {cand_sha}"]
     gate = _delivery_gate(ctx, cand_sha, base_sha, sc1_child, cand_branch)
     child_contract = {**ctx.child_contract, "head_branch": cand_branch}
     int_res = integrate_approved_child(
@@ -1515,25 +1516,30 @@ def run_scenario_4_renewed_verification_after_base_change(
     return sc_data
 
 
+class _ScenarioContextUnavailable(Exception):
+    """The hosted repository cannot supply a scenario context; the reason is recorded as a blocker."""
+
+
 @contextlib.contextmanager
 def hosted_scenario_context(
     ws_root: Path, repo_slug: str, token: str, *,
-    branch: str = "feature/demo", head_branch: str = "feat/qual-candidate-101",
+    branch: str = "feature/demo", head_branch: str = "feat/qual-candidate-101", blockers: list[str] | None = None,
 ) -> Iterator[SimpleNamespace]:
     """Clone the hosted repository into a private workspace and yield the scenario context; no test fakes.
 
     The context carries no reviewer and no prerequisite records, so delivery gates stay closed until real
     reviewer records exist for a candidate.
     """
+    shutil.rmtree(ws_root, ignore_errors=True)  # fresh clone and private home every run
     repo, home = ws_root / "live_repo", safe_dir(ws_root / "home", create=True)
-    if not repo.exists():
-        clone_remote_repo(repo, repo_slug, token)
+    clone_remote_repo(repo, repo_slug, token)
     fetch_remote_repo(repo, repo_slug, token)
     subprocess.run(["git", "checkout", "-q", "-B", branch, f"origin/{branch}"], cwd=repo, check=True, capture_output=True)
     policy = json.loads((repo / ".factory" / "policy.json").read_text(encoding="utf-8"))
     contract = repo / ".factory" / "child-contract.json"
     if not contract.is_file():
-        contract = SEED_ASSETS_DIR / "factory" / "child-contract.json"
+        (blockers if blockers is not None else []).append("scenario-context-unavailable: hosted repository has no .factory/child-contract.json")
+        raise _ScenarioContextUnavailable(".factory/child-contract.json missing")
     conf = config_module.with_gate(
         config_module.skeleton(RuntimePaths(repo=repo, home=home)), "3",
         config_module.GateConfig(kind="protected-paths", label="protected paths", paths=tuple(policy.get("protected_paths", ()))),
@@ -1644,7 +1650,8 @@ def run_hosted_qualification(
         scenario_blockers.append(f"scenario-context-unavailable: hosted scenarios need a clone from {HOSTED_API_ORIGIN}, not {base_url}")
     elif not all_preflight_blockers:
         ws_root = safe_dir(evidence_dir / "workspace", create=True)
-        with hosted_scenario_context(ws_root, repo_slug, integrator_token, branch=branch) as ctx:
+        with contextlib.suppress(_ScenarioContextUnavailable), hosted_scenario_context(
+                ws_root, repo_slug, integrator_token, branch=branch, blockers=scenario_blockers) as ctx:
             # 1. Scenario 1: Confirmed landing
             sc1_res = run_scenario_1_confirmed_landing(
                 base_url, repo_slug, evidence_dir, ctx, integrator_token, competitor_token,

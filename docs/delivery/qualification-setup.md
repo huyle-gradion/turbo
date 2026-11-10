@@ -50,7 +50,7 @@ DEMO_KEEP_EVIDENCE_DIR="$(mktemp -d /tmp/turbo-qual-67.XXXXXX)" \
   bash scripts/qualify-protected-demo.sh --mode offline
 ```
 
-The offline simulation is built on test fakes, so it lives in `tests/qualification_offline.py`, not in `factory/`. The script's offline mode (the default) runs it as `python3 -m qualification_offline`; hosted mode runs `python3 -m factory.qualification`.
+The offline simulation is built on test fakes, so it lives in `tests/qualification_offline.py`, not in `factory/`. The script's offline mode (the default) runs it as `python3 -m qualification_offline`; hosted mode runs `python3 -m factory.qualification`, which is hosted-only. Run the offline harness directly with `PYTHONPATH=tests:. python3 -m qualification_offline`.
 
 ### Hosted Qualification (Hosted Safety and Evidence Foundation / Scenarios Not Implemented)
 ```sh

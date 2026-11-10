@@ -6,7 +6,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 export PYTHONDONTWRITEBYTECODE=1
-export PYTHONPATH="$ROOT/tests:$ROOT:${PYTHONPATH:-}"
+export PYTHONPATH="$ROOT:${PYTHONPATH:-}"
 
 # Evidence is kept by default. Set DEMO_DELETE_EVIDENCE=1 to delete a generated
 # evidence directory on exit; an explicitly named directory is never deleted.
@@ -28,5 +28,5 @@ for ARG in "$@"; do
   PREV="$ARG"
 done
 MODULE=factory.qualification
-[[ "$MODE" == offline ]] && MODULE=qualification_offline
+[[ "$MODE" == offline ]] && MODULE=qualification_offline && PYTHONPATH="$ROOT/tests:$PYTHONPATH"  # test fakes: offline only
 python3 -m "$MODULE" --evidence-dir "$EVIDENCE_DIR" "$@"
