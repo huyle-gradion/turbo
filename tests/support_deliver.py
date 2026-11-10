@@ -126,25 +126,27 @@ def _build_delivery_context(root: Path, stack: ExitStack) -> DeliveryContext:
         )
         assert ir_rec["review_verified"], ir_rec
 
-    backup_child_dir = root / "backup-child-101"
-    shutil.copytree(child_dir, backup_child_dir)
+        backup_child_dir = root / "backup-child-101"
+        shutil.copytree(child_dir, backup_child_dir)
 
-    valid_snapshots = {
-        "ci": read_json(child_dir / "ci-verification.json", home),
-        "qa_round": read_json(child_dir / "automated-qa" / "round-1" / "record.json", home),
-        "qa_summary": read_json(child_dir / "automated-qa" / "record.json", home),
-        "sec": read_json(child_dir / "security-review.json", home),
-        "ir": read_json(child_dir / "independent-review.json", home),
-        "att_record": copy.deepcopy(read_json(att_dir / "record.json", home)),
-    }
-    return DeliveryContext(
-        root=root, repo=repo, home=home, bare=bare, paths=paths, conf=conf,
-        spec=spec, asana=asana, gh=gh, cand_sha=cand_sha, base_sha=base_sha,
-        head_branch=head_branch, att_dir=att_dir, child_dir=child_dir,
-        backup_child_dir=backup_child_dir, intake_rec=intake_rec,
-        child_contract=child_contract, valid_snapshots=valid_snapshots,
-        builder_agy=builder_agy, sec_agy=sec_agy, ir_agy=ir_agy,
-    )
+        valid_snapshots = {
+            "ci": read_json(child_dir / "ci-verification.json", home),
+            "qa_round": read_json(child_dir / "automated-qa" / "round-1" / "record.json", home),
+            "qa_summary": read_json(child_dir / "automated-qa" / "record.json", home),
+            "sec": read_json(child_dir / "security-review.json", home),
+            "ir": read_json(child_dir / "independent-review.json", home),
+            "att_record": copy.deepcopy(read_json(att_dir / "record.json", home)),
+        }
+
+        ctx = DeliveryContext(
+            root=root, repo=repo, home=home, bare=bare, paths=paths, conf=conf,
+            spec=spec, asana=asana, gh=gh, cand_sha=cand_sha, base_sha=base_sha,
+            head_branch=head_branch, att_dir=att_dir, child_dir=child_dir,
+            backup_child_dir=backup_child_dir, intake_rec=intake_rec,
+            child_contract=child_contract, valid_snapshots=valid_snapshots,
+            builder_agy=builder_agy, sec_agy=sec_agy, ir_agy=ir_agy,
+        )
+        return ctx
 
 
 _SERVER_HANDLES = ("_server", "_thread")
