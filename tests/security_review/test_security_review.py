@@ -119,17 +119,18 @@ def run_disposable_demo(tmp: Path) -> dict[str, Any]:
         pr_info = deliver_checks.open_and_confirm_pr(
             gh.base_url, "tok-g", "example/chat-bridge", PARENT_TASK, PARSED_CHILD,
             "task/101-auth", cand1_sha, "feature/chat-auth", [], scope_detail, [], time.monotonic() + 30.0, 30)
-        ev = lambda rec, sha=cand1_sha: security_review.evaluate_child_pr_with_security_gate(
+        # No CI runs ever appear for the stale revision, so its CI poll waits out the whole bound; keep that bound short.
+        ev = lambda rec, sha=cand1_sha, limit=30: security_review.evaluate_child_pr_with_security_gate(
             repo=repo, home=home, child_dir=child_dir, base_url=gh.base_url, token="tok-g", repo_slug="example/chat-bridge",
             parent=PARENT_TASK, child=PARSED_CHILD, conf=conf, pr_info=pr_info, head_branch="task/101-auth", candidate_sha=sha,
             base_branch="feature/chat-auth", base_sha=base_sha, scope_detail=scope_detail, security_review_record=rec,
-            trace=[], deadline=time.monotonic() + 30.0, limit_s=30)
+            trace=[], deadline=time.monotonic() + limit, limit_s=limit)
         r_clean, r_missing, r_sugg = ev(clean_rev), ev(None), ev(sugg_rev)
         r_nover = ev({**clean_rev, "independent_verification": {**clean_rev["independent_verification"], "checks": []}})
         r_unres = ev({**clean_rev, "blocking_findings": [{"finding_id": "SEC-POL-01-x", "blocking": True, "status": "open", "title": "secret"}]})
         (repo / "src/chat_bridge/auth.py").write_text(CLEAN_AUTH_PY + "# v2\n", encoding="utf-8")
         git(repo, "add", "."); git(repo, "commit", "-q", "-m", "v2"); cand2_sha = git(repo, "rev-parse", "HEAD"); git(repo, "push", "-q", "origin", "task/101-auth")
-        r_stale = ev(clean_rev, cand2_sha)
+        r_stale = ev(clean_rev, cand2_sha, 5)
 
         run_cli = lambda agy, cap: json.loads(subprocess.run(
             [sys.executable, "-m", "factory.security_review", "--repo", str(repo), "--home", str(home),
