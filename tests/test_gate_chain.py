@@ -72,7 +72,7 @@ class GateChainTest(unittest.TestCase):
         self.assertIn("digest", result.stderr.lower())
         self.assertFalse(marker.exists())
 
-    def test_green_does_not_execute_the_gate_ladder(self):
+    def test_green_does_not_execute_the_gate_ladder_or_create_commits(self):
         with tempfile.TemporaryDirectory() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
@@ -83,6 +83,7 @@ class GateChainTest(unittest.TestCase):
                 gate1=[sys.executable, "-c", f"open({str(one)!r}, 'w').write('x')"],
                 gate2=[sys.executable, "-c", f"open({str(two)!r}, 'w').write('x')"],
             )
+            head_before = git(repo, "rev-parse", "HEAD")
             result = cli(repo, home, "green", "--issue", "7")
             self.assertFalse(one.exists())
             self.assertFalse(two.exists())
@@ -98,22 +99,11 @@ class GateChainTest(unittest.TestCase):
             files_before_green = len(list((home / "evidence" / "7").glob("replay-*.txt")))
             final = cli(repo, home, "green", "--issue", "7")
             files_after_green = len(list((home / "evidence" / "7").glob("replay-*.txt")))
+            head_after = git(repo, "rev-parse", "HEAD")
         self.assertEqual(result.returncode, 1)
         self.assertEqual(final.returncode, 0, final.stdout + final.stderr)
         self.assertEqual(files_before_green, files_after_green)
-
-    def test_gates_and_green_do_not_create_commits(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            repo = make_repo(Path(tmp))
-            home = home_dir(Path(tmp))
-            staged(repo, home)
-            before = git(repo, "rev-parse", "HEAD")
-            for gate in ("1", "2", "3"):
-                assert cli(repo, home, "gate", "--issue", "7", "--gate", gate).returncode == 0
-            assert cli(repo, home, "replay", "--issue", "7").returncode == 0
-            assert cli(repo, home, "green", "--issue", "7").returncode == 0
-            after = git(repo, "rev-parse", "HEAD")
-        self.assertEqual(before, after)
+        self.assertEqual(head_before, head_after)
 
     def test_gate_rerun_adds_evidence_without_overwriting(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -42,11 +42,20 @@ class IntegrationBehaviorTest(unittest.TestCase):
         )
 
     def test_successful_approved_integration(self) -> None:
+        """Confirmed landing, redacted persisted credentials, and single-encoded branch protection path."""
+        import urllib.request, urllib.error
         with tempfile.TemporaryDirectory() as tmp_str:
             with setup_disposable_delivery_context(Path(tmp_str)) as ctx:
                 gate, b_branch = self._setup_ctx(ctx)
                 self.assertTrue(gate.get("delivery_approved"))
-                res = self._call(ctx, gate, b_branch)
+                kwarg_secret = "synthetic-kwarg-token/with-special%chars"
+                quoted_secret = "synthetic-kwarg-token%2Fwith-special%25chars"
+                old_env = {k: os.environ.pop(k, None) for k in ("GITHUB_TOKEN", "GH_TOKEN", "TURBO_GITHUB_TOKEN")}
+                try:
+                    res = self._call(ctx, gate, b_branch, token=kwarg_secret)
+                finally:
+                    for k, v in old_env.items():
+                        if v is not None: os.environ[k] = v
                 self.assertEqual((res.status, res.outcome), ("confirmed", "confirmed"))
                 self.assertEqual(git(ctx.bare, "rev-parse", f"refs/heads/{b_branch}"), res.landed_sha)
                 self.assertTrue(ctx.gh.pulls[1]["merged"] and ctx.gh.pulls[1]["state"] == "closed")
@@ -54,6 +63,27 @@ class IntegrationBehaviorTest(unittest.TestCase):
                 rec_data = json.loads((ctx.child_dir / "integration-record.json").read_text(encoding="utf-8"))
                 self.assertEqual((rec_data["status"], rec_data["landed_sha"]), ("confirmed", res.landed_sha))
                 self.assertTrue(rec_data["protection_observed"]["required_status_checks"]["strict"])
+                combined = (ctx.child_dir / "integration-request.json").read_text(encoding="utf-8") + (ctx.child_dir / "integration-record.json").read_text(encoding="utf-8")
+                self.assertNotIn(kwarg_secret, combined)
+                self.assertNotIn(quoted_secret, combined)
+
+                # Branch protection is read through one URL-encoded branch segment
+                prot_reqs = [r for r in ctx.gh.requests if r["path"].endswith("/protection")]
+                self.assertTrue(prot_reqs)
+                outbound_path = prot_reqs[0]["path"]
+                expected_path = f"/api/v3/repos/example/chat-bridge/branches/{quote(b_branch, safe='')}/protection"
+                self.assertEqual(outbound_path, expected_path)
+                prefix = "/api/v3/repos/example/chat-bridge/branches/"
+                self.assertNotIn("/", outbound_path[len(prefix):-len("/protection")])
+                raw_url = f"{ctx.gh.base_url}/repos/example/chat-bridge/branches/{b_branch}/protection"
+                with self.assertRaises(urllib.error.HTTPError) as cm:
+                    urllib.request.urlopen(urllib.request.Request(raw_url, headers={"Authorization": "Bearer token"}))
+                self.assertEqual(cm.exception.code, 404)
+                pct_branch = "feature/pct%test"
+                ctx.gh.branch_protections = {pct_branch: {"required_status_checks": {"strict": True}, "enforce_admins": {"enabled": True}}}
+                enc_pct_url = f"{ctx.gh.base_url}/repos/example/chat-bridge/branches/{quote(pct_branch, safe='')}/protection"
+                with urllib.request.urlopen(urllib.request.Request(enc_pct_url, headers={"Authorization": "Bearer token"})) as resp:
+                    self.assertEqual(resp.status, 200)
 
     def test_concurrent_attempts_from_independent_processes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_str:
@@ -159,65 +189,6 @@ class IntegrationBehaviorTest(unittest.TestCase):
                 self.assertEqual(self._call(ctx, gate, b_branch).status, "persistence-failed")
                 self.assertFalse(ctx.gh.pulls[1]["merged"])
 
-    def test_credential_redaction_in_persisted_evidence(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp_str:
-            with setup_disposable_delivery_context(Path(tmp_str)) as ctx:
-                gate, b_branch = self._setup_ctx(ctx)
-                kwarg_secret = "synthetic-kwarg-token/with-special%chars"
-                quoted_secret = "synthetic-kwarg-token%2Fwith-special%25chars"
-                old_env = {k: os.environ.pop(k, None) for k in ("GITHUB_TOKEN", "GH_TOKEN", "TURBO_GITHUB_TOKEN")}
-                try:
-                    res = self._call(ctx, gate, b_branch, token=kwarg_secret)
-                    self.assertEqual(res.status, "confirmed")
-                    req_txt = (ctx.child_dir / "integration-request.json").read_text(encoding="utf-8")
-                    rec_txt = (ctx.child_dir / "integration-record.json").read_text(encoding="utf-8")
-                    combined = req_txt + rec_txt
-                    self.assertNotIn(kwarg_secret, combined)
-                    self.assertNotIn(quoted_secret, combined)
-                finally:
-                    for k, v in old_env.items():
-                        if v is not None: os.environ[k] = v
-
-    def test_transport_disconnect_after_mutation_yields_uncertain_and_no_retry(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp_str:
-            with setup_disposable_delivery_context(Path(tmp_str)) as ctx:
-                gate, b_branch = self._setup_ctx(ctx)
-                ctx.gh.disconnect_after_merge = True
-                res = self._call(ctx, gate, b_branch)
-                self.assertEqual((res.status, res.outcome), ("uncertain", "uncertain"))
-                rec_data = json.loads((ctx.child_dir / "integration-record.json").read_text(encoding="utf-8"))
-                self.assertEqual((rec_data["status"], rec_data["outcome"]), ("uncertain", "uncertain"))
-                self.assertTrue(ctx.gh.pulls[1]["merged"] and ctx.gh.pulls[1]["state"] == "closed")
-                put_reqs = [r for r in ctx.gh.requests if r["method"] == "PUT"]
-                self.assertEqual(len(put_reqs), 1)
-
-    def test_branch_protection_contract_and_single_encoded_segment(self) -> None:
-        import urllib.request, urllib.error
-        from urllib.parse import quote
-        with tempfile.TemporaryDirectory() as tmp_str:
-            with setup_disposable_delivery_context(Path(tmp_str)) as ctx:
-                gate, b_branch = self._setup_ctx(ctx)
-                res = self._call(ctx, gate, b_branch)
-                self.assertEqual(res.status, "confirmed")
-                prot_reqs = [r for r in ctx.gh.requests if r["path"].endswith("/protection")]
-                self.assertTrue(prot_reqs)
-                outbound_path = prot_reqs[0]["path"]
-                encoded_segment = quote(b_branch, safe="")
-                expected_path = f"/api/v3/repos/example/chat-bridge/branches/{encoded_segment}/protection"
-                self.assertEqual(outbound_path, expected_path)
-                prefix = "/api/v3/repos/example/chat-bridge/branches/"
-                extracted_segment = outbound_path[len(prefix):-len("/protection")]
-                self.assertNotIn("/", extracted_segment)
-                raw_url = f"{ctx.gh.base_url}/repos/example/chat-bridge/branches/{b_branch}/protection"
-                with self.assertRaises(urllib.error.HTTPError) as cm:
-                    urllib.request.urlopen(urllib.request.Request(raw_url, headers={"Authorization": "Bearer token"}))
-                self.assertEqual(cm.exception.code, 404)
-                pct_branch = "feature/pct%test"
-                ctx.gh.branch_protections = {pct_branch: {"required_status_checks": {"strict": True}, "enforce_admins": {"enabled": True}}}
-                enc_pct_url = f"{ctx.gh.base_url}/repos/example/chat-bridge/branches/{quote(pct_branch, safe='')}/protection"
-                with urllib.request.urlopen(urllib.request.Request(enc_pct_url, headers={"Authorization": "Bearer token"})) as resp:
-                    self.assertEqual(resp.status, 200)
-
     def test_result_persistence_failure_handling(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_str:
             with setup_disposable_delivery_context(Path(tmp_str)) as ctx:
@@ -283,46 +254,30 @@ class IntegrationBehaviorTest(unittest.TestCase):
                 self.assertIsNone(res4.landed_sha)
                 ctx.gh.verify_override = {}
 
-    def test_landing_relationship_mismatched_tree_fails_closed(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp_str:
-            with setup_disposable_delivery_context(Path(tmp_str)) as ctx:
-                gate, b_branch = self._setup_ctx(ctx)
-                wrong_tree_commit = git(
-                    ctx.bare, "-c", "user.name=CI", "-c", "user.email=ci@test",
-                    "commit-tree", f"{ctx.base_sha}^{{tree}}", "-p", ctx.base_sha, "-p", ctx.cand_sha, "-m", "wrong tree commit",
-                )
-                git(ctx.bare, "update-ref", "refs/heads/wrong-tree-branch", wrong_tree_commit)
-                ctx.gh.verify_override = {"merge_commit_sha": wrong_tree_commit}
-                res = self._call(ctx, gate, b_branch)
-                self.assertEqual((res.status, res.outcome), ("invalid-landing-relationship", "rejected"))
-                self.assertIn("tree", " ".join(res.blockers).lower())
-
-    def test_landing_relationship_single_parent_fails_closed(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp_str:
-            with setup_disposable_delivery_context(Path(tmp_str)) as ctx:
-                gate, b_branch = self._setup_ctx(ctx)
-                single_p = git(
-                    ctx.bare, "-c", "user.name=CI", "-c", "user.email=ci@test",
-                    "commit-tree", f"{ctx.cand_sha}^{{tree}}", "-p", ctx.cand_sha, "-m", "single parent",
-                )
-                git(ctx.bare, "update-ref", "refs/heads/single-parent-branch", single_p)
-                ctx.gh.verify_override = {"merge_commit_sha": single_p}
-                res = self._call(ctx, gate, b_branch)
-                self.assertEqual((res.status, res.outcome), ("invalid-landing-relationship", "rejected"))
-                self.assertIn("parents", " ".join(res.blockers).lower())
-
-    def test_landing_relationship_unreachable_commit_fails_closed(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp_str:
-            with setup_disposable_delivery_context(Path(tmp_str)) as ctx:
-                gate, b_branch = self._setup_ctx(ctx)
-                unreachable = git(
-                    ctx.bare, "-c", "user.name=CI", "-c", "user.email=ci@test",
-                    "commit-tree", f"{ctx.cand_sha}^{{tree}}", "-p", ctx.base_sha, "-p", ctx.cand_sha, "-m", "unreachable",
-                )
-                git(ctx.bare, "update-ref", "refs/heads/unreachable-branch", unreachable)
-                ctx.gh.verify_override = {"merge_commit_sha": unreachable}
-                res = self._call(ctx, gate, b_branch)
-                self.assertEqual((res.status, res.outcome), ("landed-commit-not-on-base", "rejected"))
+    def test_landing_relationship_violations_fail_closed(self) -> None:
+        """Mismatched tree, single parent, or landed commit unreachable from base fails closed."""
+        cases = (
+            ("tree", ("{base}^{{tree}}", "{base}", "{cand}"), "invalid-landing-relationship", "tree"),
+            ("single-parent", ("{cand}^{{tree}}", "{cand}"), "invalid-landing-relationship", "parents"),
+            ("unreachable", ("{cand}^{{tree}}", "{base}", "{cand}"), "landed-commit-not-on-base", None),
+        )
+        for name, (tree, *parents), status, blocker_word in cases:
+            with self.subTest(case=name):
+                with tempfile.TemporaryDirectory() as tmp_str:
+                    with setup_disposable_delivery_context(Path(tmp_str)) as ctx:
+                        gate, b_branch = self._setup_ctx(ctx)
+                        fmt = lambda t: t.format(base=ctx.base_sha, cand=ctx.cand_sha)
+                        parent_args = [a for p in parents for a in ("-p", fmt(p))]
+                        landed = git(
+                            ctx.bare, "-c", "user.name=CI", "-c", "user.email=ci@test",
+                            "commit-tree", fmt(tree), *parent_args, "-m", name,
+                        )
+                        git(ctx.bare, "update-ref", f"refs/heads/{name}-branch", landed)
+                        ctx.gh.verify_override = {"merge_commit_sha": landed}
+                        res = self._call(ctx, gate, b_branch)
+                        self.assertEqual((res.status, res.outcome), (status, "rejected"))
+                        if blocker_word:
+                            self.assertIn(blocker_word, " ".join(res.blockers).lower())
 
     def test_confirm_landing_requires_tested_sha_proof(self) -> None:
         """_confirm_landing helper fails closed when tested_sha is None or empty with otherwise valid landing evidence."""
@@ -588,6 +543,9 @@ class IntegrationBehaviorTest(unittest.TestCase):
                 self.assertEqual((res1.status, res1.outcome), ("uncertain", "uncertain"))
                 self.assertTrue((ctx.child_dir / "integration-request.json").is_file())
                 self.assertEqual(len([r for r in ctx.gh.requests if r["method"] == "PUT"]), 1)
+                rec1 = json.loads((ctx.child_dir / "integration-record.json").read_text(encoding="utf-8"))
+                self.assertEqual((rec1["status"], rec1["outcome"]), ("uncertain", "uncertain"))
+                self.assertTrue(ctx.gh.pulls[1]["merged"] and ctx.gh.pulls[1]["state"] == "closed")
 
                 # Retry reconciles remote state, positively confirms landing, writes confirmed record without another mutation
                 ctx.gh.disconnect_after_merge = False
@@ -638,10 +596,12 @@ class IntegrationBehaviorTest(unittest.TestCase):
                 self.assertEqual(len([r for r in ctx.gh.requests if r["method"] == "PUT"]), 0)
 
     def test_confirmation_get_timeout_after_successful_put_persists_uncertainty(self) -> None:
-        """Confirmation GET timeout after PUT returns normally, persists uncertainty, and recovers without duplicate PUT."""
+        """Confirmation GET timeout after PUT returns normally, persists uncertainty with redacted diagnostics, and recovers without duplicate PUT."""
         with tempfile.TemporaryDirectory() as tmp_str:
             with setup_disposable_delivery_context(Path(tmp_str)) as ctx:
                 gate, b_branch = self._setup_ctx(ctx)
+                raw_secret = "synthetic-secret-token/special%chars"
+                enc_secret = quote(raw_secret, safe="")
                 orig_http = integration_mod._http_req
                 put_state = {"done": False}
 
@@ -650,11 +610,11 @@ class IntegrationBehaviorTest(unittest.TestCase):
                     if method == "PUT":
                         put_state["done"] = True
                     elif method == "GET" and put_state["done"] and "pulls/1" in args[1]:
-                        raise AttemptTimeoutError("injected confirmation GET timeout")
+                        raise AttemptTimeoutError(f"injected confirmation GET timeout with {raw_secret} and {enc_secret}")
                     return orig_http(*args, **kw)
 
                 with patch.object(integration_mod, "_http_req", side_effect=fake_http):
-                    res = self._call(ctx, gate, b_branch)
+                    res = self._call(ctx, gate, b_branch, token=raw_secret)
 
                 self.assertEqual((res.status, res.outcome, res.confirmation_status), ("uncertain", "uncertain", "uncertain"))
                 self.assertEqual(res.mutation_outcome, "succeeded")
@@ -674,6 +634,12 @@ class IntegrationBehaviorTest(unittest.TestCase):
                 self.assertEqual(rec["candidate_sha"], ctx.cand_sha)
                 self.assertEqual(rec["base_sha"], ctx.base_sha)
                 self.assertEqual(len([r for r in ctx.gh.requests if r["method"] == "PUT"]), 1)
+                req_txt = (ctx.child_dir / "integration-request.json").read_text(encoding="utf-8")
+                rec_txt = (ctx.child_dir / "integration-record.json").read_text(encoding="utf-8")
+                for secret in (raw_secret, enc_secret):
+                    self.assertNotIn(secret, req_txt)
+                    self.assertNotIn(secret, rec_txt)
+                    self.assertFalse(any(secret in b for b in res.blockers))
 
                 # Retry confirms existing landing without duplicate PUT
                 res_rec = self._call(ctx, gate, b_branch)
@@ -803,33 +769,3 @@ class IntegrationBehaviorTest(unittest.TestCase):
                 self.assertTrue(res_g.reconciled)
                 self.assertIsNone(res_g.landed_sha)
                 self.assertEqual(len([r for r in ctx.gh.requests if r["method"] == "PUT"]), 1)
-
-    def test_confirmation_timeout_diagnostic_redacts_synthetic_secrets(self) -> None:
-        """Confirmation timeout diagnostics redact both raw and urlencoded synthetic secrets from disk evidence."""
-        with tempfile.TemporaryDirectory() as tmp_str:
-            with setup_disposable_delivery_context(Path(tmp_str)) as ctx:
-                gate, b_branch = self._setup_ctx(ctx)
-                raw_secret = "synthetic-secret-token/special%chars"
-                enc_secret = quote(raw_secret, safe="")
-
-                orig_http = integration_mod._http_req
-                put_state = {"done": False}
-
-                def fake_http(*args: Any, **kw: Any) -> Any:
-                    method = args[0]
-                    if method == "PUT":
-                        put_state["done"] = True
-                    elif method == "GET" and put_state["done"] and "pulls/1" in args[1]:
-                        raise AttemptTimeoutError(f"timed out with {raw_secret} and {enc_secret}")
-                    return orig_http(*args, **kw)
-
-                with patch.object(integration_mod, "_http_req", side_effect=fake_http):
-                    res = self._call(ctx, gate, b_branch, token=raw_secret)
-
-                self.assertEqual(res.status, "uncertain")
-                req_txt = (ctx.child_dir / "integration-request.json").read_text(encoding="utf-8")
-                rec_txt = (ctx.child_dir / "integration-record.json").read_text(encoding="utf-8")
-                for s in (raw_secret, enc_secret):
-                    self.assertNotIn(s, req_txt)
-                    self.assertNotIn(s, rec_txt)
-                    self.assertFalse(any(s in b for b in res.blockers))
