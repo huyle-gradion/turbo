@@ -1,12 +1,11 @@
 import json
-import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
 
 from support import (
     cli, commit_probe, config, git, home_dir, make_repo, prepare,
-    red, run_state, spend_record, staged, to_green, to_red,
+    red, run_state, spend_record, staged, to_green, to_red, workspace,
 )
 
 from factory.budget import attestation, week_key
@@ -80,7 +79,7 @@ class BudgetLineTest(unittest.TestCase):
 
 class BudgetRecheckTest(unittest.TestCase):
     def test_a_new_weekly_stop_stops_an_ongoing_feature_run(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             staged(repo, home)
@@ -94,7 +93,7 @@ class BudgetRecheckTest(unittest.TestCase):
         self.assertEqual(state["gate_chain"], [])
 
     def test_a_new_bugfix_line_stops_an_ongoing_feature_run(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             staged(repo, home)
@@ -106,7 +105,7 @@ class BudgetRecheckTest(unittest.TestCase):
         self.assertEqual(state["stop_reason"], "budget")
 
     def test_a_bug_run_continues_between_the_bugfix_line_and_the_weekly_stop(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             config(repo, home, spend=12.5)
@@ -123,7 +122,7 @@ class BudgetRecheckTest(unittest.TestCase):
         self.assertEqual(state["gate_chain"], ["1"])
 
     def test_an_unknown_week_stops_work_in_progress(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             to_red(repo, home)
@@ -137,7 +136,7 @@ class BudgetRecheckTest(unittest.TestCase):
         self.assertIsNone(state["expected_green_sha"])
 
     def test_resume_refuses_when_the_declared_position_reaches_the_weekly_stop(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             to_red(repo, home)
@@ -150,7 +149,7 @@ class BudgetRecheckTest(unittest.TestCase):
 
 class ManifestBudgetTest(unittest.TestCase):
     def test_manifest_keeps_the_admission_position_separate_from_the_current_one(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             to_green(repo, home)
@@ -168,7 +167,7 @@ class ManifestBudgetTest(unittest.TestCase):
         self.assertEqual(state["budget"]["usd"], 175.0)
 
     def test_manifest_marks_an_unpriced_current_week_instead_of_reusing_admission(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             to_green(repo, home)

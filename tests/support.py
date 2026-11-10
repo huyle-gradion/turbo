@@ -10,6 +10,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -61,6 +63,102 @@ def git(repo: Path, *args: str) -> str:
     return result.stdout.strip()
 
 
+def _week(kwargs: dict[str, object]) -> tuple[int, int] | None:
+    """The ISO week of the budget timezone; recorded spend is only valid within it."""
+    try:
+        return tuple(datetime.now(ZoneInfo(str(kwargs.get("timezone", "UTC")))).isocalendar()[:2])
+    except (KeyError, ValueError):
+        return None
+
+
+class _Workspace:
+    def __init__(self) -> None:
+        self.base = Path(tempfile.mkdtemp(prefix="turbo-workspace-"))
+        atexit.register(shutil.rmtree, self.base, True)
+        self.path = self.base / "tmp"
+        self.snapshots: dict[tuple[object, ...], tuple[Path, object, float]] = {}
+        self.active = False
+        self.depth = 0
+        self.history: tuple[object, ...] | None = None
+        self.fingerprint: list[tuple[str, int, int]] = []
+
+    def scan(self) -> list[tuple[str, int, int]]:
+        found = []
+        for root, _dirs, files in os.walk(self.path):
+            for name in files:
+                status = os.lstat(os.path.join(root, name))
+                found.append((os.path.join(root, name), status.st_size, status.st_mtime_ns))
+        return sorted(found)
+
+
+_WORKSPACE = _Workspace()
+SNAPSHOT_MAX_AGE = 600.0
+
+
+@contextmanager
+def workspace():
+    """A temporary directory in which fixture steps are restored from snapshots.
+
+    Inside it, make_repo and the run-building helpers run for real once per
+    sequence of calls and arguments in a test process. A later identical
+    sequence restores the tree snapshotted after each step at the same
+    absolute path, so path-bound evidence and digests stay valid. A change the
+    test makes between steps ends snapshot use for the rest of the block. A
+    nested use is a plain temporary directory.
+    """
+    ws = _WORKSPACE
+    if ws.active:
+        with tempfile.TemporaryDirectory() as tmp:
+            yield tmp
+        return
+    ws.active = True
+    ws.path.mkdir()
+    ws.history, ws.fingerprint = (), []
+    try:
+        yield str(ws.path)
+    finally:
+        shutil.rmtree(ws.path, ignore_errors=True)
+        ws.active = False
+
+
+def _snapshotted(step):
+    @functools.wraps(step)
+    def wrapper(first: Path, *args: object, **kwargs: object) -> object:
+        ws = _WORKSPACE
+        root = Path(first) if step.__name__ == "make_repo" else Path(first).parent
+        week = _week(kwargs)
+        eligible = ws.active and not ws.depth and root == ws.path
+        if not eligible or ws.history is None or week is None or ws.scan() != ws.fingerprint:
+            if eligible:
+                ws.history = None
+            ws.depth += 1
+            try:
+                return step(first, *args, **kwargs)
+            finally:
+                ws.depth -= 1
+        key = (*ws.history, (step.__name__, repr(args), repr(sorted(kwargs.items())), week))
+        snapshot = ws.snapshots.get(key)
+        if snapshot is not None and time.time() - snapshot[2] < SNAPSHOT_MAX_AGE:
+            shutil.rmtree(ws.path)
+            shutil.copytree(snapshot[0], ws.path, symlinks=True)
+            result = snapshot[1]
+        else:
+            ws.history = None
+            ws.depth += 1
+            try:
+                result = step(first, *args, **kwargs)
+            finally:
+                ws.depth -= 1
+            target = ws.base / f"snapshot-{len(ws.snapshots)}"
+            shutil.copytree(ws.path, target, symlinks=True)
+            ws.snapshots[key] = (target, result, time.time())
+        ws.history, ws.fingerprint = key, ws.scan()
+        return result
+
+    return wrapper
+
+
+@_snapshotted
 def make_repo(tmp: Path) -> Path:
     repo = tmp / "repo"
     repo.mkdir()
@@ -118,9 +216,8 @@ def _reused_home(build):
     """
     @functools.wraps(build)
     def wrapper(repo: Path, home: Path, **kwargs: object) -> None:
-        try:
-            week = datetime.now(ZoneInfo(str(kwargs.get("timezone", "UTC")))).isocalendar()[:2]
-        except (KeyError, ValueError):
+        week = _week(kwargs)
+        if week is None:
             build(repo, home, **kwargs)
             return
         key = (build.__name__, repr(sorted(kwargs.items())), week)
@@ -201,6 +298,7 @@ def prepare(
     return cli(repo, home, *args)
 
 
+@_snapshotted
 def to_ready(repo: Path, home: Path, **kwargs: object) -> None:
     config(repo, home, **kwargs)
     result = prepare(repo, home)
@@ -237,6 +335,7 @@ def configure_turbo(
         spend_record(repo, home, spend, source)
 
 
+@_snapshotted
 def staged_turbo(repo: Path, home: Path, *, operations: int = 5, issue: int = 7, **kwargs: object) -> str:
     configure_turbo(repo, home, **kwargs)
     result = prepare(repo, home, issue=issue, operations=operations)
@@ -267,6 +366,7 @@ def marker_gate(marker: Path) -> list[str]:
     ]
 
 
+@_snapshotted
 def to_red(repo: Path, home: Path, issue: int = 7) -> None:
     to_ready(repo, home)
     git(repo, "switch", "-q", "-c", f"run-issue-{issue}")
@@ -281,6 +381,7 @@ def to_red(repo: Path, home: Path, issue: int = 7) -> None:
     assert result.returncode == 0, result.stdout + result.stderr
 
 
+@_snapshotted
 def to_staged(repo: Path, home: Path, issue: int = 7) -> str:
     to_red(repo, home, issue)
     sha = commit_probe(repo, 42, "implementation")
@@ -289,6 +390,7 @@ def to_staged(repo: Path, home: Path, issue: int = 7) -> str:
     return sha
 
 
+@_snapshotted
 def to_green(repo: Path, home: Path, issue: int = 7) -> str:
     sha = to_staged(repo, home, issue)
     for gate in ("1", "2", "3"):
@@ -319,6 +421,7 @@ def red(
     )
 
 
+@_snapshotted
 def staged(repo: Path, home: Path, *, issue: int = 7, **config_kwargs: object) -> str:
     config(repo, home, **config_kwargs)
     assert prepare(repo, home, issue=issue).returncode == 0

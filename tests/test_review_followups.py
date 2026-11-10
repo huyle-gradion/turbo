@@ -1,11 +1,10 @@
 import json
-import tempfile
 import unittest
 from pathlib import Path
 
 from support import (
     cli, commit, commit_probe, config, git, home_dir, make_repo, prepare,
-    run_state, staged, to_ready,
+    run_state, staged, to_ready, workspace,
 )
 
 from factory import gitio
@@ -21,7 +20,7 @@ def gates_and_replay(repo: Path, home: Path) -> None:
 
 class PathEncodingTest(unittest.TestCase):
     def test_gate_three_catches_a_non_ascii_protected_file(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             staged(repo, home, protected=["docs/é.md", "guards"])
@@ -37,7 +36,7 @@ class PathEncodingTest(unittest.TestCase):
         self.assertIn("docs/é.md", evidence)
 
     def test_gate_three_catches_a_renamed_protected_file(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             commit(repo, "guards/policy.py", "RULE = 1\n", "protected file")
@@ -55,7 +54,7 @@ class PathEncodingTest(unittest.TestCase):
         self.assertIn("guards/policy.py", evidence)
 
     def test_status_paths_keep_non_ascii_and_both_sides_of_a_rename(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             commit(repo, "guards/policy.py", "RULE = 1\n", "protected file")
             git(repo, "mv", "guards/policy.py", "policy_moved.py")
@@ -69,7 +68,7 @@ class PathEncodingTest(unittest.TestCase):
 
 class PromptFollowupTest(unittest.TestCase):
     def test_prompt_offers_no_gate_four_after_the_chain_is_complete(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             staged(repo, home)
@@ -81,7 +80,7 @@ class PromptFollowupTest(unittest.TestCase):
         self.assertIn("factory green", result.stdout)
 
     def test_restaging_clears_the_old_replay_and_prompt_asks_again(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             staged(repo, home)
@@ -98,7 +97,7 @@ class PromptFollowupTest(unittest.TestCase):
 
 class RecoveryDeadEndTest(unittest.TestCase):
     def test_exhausted_operation_limit_is_marked_superseded_not_resumable(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             config(repo, home)
@@ -116,7 +115,7 @@ class RecoveryDeadEndTest(unittest.TestCase):
         self.assertEqual(state["counters"]["operations_used"], 1)
 
     def test_gate_configuration_drift_is_marked_superseded_with_instructions(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             staged(repo, home)
@@ -136,7 +135,7 @@ class RecoveryDeadEndTest(unittest.TestCase):
         self.assertNotIn("factory prepare", prompt.stdout)
 
     def test_prompt_never_offers_prepare_for_a_mid_run_stop(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             from support import to_red
@@ -151,7 +150,7 @@ class RecoveryDeadEndTest(unittest.TestCase):
 
 class AdmissionInputTest(unittest.TestCase):
     def test_blank_feature_is_refused_before_writing_state(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             config(repo, home)
@@ -161,7 +160,7 @@ class AdmissionInputTest(unittest.TestCase):
         self.assertFalse(exists)
 
     def test_blank_model_is_refused_before_writing_state(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             config(repo, home)
@@ -171,7 +170,7 @@ class AdmissionInputTest(unittest.TestCase):
         self.assertFalse(exists)
 
     def test_detached_head_is_refused_before_writing_state(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             config(repo, home)
@@ -183,7 +182,7 @@ class AdmissionInputTest(unittest.TestCase):
         self.assertFalse(exists)
 
     def test_empty_stop_detail_leaves_reloadable_state(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             to_ready(repo, home)
@@ -195,7 +194,7 @@ class AdmissionInputTest(unittest.TestCase):
 
 class ProvenanceTest(unittest.TestCase):
     def test_green_refuses_attested_red_provenance(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             staged(repo, home)
@@ -210,7 +209,7 @@ class ProvenanceTest(unittest.TestCase):
         self.assertIsNone(after["green"])
 
     def test_green_refuses_a_replay_with_a_different_selector(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             staged(repo, home)
@@ -224,7 +223,7 @@ class ProvenanceTest(unittest.TestCase):
         self.assertIsNone(after["green"])
 
     def test_manifest_refuses_a_replay_with_a_different_selector(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             staged(repo, home)
@@ -239,7 +238,7 @@ class ProvenanceTest(unittest.TestCase):
         self.assertFalse(manifest.exists())
 
     def test_manifest_records_the_expected_red_marker(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             to_green_sha = staged(repo, home)

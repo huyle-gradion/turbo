@@ -3,13 +3,12 @@
 import hashlib
 import json
 import sys
-import tempfile
 import unittest
 from pathlib import Path
 
 from support import (
     cli, commit, config, evidence_files, git, home_dir, make_repo, marker_gate,
-    run_state, spend_record, staged, staged_turbo, to_green,
+    run_state, spend_record, staged, staged_turbo, to_green, workspace,
 )
 
 from factory import config as config_module
@@ -97,7 +96,7 @@ GOLDEN_DIGEST = "3d1edb5fc3d060c2df93205dc8192aa2e41ce361caa009b105cb7b14508f75c
 class ProtectedEntryBoundaryTest(unittest.TestCase):
     def test_configure_rejects_unusable_protected_entries(self):
         entries = ["", " ", " docs/spec.md", "docs/spec.md ", "\tguards", "/etc/passwd", "../secrets", "docs/../../x"]
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             config(repo, home)
@@ -109,7 +108,7 @@ class ProtectedEntryBoundaryTest(unittest.TestCase):
                     self.assertEqual((home / "config.json").read_bytes(), before)
 
     def test_a_stored_padded_protected_path_refuses_load_before_a_child(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             marker = Path(tmp) / "gate-one-ran"
@@ -133,7 +132,7 @@ class ProtectedEntryBoundaryTest(unittest.TestCase):
 
     def test_valid_entries_keep_their_spelling_and_still_catch_changes(self):
         entries = ["./guards/", "docs/my spec.md"]
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             staged(repo, home, protected=entries)
@@ -162,7 +161,7 @@ class ProtectedEntryBoundaryTest(unittest.TestCase):
 
 class CommandArgvBoundaryTest(unittest.TestCase):
     def test_configure_rejects_a_blank_executable(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             config(repo, home)
@@ -174,7 +173,7 @@ class CommandArgvBoundaryTest(unittest.TestCase):
         self.assertEqual(after, before)
 
     def test_a_stored_blank_executable_refuses_load_before_a_child(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             marker = Path(tmp) / "gate-one-ran"
@@ -198,7 +197,7 @@ class CommandArgvBoundaryTest(unittest.TestCase):
 
     def test_gate_command_data_arguments_are_preserved_exactly(self):
         args = [" ", "A B", "  padded  "]
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             marker = Path(tmp) / "argv.json"
@@ -217,7 +216,7 @@ class CommandArgvBoundaryTest(unittest.TestCase):
 
 class ReplayProvenanceTest(unittest.TestCase):
     def test_replay_does_not_reuse_an_unobserved_record(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             staged(repo, home)
@@ -236,7 +235,7 @@ class ReplayProvenanceTest(unittest.TestCase):
         self.assertEqual(after["counters"]["operations_used"], before["counters"]["operations_used"] + 1)
 
     def test_verify_reruns_an_unobserved_replay_instead_of_reusing_it(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             staged_turbo(repo, home, operations=5)
@@ -253,7 +252,7 @@ class ReplayProvenanceTest(unittest.TestCase):
         self.assertEqual(after["counters"]["operations_used"], 5)
 
     def test_a_completed_run_refuses_a_tampered_replay_without_state_changes(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             to_green(repo, home)
@@ -284,7 +283,7 @@ class MidRunSpendTest(unittest.TestCase):
     """The admission position is fixed at prepare; later spend belongs only to budget_current."""
 
     def test_manual_flow_keeps_the_admission_position_when_spend_rises_before_gates(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             staged(repo, home, spend=12.5)
@@ -301,7 +300,7 @@ class MidRunSpendTest(unittest.TestCase):
         self.assertEqual(payload["budget_current"]["usd"], 50.0)
 
     def test_native_turbo_verify_keeps_the_admission_position_when_spend_rises_first(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             staged_turbo(repo, home, operations=5, spend=12.5)
@@ -337,7 +336,7 @@ class ManifestRepositoryStateTest(unittest.TestCase):
 
     def test_a_changed_repository_is_refused_before_the_first_seal(self):
         for label, (mutate, fragment) in self.MUTATIONS.items():
-            with self.subTest(label), tempfile.TemporaryDirectory() as tmp:
+            with self.subTest(label), workspace() as tmp:
                 repo = make_repo(Path(tmp))
                 home = home_dir(Path(tmp))
                 to_green(repo, home)
@@ -353,7 +352,7 @@ class ManifestRepositoryStateTest(unittest.TestCase):
 
     def test_a_changed_repository_is_refused_on_revalidation(self):
         for label, (mutate, fragment) in self.MUTATIONS.items():
-            with self.subTest(label), tempfile.TemporaryDirectory() as tmp:
+            with self.subTest(label), workspace() as tmp:
                 repo = make_repo(Path(tmp))
                 home = home_dir(Path(tmp))
                 to_green(repo, home)

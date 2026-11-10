@@ -1,17 +1,16 @@
 import json
-import tempfile
 import unittest
 from pathlib import Path
 
 from support import (
     cli, config, config_json, configure_turbo, home_dir, make_repo,
-    prepare, spend_record, to_ready,
+    prepare, spend_record, to_ready, workspace,
 )
 
 
 class ProfileConfigurationTest(unittest.TestCase):
     def test_native_turbo_needs_the_explicit_attestation(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             self.assertEqual(cli(repo, home, "init").returncode, 0)
@@ -30,7 +29,7 @@ class ProfileConfigurationTest(unittest.TestCase):
         self.assertEqual(saved["execution_profile"], "manual")
 
     def test_manual_reset_removes_the_old_attestation(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             configure_turbo(repo, home)
@@ -44,7 +43,7 @@ class ProfileConfigurationTest(unittest.TestCase):
         self.assertIsNone(saved["native_turbo_attestation"])
 
     def test_turbo_refuses_to_claim_a_host_write_denial(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             self.assertEqual(cli(repo, home, "init").returncode, 0)
@@ -61,7 +60,7 @@ class ProfileConfigurationTest(unittest.TestCase):
         self.assertNotIn("1", saved["gates"])
 
     def test_switching_to_turbo_with_a_host_deny_gate_one_is_refused(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             config(repo, home)
@@ -76,7 +75,7 @@ class ProfileConfigurationTest(unittest.TestCase):
 
 class DigestTest(unittest.TestCase):
     def test_doctor_reports_drift_after_a_profile_change(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             configure_turbo(repo, home)
@@ -90,7 +89,7 @@ class DigestTest(unittest.TestCase):
         self.assertIn("digest", (result.stdout + result.stderr).lower())
 
     def test_doctor_reports_drift_after_a_budget_policy_change(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             config(repo, home)
@@ -105,7 +104,7 @@ class DigestTest(unittest.TestCase):
 
 class RunSnapshotTest(unittest.TestCase):
     def test_old_run_fixture_defaults_to_manual(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             to_ready(repo, home)
@@ -123,7 +122,7 @@ class RunSnapshotTest(unittest.TestCase):
         self.assertEqual(payload["verified_by"], "manual")
 
     def test_unknown_profile_is_a_clean_corrupt_state_refusal(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             to_ready(repo, home)
@@ -137,7 +136,7 @@ class RunSnapshotTest(unittest.TestCase):
         self.assertNotIn("Traceback", result.stderr)
 
     def test_native_turbo_run_without_attestation_is_refused(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             configure_turbo(repo, home)

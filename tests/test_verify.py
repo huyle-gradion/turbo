@@ -1,12 +1,11 @@
 import json
-import tempfile
 import unittest
 from pathlib import Path
 
 from support import (
     cli, commit_probe, commit, configure_turbo, evidence_files, git, home_dir,
     make_repo, marker_gate, prepare, red, run_state, spend_record, staged,
-    staged_turbo,
+    staged_turbo, workspace,
 )
 
 ISSUE = "7"
@@ -23,7 +22,7 @@ def turbo_staged(repo: Path, home: Path, *, operations: int = 5, **kwargs: objec
 
 class ManualRefusalTest(unittest.TestCase):
     def test_manual_verify_refuses_before_any_child_or_state_change(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             marker = Path(tmp) / "gate-one-ran"
@@ -41,7 +40,7 @@ class ManualRefusalTest(unittest.TestCase):
         self.assertEqual(files, files_after)
 
     def test_manual_verify_refuses_after_green_too(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             from support import to_green
@@ -53,7 +52,7 @@ class ManualRefusalTest(unittest.TestCase):
 
 class TurboBundleTest(unittest.TestCase):
     def test_five_total_operations_complete_the_bundle(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             sha = turbo_staged(repo, home, operations=5)
@@ -73,7 +72,7 @@ class TurboBundleTest(unittest.TestCase):
         self.assertEqual(len(files), 5)
 
     def test_four_operation_limit_refuses_before_any_child(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             marker = Path(tmp) / "gate-one-ran"
@@ -88,7 +87,7 @@ class TurboBundleTest(unittest.TestCase):
 
     def test_first_failure_stops_the_bundle_and_the_next_verify_reruns_gate_one(self):
         failing_gate_two = ["python3", "-c", "import sys; sys.exit(1)"]
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             turbo_staged(repo, home, operations=10, gate2=failing_gate_two)
@@ -109,7 +108,7 @@ class TurboBundleTest(unittest.TestCase):
         self.assertEqual(state["counters"]["operations_used"], 5)
 
     def test_a_noop_gate_two_cannot_mask_a_failing_red_replay(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             configure_turbo(repo, home, gate2=["python3", "-c", "pass"])
@@ -128,7 +127,7 @@ class TurboBundleTest(unittest.TestCase):
         self.assertEqual(state["phase"], "gates")
 
     def test_a_manual_prefix_is_reused_and_the_remaining_steps_run_in_order(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             turbo_staged(repo, home, operations=5, gate2=["python3", "-c", "pass"])
@@ -141,7 +140,7 @@ class TurboBundleTest(unittest.TestCase):
         self.assertEqual(state["gate_chain"], ["1", "2", "3"])
 
     def test_a_recorded_passing_replay_is_not_executed_again(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             turbo_staged(repo, home, operations=5, gate2=["python3", "-c", "pass"])
@@ -158,7 +157,7 @@ class TurboBundleTest(unittest.TestCase):
         self.assertEqual(state["counters"]["operations_used"], 5)
 
     def test_repeated_verify_after_local_verified_uses_no_children_or_new_bytes(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             turbo_staged(repo, home, operations=5)
@@ -177,7 +176,7 @@ class TurboBundleTest(unittest.TestCase):
         self.assertEqual(after["counters"]["operations_used"], 5)
 
     def test_verify_from_the_green_phase_revalidates_without_children(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             turbo_staged(repo, home, operations=5, gate2=["python3", "-c", "pass"])
@@ -210,7 +209,7 @@ class DriftAndTamperTest(unittest.TestCase):
             commit(repo, "README.md", "# moved\n", "move head")
 
         for drift in (profile, identity, moved_head):
-            with self.subTest(drift=drift.__name__), tempfile.TemporaryDirectory() as tmp:
+            with self.subTest(drift=drift.__name__), workspace() as tmp:
                 repo = make_repo(Path(tmp))
                 home = home_dir(Path(tmp))
                 marker = Path(tmp) / "gate-one-ran"
@@ -225,7 +224,7 @@ class DriftAndTamperTest(unittest.TestCase):
                     self.assertEqual(state["phase"], "gates")
 
     def test_a_tampered_gate_prefix_refuses_without_rerunning_it(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             turbo_staged(repo, home, operations=10, gate2=["python3", "-c", "pass"])
@@ -242,7 +241,7 @@ class DriftAndTamperTest(unittest.TestCase):
         self.assertEqual(len(after["gate_observations"]), 2)
 
     def test_a_tampered_replay_refuses_without_reexecuting_it(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             turbo_staged(repo, home, operations=10, gate2=["python3", "-c", "pass"])
@@ -264,7 +263,7 @@ class DriftAndTamperTest(unittest.TestCase):
 class BudgetAndTimeTest(unittest.TestCase):
     def test_the_bugfix_line_and_the_weekly_stop_refuse_a_feature_before_a_child(self):
         for spend in (165.0, 200.0):
-            with self.subTest(spend=spend), tempfile.TemporaryDirectory() as tmp:
+            with self.subTest(spend=spend), workspace() as tmp:
                 repo = make_repo(Path(tmp))
                 home = home_dir(Path(tmp))
                 marker = Path(tmp) / "gate-one-ran"
@@ -278,7 +277,7 @@ class BudgetAndTimeTest(unittest.TestCase):
                 self.assertEqual(state["counters"]["operations_used"], 1)
 
     def test_an_expired_time_limit_refuses_before_a_child(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             marker = Path(tmp) / "gate-one-ran"
@@ -298,7 +297,7 @@ class BudgetAndTimeTest(unittest.TestCase):
 
 class PhaseTest(unittest.TestCase):
     def test_turbo_prompt_offers_the_single_verify_bundle(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             turbo_staged(repo, home, operations=5)
@@ -308,7 +307,7 @@ class PhaseTest(unittest.TestCase):
         self.assertNotIn(f"factory gate --issue {ISSUE}", result.stdout)
 
     def test_wrong_phase_is_refused_before_work(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             configure_turbo(repo, home)
@@ -322,7 +321,7 @@ class PhaseTest(unittest.TestCase):
         self.assertEqual(evidence_files(home), [])
 
     def test_a_stopped_run_is_refused(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             turbo_staged(repo, home, operations=5)

@@ -1,19 +1,18 @@
 import json
 import sys
-import tempfile
 import time
 import unittest
 from pathlib import Path
 
 from support import (
     cli, commit, commit_probe, config, git, home_dir, make_repo,
-    prepare, red, run_state, staged, to_green,
+    prepare, red, run_state, staged, to_green, workspace,
 )
 
 
 class GateChainTest(unittest.TestCase):
     def test_gate_order_is_strict(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             staged(repo, home)
@@ -27,7 +26,7 @@ class GateChainTest(unittest.TestCase):
         self.assertEqual(second_ok.returncode, 0, second_ok.stdout + second_ok.stderr)
 
     def test_gate_three_catches_a_committed_protected_change(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             staged(repo, home)
@@ -45,7 +44,7 @@ class GateChainTest(unittest.TestCase):
 
     def test_repair_cap_is_total_and_does_not_reset(self):
         failing = [sys.executable, "-c", "import sys; sys.exit(1)"]
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             staged(repo, home, gate1=failing)
@@ -59,7 +58,7 @@ class GateChainTest(unittest.TestCase):
         self.assertNotEqual(fourth.returncode, 0)
 
     def test_gate_config_drift_is_refused_before_execution(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             staged(repo, home)
@@ -73,7 +72,7 @@ class GateChainTest(unittest.TestCase):
         self.assertFalse(marker.exists())
 
     def test_green_does_not_execute_the_gate_ladder_or_create_commits(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             one = Path(tmp) / "g1"
@@ -106,7 +105,7 @@ class GateChainTest(unittest.TestCase):
         self.assertEqual(head_before, head_after)
 
     def test_gate_rerun_adds_evidence_without_overwriting(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             staged(repo, home)
@@ -121,7 +120,7 @@ class GateChainTest(unittest.TestCase):
 
     def test_gate_timeout_is_bounded(self):
         slow = [sys.executable, "-c", "import time; time.sleep(5)"]
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             config(repo, home)
@@ -139,7 +138,7 @@ class GateChainTest(unittest.TestCase):
         self.assertLess(elapsed, 10)
 
     def test_gate_passes_argv_without_a_shell(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             marker = Path(tmp) / "argv.txt"
@@ -157,7 +156,7 @@ class GateChainTest(unittest.TestCase):
         self.assertEqual(written, "A B")
 
     def test_manifest_refuses_after_gate_configuration_drift(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             to_green(repo, home)
@@ -173,7 +172,7 @@ class GateChainTest(unittest.TestCase):
 
     def test_docs_gate_failure_cannot_become_local_verified(self):
         docs_gate = [sys.executable, "-c", "import sys; print('QC001'); sys.exit(1)"]
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             staged(repo, home, gate2=docs_gate)

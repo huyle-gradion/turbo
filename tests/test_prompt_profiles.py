@@ -1,12 +1,11 @@
 """The generated prompt must match the operator's declared execution profile."""
 
-import tempfile
 import unittest
 from pathlib import Path
 
 from support import (
     cli, configure_turbo, home_dir, make_repo, prepare, run_state, staged_turbo,
-    to_ready,
+    to_ready, workspace,
 )
 
 ISSUE = "7"
@@ -17,7 +16,7 @@ HUMAN_DECISION = "Human QC and merge stay human decisions."
 
 class ManualPromptTest(unittest.TestCase):
     def test_manual_prompt_keeps_the_operator_approval_line(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             to_ready(repo, home)
@@ -30,7 +29,7 @@ class ManualPromptTest(unittest.TestCase):
 
 class NativeTurboPromptTest(unittest.TestCase):
     def test_turbo_ready_prompt_uses_the_selected_host_permissions(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             configure_turbo(repo, home)
@@ -49,7 +48,7 @@ class NativeTurboPromptTest(unittest.TestCase):
         self.assertIn("never calls a model or network service", output)
 
     def test_turbo_local_verified_prompt_keeps_the_native_wording(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             staged_turbo(repo, home, operations=5)
