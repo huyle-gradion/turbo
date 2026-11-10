@@ -20,4 +20,13 @@ fi
 mkdir -p "$EVIDENCE_DIR"
 echo "qualification evidence: $EVIDENCE_DIR" >&2
 
-python3 -m factory.qualification --evidence-dir "$EVIDENCE_DIR" "$@"
+# Offline (the default) runs the simulated harness in tests/; hosted runs factory.qualification.
+MODE=offline PREV=""
+for ARG in "$@"; do
+  [[ "$PREV" == --mode ]] && MODE="$ARG"
+  [[ "$ARG" == --mode=* ]] && MODE="${ARG#--mode=}"
+  PREV="$ARG"
+done
+MODULE=factory.qualification
+[[ "$MODE" == offline ]] && MODULE=qualification_offline
+python3 -m "$MODULE" --evidence-dir "$EVIDENCE_DIR" "$@"
