@@ -1024,52 +1024,96 @@ def check_credentials_and_capabilities(
     return ok, rec.get("protections", {}).get(branch, rec), blockers
 
 
+_PASSING_SCENARIO_OUTCOMES = ("passed", "verified")
+
+
+def _scenario_verdict(names: list[str], scenarios: dict[str, Any]) -> str:
+    """Return failed, unavailable, or verified from the recorded outcomes of the named scenarios."""
+    outcomes = [scenarios[n].get("outcome") if n in scenarios else None for n in names]
+    if "failed" in outcomes:
+        return "failed"
+    if not outcomes or any(o not in _PASSING_SCENARIO_OUTCOMES for o in outcomes):
+        return "unavailable"
+    return "verified"
+
+
+def _artifact_present(path: str) -> bool:
+    p = Path(path)
+    return p.is_file() and p.stat().st_size > 0
+
+
+def _run_outcome(scenarios: dict[str, Any], blockers: list[str], verified_label: str) -> str:
+    """Summarize a run: failed if any scenario failed, unavailable if anything is missing or blocked."""
+    outcomes = [s.get("outcome") for s in scenarios.values()]
+    if "failed" in outcomes:
+        return "failed"
+    if not scenarios or blockers or any(o not in _PASSING_SCENARIO_OUTCOMES for o in outcomes):
+        return "unavailable"
+    return verified_label
+
+
 def reduce_evidence_index(
     parent_index: dict[str, Any],
     preflight: dict[str, Any],
     scenarios: dict[str, Any],
+    *,
+    preparation: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], bool, list[str]]:
-    """Reduce parent evidence index over required subchecks, artifacts, and simulation status."""
+    """Reduce parent evidence index over recorded scenario outcomes, artifacts, blockers, and simulation status."""
     reduced_index: dict[str, Any] = {}
     reduction_blockers: list[str] = []
     all_qualified = True
 
     preflight_ok = preflight.get("status") == "verified"
-    if not preflight_ok:
-        reduction_blockers.extend(preflight.get("blockers", []))
+    run_blockers = list(preflight.get("blockers", [])) + list((preparation or {}).get("blockers", []))
+    reduction_blockers.extend(run_blockers)
 
     for ac_id, entry in parent_index.items():
         ac_entry = dict(entry)
         subchecks_status: dict[str, str] = {}
-        missing_artifacts: list[str] = []
-
-        for ap in ac_entry.get("artifact_paths", []):
-            if not Path(ap).exists():
-                missing_artifacts.append(ap)
-
+        artifact_paths = list(ac_entry.get("artifact_paths", []))
+        missing_artifacts = [ap for ap in artifact_paths if not _artifact_present(ap)]
+        artifact_blockers: list[str] = []
         if missing_artifacts:
+            artifact_blockers.append(f"missing-artifacts: {ac_id} is missing artifacts: {missing_artifacts}")
+        elif not artifact_paths:
+            artifact_blockers.append(f"missing-artifacts: {ac_id} recorded no artifacts")
+        for sn in ac_entry.get("scenarios", []):
+            if sn not in scenarios:
+                continue  # a missing scenario is reported by the scenario verdict
+            sc_arts = list(scenarios[sn].get("artifacts") or [])
+            sc_missing = [ap for ap in sc_arts if not _artifact_present(ap)]
+            if not sc_arts or sc_missing:
+                artifact_blockers.append(
+                    f"missing-artifacts: {ac_id} scenario {sn} "
+                    + (f"is missing artifacts: {sc_missing}" if sc_missing else "recorded no artifacts")
+                )
+
+        if artifact_blockers:
             subchecks_status["artifacts"] = "missing"
-            reduction_blockers.append(f"missing-artifacts: {ac_id} is missing artifacts: {missing_artifacts}")
+            reduction_blockers.extend(artifact_blockers)
         else:
             subchecks_status["artifacts"] = "verified"
 
+        verdict = _scenario_verdict(ac_entry.get("scenarios", []), scenarios)
+        subchecks_status["scenarios"] = verdict
         simulated = any(scenarios.get(sn, {}).get("simulated", False) for sn in ac_entry.get("scenarios", [])) or preflight.get("simulated", False)
-        if simulated:
+        complete = verdict == "verified" and subchecks_status["artifacts"] == "verified" and not run_blockers
+        ac_entry["hosted_proof_status"] = "PENDING"
+        if verdict == "failed":
+            subchecks_status["hosted_scenarios"] = "failed"
+            ac_entry["outcome"] = "failed"
+        elif simulated:
             subchecks_status["hosted_scenarios"] = "simulated"
-            ac_entry["hosted_proof_status"] = "PENDING"
-            ac_entry["outcome"] = "passed-offline-simulated"
+            sim_label = "passed-simulated" if ac_entry.get("mode") == "hosted" else "passed-offline-simulated"
+            ac_entry["outcome"] = sim_label if complete else "unavailable"
+        elif complete and preflight_ok:
+            subchecks_status["hosted_scenarios"] = "verified"
+            ac_entry["hosted_proof_status"] = "VERIFIED"
+            ac_entry["outcome"] = "hosted-verified"
         else:
-            all_passed = bool(scenarios) and all(
-                scenarios.get(sn, {}).get("outcome") in ("passed", "verified") for sn in ac_entry.get("scenarios", [])
-            )
-            if all_passed and not missing_artifacts and preflight_ok:
-                subchecks_status["hosted_scenarios"] = "verified"
-                ac_entry["hosted_proof_status"] = "VERIFIED"
-                ac_entry["outcome"] = "hosted-verified"
-            else:
-                subchecks_status["hosted_scenarios"] = "unperformed-or-failed"
-                ac_entry["hosted_proof_status"] = "PENDING"
-                ac_entry["outcome"] = "unavailable"
+            subchecks_status["hosted_scenarios"] = "unperformed-or-failed"
+            ac_entry["outcome"] = "unavailable"
 
         ac_entry["subchecks"] = subchecks_status
         if ac_entry["hosted_proof_status"] != "VERIFIED":
@@ -1080,8 +1124,13 @@ def reduce_evidence_index(
     return reduced_index, all_qualified, reduction_blockers
 
 
-def build_parent_evidence_index(scenarios: dict[str, Any], factory_rev: str) -> dict[str, Any]:
-    """Produce comprehensive evidence index across all six parent #24 acceptance criteria."""
+def build_parent_evidence_index(
+    scenarios: dict[str, Any], factory_rev: str, *, mode: str = "offline-simulated",
+) -> dict[str, Any]:
+    """Produce the evidence index across all six parent #24 acceptance criteria from recorded scenarios.
+
+    `command` and `exit_status` stay null until the invoking command records them (see main()).
+    """
     mapping = {
         "AC1": ["confirmed_landing", "prereq_missing_and_denied"],
         "AC2": ["confirmed_landing", "wrong_target_rejected"],
@@ -1112,18 +1161,30 @@ def build_parent_evidence_index(scenarios: dict[str, Any], factory_rev: str) -> 
             "ac_id": ac_id,
             "description": PARENT_AC_DESCRIPTIONS.get(ac_id, ""),
             "scenarios": sc_names,
-            "command": "python3 -m factory.qualification --mode offline",
-            "exit_status": 0,
+            "mode": mode,
+            "command": None,
+            "exit_status": None,
             "factory_revision": factory_rev,
             "candidate_revision": c_sha,
             "base_revision": b_sha,
             "tested_revision": t_sha,
             "landed_revision": l_sha,
-            "outcome": "passed-offline-simulated" if scenarios else "unavailable",
+            "outcome": _scenario_verdict(sc_names, scenarios),
             "hosted_proof_status": "PENDING",
             "artifact_paths": all_artifacts,
         }
     return index
+
+
+def _read_remote_main(base_url: str, repo_slug: str, token: str, ledger: QualificationLedger | None) -> str | None:
+    """Read the provider's current `main` SHA, or None when the provider did not report one."""
+    code, data, _ = get_remote_commit(base_url, repo_slug, "main", token, ledger=ledger)
+    sha = data.get("sha") if code == 200 and isinstance(data, dict) else None
+    return sha if isinstance(sha, str) and sha else None
+
+
+def _main_preserved(before: str | None, after: str | None) -> bool | None:
+    return (before == after) if before and after else None
 
 
 def _prepare_approved_delivery_gate(
@@ -1243,7 +1304,7 @@ def run_scenario_2_prereq_missing_and_denied(
     sdir = safe_dir(evidence_dir / "scenarios" / "prereq_missing_and_denied", create=True)
     tokens = [integrator_token, competitor_token]
     sc_ledger = ledger or QualificationLedger(sdir / "operation-ledger.jsonl", tokens)
-    main_sha_before = gitio.remote_ref(ctx.repo, "main") or gitio.commit_sha(ctx.repo, "refs/heads/main")
+    main_sha_before = _read_remote_main(base_url, repo_slug, integrator_token, sc_ledger)
     cand_sha, base_sha = ctx.cand_sha, ctx.base_sha
     fake_child_dir = safe_dir(ctx.home / "missing-child", create=True)
     gate_missing = deliver_module.enforce_delivery_approval(
@@ -1277,24 +1338,26 @@ def run_scenario_2_prereq_missing_and_denied(
             approval_record=gate_missing, repo_slug=repo_slug, base_url=base_url, token=integrator_token,
         )
         code_chk, pr_chk_data, _ = _http_req("GET", f"{base_url.rstrip('/')}/repos/{repo_slug}/pulls/{unapp_pr_num}", integrator_token, base_url, [], time.monotonic() + 15.0, 15)
-        pr_still_open = (pr_chk_data.get("state") == "open" and pr_chk_data.get("merged") is not True) if code_chk == 200 else True
-        protection_denial_observed = (_denial_source(unapp_res) == "provider" and pr_still_open)
+        pr_still_open = (pr_chk_data.get("state") == "open" and pr_chk_data.get("merged") is not True) if code_chk == 200 else None
+        protection_denial_observed = (_denial_source(unapp_res) == "provider" and pr_still_open is True)
         prot_res = {"status": unapp_res.status, "blockers": unapp_res.blockers, "denial_source": _denial_source(unapp_res)}
         perm_code, perm_data, perm_msg = _http_req("GET", f"{base_url.rstrip('/')}/repos/{repo_slug}/actions/permissions", competitor_token, base_url, [], time.monotonic() + 15.0, 15)
         sc_ledger.record("GET", f"{base_url.rstrip('/')}/repos/{repo_slug}/actions/permissions", "competitor", perm_code, perm_msg)
         permission_denial_observed = (perm_code == 403)
-        perm_res = {"status": f"HTTP {perm_code}", "blockers": [perm_msg or "You must have repository read permissions"]}
-    main_sha_after = gitio.remote_ref(ctx.repo, "main") or gitio.commit_sha(ctx.repo, "refs/heads/main")
-    main_preserved = (main_sha_after == main_sha_before)
-    all_passed = (missing_prereq_ok and stale_prereq_ok and protection_denial_observed and permission_denial_observed and main_preserved)
+        provider_message = perm_data.get("message") if isinstance(perm_data, dict) and isinstance(perm_data.get("message"), str) else None
+        perm_res = {"status": f"HTTP {perm_code}", "provider_message": provider_message, "blockers": [provider_message] if provider_message else []}
+    main_sha_after = _read_remote_main(base_url, repo_slug, integrator_token, sc_ledger)
+    main_preserved = _main_preserved(main_sha_before, main_sha_after)
+    all_passed = (missing_prereq_ok and stale_prereq_ok and protection_denial_observed and permission_denial_observed and main_preserved is True)
     sc_data = {
         "name": "prereq_missing_and_denied", "scenario": "prereq_missing_and_denied",
         "status": "verified" if all_passed else "failed",
         "outcome": "verified" if all_passed else "failed",
         "missing_prereq_rejected": missing_prereq_ok, "stale_prereq_rejected": stale_prereq_ok,
         "protection_denial": {"observed": protection_denial_observed, "pr_number": unapp_pr_num, "status": prot_res["status"], "blockers": prot_res["blockers"], "denial_source": prot_res.get("denial_source"), "pr_unmerged": pr_still_open},
-        "permission_denial": {"observed": permission_denial_observed, "status": perm_res["status"], "blockers": perm_res["blockers"]},
-        "main_preserved": main_preserved, "candidate_sha": unapp_cand_sha, "base_sha": base_sha,
+        "permission_denial": {"observed": permission_denial_observed, "status": perm_res["status"], "provider_message": perm_res.get("provider_message"), "blockers": perm_res["blockers"]},
+        "main_preserved": main_preserved, "main_sha_before": main_sha_before, "main_sha_after": main_sha_after,
+        "candidate_sha": unapp_cand_sha, "base_sha": base_sha,
         "simulated": allow_test_origin, "artifacts": [str(sdir / "scenario-result.json")],
         "recorded_at": approval_mod.now(),
     }
@@ -1314,7 +1377,7 @@ def run_scenario_3_competing_base_rejection(
     sc_ledger = ledger or QualificationLedger(sdir / "operation-ledger.jsonl", tokens)
     code, base_c, _ = get_remote_commit(base_url, repo_slug, base_branch, integrator_token, ledger=sc_ledger)
     base_sha_b = base_c.get("sha", ctx.base_sha) if code == 200 else ctx.base_sha
-    main_sha_before = gitio.remote_ref(ctx.repo, "main") or gitio.commit_sha(ctx.repo, "refs/heads/main")
+    main_sha_before = _read_remote_main(base_url, repo_slug, integrator_token, sc_ledger)
     cand_branch = "feat/qual-cand-sc3-r3"
     cand_sha, cand_pr_num, adv_pr_num = ctx.cand_sha, 3, 4
     new_base_b_prime = base_sha_b
@@ -1345,7 +1408,7 @@ def run_scenario_3_competing_base_rejection(
         rejection_observed = (res_cand.status in ("rejected-competing-base", "stale-base-revision"))
         cand_merge_status, cand_blockers, denial_source = res_cand.status, res_cand.blockers, _denial_source(res_cand)
         code_cchk, pr_c_data, _ = _http_req("GET", f"{base_url.rstrip('/')}/repos/{repo_slug}/pulls/{cand_pr_num}", integrator_token, base_url, [], time.monotonic() + 15.0, 15)
-        cand_unmerged = (pr_c_data.get("state") == "open" and pr_c_data.get("merged") is not True) if code_cchk == 200 else True
+        cand_unmerged = (pr_c_data.get("state") == "open" and pr_c_data.get("merged") is not True) if code_cchk == 200 else None
     else:
         gate_cand = _prepare_approved_delivery_gate(ctx, ctx.repo, cand_sha, base_sha_b, sc3_child, cand_branch)
         child_c3 = {**ctx.child_contract, "head_branch": cand_branch}
@@ -1366,9 +1429,9 @@ def run_scenario_3_competing_base_rejection(
         rejection_observed = (res_cand.status in ("rejected-competing-base", "rejected"))
         cand_merge_status, cand_blockers, denial_source = res_cand.status, res_cand.blockers, _denial_source(res_cand)
 
-    main_sha_after = gitio.remote_ref(ctx.repo, "main") or gitio.commit_sha(ctx.repo, "refs/heads/main")
-    main_preserved = (main_sha_after == main_sha_before)
-    passed = (rejection_observed and cand_unmerged and main_preserved)
+    main_sha_after = _read_remote_main(base_url, repo_slug, integrator_token, sc_ledger)
+    main_preserved = _main_preserved(main_sha_before, main_sha_after)
+    passed = (rejection_observed and cand_unmerged is True and main_preserved is True)
     sc_data = {
         "name": "competing_base_rejection", "scenario": "competing_base_rejection",
         "status": cand_merge_status, "outcome": "verified" if passed else "failed",
@@ -1377,6 +1440,7 @@ def run_scenario_3_competing_base_rejection(
         "advance_pr_number": adv_pr_num, "advance_merge": adv_merge_obs,
         "candidate_merge_status": cand_merge_status, "candidate_merge_blockers": cand_blockers, "denial_source": denial_source,
         "candidate_unmerged": cand_unmerged, "main_preserved": main_preserved,
+        "main_sha_before": main_sha_before, "main_sha_after": main_sha_after,
         "simulated": allow_test_origin, "artifacts": [str(sdir / "scenario-result.json")],
         "recorded_at": approval_mod.now(),
     }
@@ -1593,15 +1657,18 @@ def run_hosted_qualification(
             scenarios["renewed_verification_after_base_change"] = sc4_res
 
     # 5. Evidence index reduction
-    parent_index = build_parent_evidence_index(scenarios, f_rev)
-    reduced_index, all_qual, red_blockers = reduce_evidence_index(parent_index, preflight_record, scenarios)
+    parent_index = build_parent_evidence_index(scenarios, f_rev, mode="hosted")
+    reduced_index, all_qual, red_blockers = reduce_evidence_index(
+        parent_index, preflight_record, scenarios, preparation=prep_record,
+    )
 
-    final_blockers = list(dict.fromkeys(all_preflight_blockers + prep_record.get("blockers", []) + ["hosted-scenarios-5-and-6-pending-slice-5"]))
-    all_passed = bool(scenarios) and all(s.get("outcome") in ("passed", "verified") for s in scenarios.values())
+    run_blockers = list(dict.fromkeys(all_preflight_blockers + prep_record.get("blockers", []) + red_blockers))
+    final_blockers = run_blockers + ["hosted-scenarios-5-and-6-pending-slice-5"]
+    outcome = _run_outcome(scenarios, run_blockers, "slice-4-verified")
     res = {
         "schema": 1, "role": "hosted-qualification-summary", "factory_revision": f_rev,
-        "status": "in-progress-slice-4-complete" if (all_passed and not all_preflight_blockers) else "blocked",
-        "outcome": "slice-4-verified" if (all_passed and not all_preflight_blockers) else "unavailable",
+        "status": "in-progress-slice-4-complete" if outcome == "slice-4-verified" else "blocked",
+        "outcome": outcome,
         "qualified": False,
         "repo_slug": repo_slug, "blockers": final_blockers,
         "preflight": preflight_record, "preparation": prep_record, "scenarios": scenarios,
@@ -1652,7 +1719,7 @@ def run_offline_qualification(evidence_dir: Path) -> dict[str, Any]:
                 ctx.gh.pulls[1]["state"] = "open"
                 ctx.gh.pulls[1]["merged"] = False
 
-        def _snap_sc(name: str, res: Any, extra: dict[str, Any]) -> dict[str, Any]:
+        def _snap_sc(name: str, res: Any, extra: dict[str, Any], expected_status: str, observed: bool) -> dict[str, Any]:
             sdir = safe_dir(scenarios_dir / name, create=True)
             arts = [str(sdir / "scenario-result.json")]
             for fn in ("integration-request.json", "integration-record.json", "approval-gate.json"):
@@ -1663,7 +1730,9 @@ def run_offline_qualification(evidence_dir: Path) -> dict[str, Any]:
                     arts.append(str(dst))
             sc_data = {
                 "name": name, "status": getattr(res, "status", str(res)),
-                "outcome": getattr(res, "outcome", "rejected"),
+                "expected_status": expected_status,
+                "integration_outcome": getattr(res, "outcome", None),
+                "outcome": "verified" if observed else "failed",
                 "landed_sha": getattr(res, "landed_sha", None),
                 "candidate_sha": extra.get("candidate_sha", ctx.cand_sha),
                 "base_sha": extra.get("base_sha", ctx.base_sha),
@@ -1691,7 +1760,7 @@ def run_offline_qualification(evidence_dir: Path) -> dict[str, Any]:
         scenarios["confirmed_landing"] = _snap_sc("confirmed_landing", r1, {
             "delivery_approved": gate1.get("delivery_approved", False),
             "landed_sha": r1.landed_sha, "reconciled": r1.reconciled,
-        })
+        }, "confirmed", r1.status == "confirmed" and bool(r1.landed_sha))
 
         # 2. Prereq missing and permission denial
         _reset_pr_and_branches(ctx.base_sha, ctx.cand_sha)
@@ -1705,7 +1774,7 @@ def run_offline_qualification(evidence_dir: Path) -> dict[str, Any]:
             repo_slug="turbo-factory/turbo-qual-67", base_url=ctx.gh.base_url, token="disp-tok",
         )
         ctx.gh.merge_status = 200
-        scenarios["prereq_missing_and_denied"] = _snap_sc("prereq_missing_and_denied", r2, {})
+        scenarios["prereq_missing_and_denied"] = _snap_sc("prereq_missing_and_denied", r2, {}, "denied-permissions", r2.status == "denied-permissions")
 
         # 3. Competing base rejection at boundary
         _reset_pr_and_branches(ctx.base_sha, ctx.cand_sha)
@@ -1724,7 +1793,7 @@ def run_offline_qualification(evidence_dir: Path) -> dict[str, Any]:
             repo_slug="turbo-factory/turbo-qual-67", base_url=ctx.gh.base_url, token="disp-tok",
             on_before_merge=_adv_competitor,
         )
-        scenarios["competing_base_rejection"] = _snap_sc("competing_base_rejection", r3, {})
+        scenarios["competing_base_rejection"] = _snap_sc("competing_base_rejection", r3, {}, "rejected-competing-base", r3.status == "rejected-competing-base")
 
         # 4. Renewed verification after base change
         # Competing actor advances base on remote feature branch
@@ -1745,8 +1814,8 @@ def run_offline_qualification(evidence_dir: Path) -> dict[str, Any]:
             repo_slug="turbo-factory/turbo-qual-67", base_url=ctx.gh.base_url, token="disp-tok",
         )
         scenarios["renewed_verification_after_base_change"] = _snap_sc("renewed_verification_after_base_change", r4, {
-            "advanced_base_sha": adv_base, "stale_base_prevented": True,
-        })
+            "advanced_base_sha": adv_base, "stale_base_prevented": r4.status == "stale-base-revision",
+        }, "stale-base-revision", r4.status == "stale-base-revision" and not r4.landed_sha)
 
         # 5. Concurrency and uncertain reconciliation
         _reset_pr_and_branches(ctx.base_sha, ctx.cand_sha)
@@ -1761,8 +1830,8 @@ def run_offline_qualification(evidence_dir: Path) -> dict[str, Any]:
         )
         ctx.gh.merge_status = 200
         scenarios["concurrency_and_uncertain_reconciliation"] = _snap_sc("concurrency_and_uncertain_reconciliation", r5, {
-            "uncertain_outcome": True,
-        })
+            "uncertain_outcome": r5.status == "uncertain",
+        }, "uncertain", r5.status == "uncertain" and not r5.landed_sha)
 
         # 6. Wrong target rejected and main preserved
         _reset_pr_and_branches(ctx.base_sha, ctx.cand_sha)
@@ -1777,15 +1846,16 @@ def run_offline_qualification(evidence_dir: Path) -> dict[str, Any]:
         main_sha_after = git(ctx.bare, "rev-parse", "refs/heads/main")
         scenarios["wrong_target_rejected"] = _snap_sc("wrong_target_rejected", r6, {
             "main_sha_before": main_sha_before, "main_sha_after": main_sha_after,
-        })
+        }, "unintended-target", r6.status == "unintended-target" and main_sha_before == main_sha_after)
 
-    parent_index = build_parent_evidence_index(scenarios, f_rev)
+    parent_index = build_parent_evidence_index(scenarios, f_rev, mode="offline-simulated")
     reduced_index, all_qualified, red_blockers = reduce_evidence_index(
         parent_index, {"status": "offline-simulated", "simulated": True}, scenarios,
     )
     summary = {
         "schema": 1, "role": "offline-qualification-summary", "factory_revision": f_rev,
-        "status": "preparation-complete", "outcome": "offline-simulated-verified",
+        "status": "preparation-complete",
+        "outcome": _run_outcome(scenarios, red_blockers, "offline-simulated-verified"),
         "qualified": False, "mode": "offline-simulated", "simulated": True,
         "disclaimer": "Offline simulated proof; not parent acceptance. Hosted qualification PENDING.",
         "scenarios": scenarios, "parent_evidence_index": reduced_index,
@@ -1805,23 +1875,52 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--repo-slug", default="turbo-factory/turbo-qual-67")
     parser.add_argument("--branch", default="feature/demo")
     parser.add_argument("--base-url", default="https://api.github.com")
+    argv = list(sys.argv[1:] if argv is None else argv)
     args = parser.parse_args(argv)
+    command = ["python3", "-m", "factory.qualification", *argv]
 
-    ev_dir = args.evidence_dir or Path(os.environ.get("DEMO_KEEP_EVIDENCE_DIR", "/tmp/turbo-issue-67-evidence"))
-    if args.mode == "hosted":
-        live_enabled = os.environ.get("TURBO_LIVE_QUALIFICATION") == "1"
-        res = run_hosted_qualification(
-            args.repo_slug, ev_dir, live_enabled=live_enabled,
-            integrator_token=os.environ.get("TURBO_QUAL_INTEGRATOR_TOKEN"),
-            competitor_token=os.environ.get("TURBO_QUAL_COMPETITOR_TOKEN"),
-            base_url=args.base_url, branch=args.branch,
-        )
-        print(json.dumps(res, indent=2))
-        return 0 if res.get("qualified") else 2
-    else:
-        res = run_offline_qualification(ev_dir)
-        print(json.dumps(res, indent=2))
-        return 0
+    ev_dir = Path(args.evidence_dir or os.environ.get("DEMO_KEEP_EVIDENCE_DIR", "/tmp/turbo-issue-67-evidence"))
+    for stale in ("qualification-summary.json", "parent-evidence-index.json"):
+        (ev_dir / stale).unlink(missing_ok=True)  # persisted results describe only this run
+    tokens: list[str] = []
+    try:
+        if args.mode == "hosted":
+            live_enabled = os.environ.get("TURBO_LIVE_QUALIFICATION") == "1"
+            tokens = [os.environ.get("TURBO_QUAL_INTEGRATOR_TOKEN") or "", os.environ.get("TURBO_QUAL_COMPETITOR_TOKEN") or ""]
+            res = run_hosted_qualification(
+                args.repo_slug, ev_dir, live_enabled=live_enabled,
+                integrator_token=tokens[0] or None, competitor_token=tokens[1] or None,
+                base_url=args.base_url, branch=args.branch,
+            )
+            rc = 0 if res.get("qualified") else 2
+        else:
+            res = run_offline_qualification(ev_dir)
+            rc = 0 if res.get("outcome") == "offline-simulated-verified" else 2
+    except BaseException as exc:
+        ev_dir.mkdir(parents=True, exist_ok=True)
+        (ev_dir / "parent-evidence-index.json").unlink(missing_ok=True)
+        crashed = {
+            "schema": 1, "role": "qualification-summary", "mode": "hosted" if args.mode == "hosted" else "offline-simulated",
+            "status": "failed", "outcome": "failed", "qualified": False,
+            "blockers": [f"qualification-run-raised: {type(exc).__name__}: {exc}"],
+            "recorded_at": approval_mod.now(),
+        }
+        _record_invocation(ev_dir, crashed, command, 1, tokens)
+        raise
+    _record_invocation(ev_dir, res, command, rc, tokens)
+    print(json.dumps(res, indent=2))
+    return rc
+
+
+def _record_invocation(ev_dir: Path, res: dict[str, Any], command: list[str], rc: int, tokens: list[str]) -> None:
+    """Persist the actual command line and exit status of this run into the summary and every index entry."""
+    index = res.get("parent_evidence_index") or {}
+    for entry in index.values():
+        entry["command"], entry["exit_status"] = command, rc
+    res["command"], res["exit_status"] = command, rc
+    if index:
+        atomic_json(ev_dir / "parent-evidence-index.json", redact_qualification_tokens(index, tokens), ev_dir)
+    atomic_json(ev_dir / "qualification-summary.json", redact_qualification_tokens(res, tokens), ev_dir)
 
 
 if __name__ == "__main__":

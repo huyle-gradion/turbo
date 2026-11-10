@@ -145,6 +145,9 @@ class _HostedQualificationFakeServer:
                 if "/commits/" in path and path.endswith("/check-runs"):
                     return self._send_json(200, {"total_count": len(outer.check_runs), "check_runs": outer.check_runs})
 
+                if path == "/api/v3/repos/turbo-factory/turbo-qual-67/commits/main":
+                    return self._send_json(200, {"sha": outer.branch_heads.get("main", "a1234567890abcdef1234567890abcdef1234567")})
+
                 prefix_pr = "/api/v3/repos/turbo-factory/turbo-qual-67/pulls/"
                 if path.startswith(prefix_pr) and not "/reviews" in path:
                     pr_id_str = path[len(prefix_pr):]
