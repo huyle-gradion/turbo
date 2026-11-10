@@ -1,7 +1,7 @@
 """Hosted qualification records only real prerequisite evidence (#97)."""
 from __future__ import annotations
 
-import ast, contextlib, os, re, shutil, tempfile, unittest
+import ast, contextlib, json, os, re, shutil, stat, tempfile, unittest
 from pathlib import Path
 from unittest import mock
 
@@ -28,6 +28,23 @@ def _candidate_checkout(tmp: Path, src: str) -> tuple[Path, str, str]:
     seed_sha = commit(repo, "src/calc.py", (SEED_ASSETS_DIR / "src" / "calc.py").read_text(encoding="utf-8"), "seed copy")
     cand_sha = commit(repo, "src/calc.py", src, "candidate")
     return repo, seed_sha, cand_sha
+
+
+def _hosted_origin(case: Path, *, with_contract: bool) -> tuple[Path, str, str]:
+    """A local bare repo standing in for github.com/REPO; returns (origin root for the URL template, cand, base)."""
+    repo = make_repo(case)
+    seed = SEED_ASSETS_DIR
+    commit(repo, ".factory/policy.json", (seed / "factory" / "policy.json").read_text(encoding="utf-8"), "policy")
+    if with_contract:
+        commit(repo, ".factory/child-contract.json", (seed / "factory" / "child-contract.json").read_text(encoding="utf-8"), "contract")
+    commit(repo, "qa/qa-cases.json", (seed / "qa" / "qa-cases.json").read_text(encoding="utf-8"), "qa cases")
+    base = commit(repo, "src/calc.py", (seed / "src" / "calc.py").read_text(encoding="utf-8"), "seed copy")
+    git(repo, "branch", "feature/demo", base)
+    git(repo, "checkout", "-q", "-b", HEAD_BRANCH)
+    cand = commit(repo, "src/calc.py", PASSING_SRC, "candidate")
+    origin = case / "origin"
+    git(case, "clone", "-q", "--bare", str(repo), str(origin / f"{REPO}.git"))
+    return origin, cand, base
 
 
 def _fake_reviewer(tmp: Path) -> str:
@@ -200,6 +217,67 @@ class QualificationRealPrerequisiteTest(unittest.TestCase):
                     self.assertIs(sc["competitor_approved"], want, sc)
                     if not want:
                         self.assertEqual(sc["outcome"], "failed")
+
+    def test_hosted_clone_path_offline(self) -> None:
+        """#104: the clone origin is injectable (HOSTED_CLONE_URL_TEMPLATE), so the hosted clone paths run offline."""
+        def _origin(with_contract: bool) -> tuple[Path, Path, str, str, contextlib.AbstractContextManager]:
+            case = Path(tempfile.mkdtemp(dir=self.tmp))
+            origin, cand, base = _hosted_origin(case, with_contract=with_contract)
+            seam = mock.patch("factory.qualification.HOSTED_CLONE_URL_TEMPLATE", f"{origin}/{{repo_slug}}.git")
+            return case, origin, cand, base, seam
+
+        with self.subTest("no child contract: scenario-context-unavailable, no examples/ fallback"):
+            case, _, _, _, seam = _origin(with_contract=False)
+            blockers: list[str] = []
+            entered = False
+            with seam, contextlib.suppress(qualification._ScenarioContextUnavailable), qualification.hosted_scenario_context(
+                    case / "ws", REPO, "valid-int-tok", blockers=blockers):
+                entered = True
+            self.assertFalse(entered, "a scenario context was built without the hosted child contract")
+            self.assertTrue(any(b.startswith("scenario-context-unavailable") for b in blockers), blockers)
+
+        with self.subTest("context from the hosted clone; workspace recreated 0700"):
+            case, _, cand, base, seam = _origin(with_contract=True)
+            ws = case / "ws"
+            ws.mkdir(mode=0o755)
+            os.chmod(ws, 0o755)
+            (ws / "stale").write_text("leftover", encoding="utf-8")
+            with seam, qualification.hosted_scenario_context(ws, REPO, "valid-int-tok", blockers=[]) as ctx:
+                self.assertEqual(stat.S_IMODE(ws.stat().st_mode), 0o700)
+                self.assertFalse((ws / "stale").exists(), "workspace was reused")
+                self.assertEqual(ctx.child_contract, json.loads((SEED_ASSETS_DIR / "factory" / "child-contract.json").read_text(encoding="utf-8")))
+                self.assertEqual((ctx.cand_sha, ctx.base_sha), (cand, base))
+                self.assertEqual(git(ctx.repo, "rev-parse", "HEAD"), base)
+
+        for name, symlinked in (("candidate-checkout cloned from the origin", False), ("symlinked candidate-checkout refused", True)):
+            with self.subTest(name):
+                case, _, cand, _, seam = _origin(with_contract=True)
+                outside = case / "outside"
+                outside.mkdir()
+                (case / "ev").mkdir()
+                if symlinked:
+                    (case / "ev" / "candidate-checkout").symlink_to(outside, target_is_directory=True)
+                fakes = {"check_hosted_authorization": dict(return_value=(True, "")),
+                         "get_remote_pulls": dict(return_value=[{"number": 1, "head": {"sha": cand}, "base": {"sha": BASE_SHA}}]),
+                         "get_remote_file_content": dict(return_value=(200, "subtract test_subtract", "")),
+                         "get_remote_commit": dict(return_value=(200, {"sha": BASE_SHA}, "")),
+                         "poll_ci_check": dict(return_value=(True, {"status": "verified", "candidate_sha": cand}, [])),
+                         "resolve_agy_bin": dict(return_value=None)}
+                with contextlib.ExitStack() as st, _HostedQualificationFakeServer() as gh:
+                    st.enter_context(seam)
+                    for fn, kw in fakes.items():
+                        st.enter_context(mock.patch("factory.qualification." + fn, **kw))
+                    rec = prepare_qualification_candidate(
+                        gh.base_url, REPO, case / "ev", head_branch=HEAD_BRANCH, base_sha=BASE_SHA,
+                        integrator_token="valid-int-tok", competitor_token="valid-comp-tok", allow_test_origin=False)
+                qa = rec["prerequisites"]["qa"]
+                if symlinked:
+                    self.assertEqual(list(outside.iterdir()), [], "the clone wrote through the candidate-checkout symlink")
+                    self.assertIsNot(qa.get("qa_verified"), True, qa)
+                    self.assertTrue(any("candidate-checkout" in b for b in rec["blockers"]), rec["blockers"])
+                else:
+                    self.assertEqual(qa.get("candidate_sha"), cand, qa)
+                    self.assertIs(qa.get("qa_verified"), True, qa)
 
 
 if __name__ == "__main__":
