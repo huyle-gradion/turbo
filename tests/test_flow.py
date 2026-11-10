@@ -11,18 +11,28 @@ from support import (
 
 
 class FlowTest(unittest.TestCase):
-    def test_full_flow_reaches_local_verified(self):
+    def test_full_flow_reaches_local_verified_idempotently(self):
         with tempfile.TemporaryDirectory() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             sha = to_green(repo, home)
+            repeat = cli(repo, home, "green", "--issue", "7")
             before = run_state(home)
             result = cli(repo, home, "manifest", "--issue", "7")
             state = run_state(home)
             manifest_path = Path(str(state["manifest_path"]))
+            digest = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
             written = json.loads(manifest_path.read_text(encoding="utf-8"))
             mode = private_mode(manifest_path)
+            second = cli(repo, home, "manifest", "--issue", "7")
+            after = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+            manifests = list(manifest_path.parent.glob("manifest*.json"))
+        self.assertEqual(repeat.returncode, 0, repeat.stdout + repeat.stderr)
+        self.assertEqual(before["green_sha"], sha)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
+        self.assertEqual(digest, after)
+        self.assertEqual(len(manifests), 1)
         self.assertEqual(state["phase"], "local-verified")
         self.assertEqual(state["green_sha"], sha)
         self.assertNotEqual(state["red_sha"], state["green_sha"])
@@ -136,33 +146,6 @@ class FlowTest(unittest.TestCase):
             state = run_state(home)
         self.assertEqual(result.returncode, 1)
         self.assertEqual(state["phase"], "gates")
-
-    def test_manifest_is_idempotent_and_preserves_the_first_file(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            repo = make_repo(Path(tmp))
-            home = home_dir(Path(tmp))
-            to_green(repo, home)
-            first = cli(repo, home, "manifest", "--issue", "7")
-            path = Path(str(run_state(home)["manifest_path"]))
-            digest = hashlib.sha256(path.read_bytes()).hexdigest()
-            second = cli(repo, home, "manifest", "--issue", "7")
-            after = hashlib.sha256(path.read_bytes()).hexdigest()
-            manifests = list(path.parent.glob("manifest*.json"))
-        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
-        self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
-        self.assertEqual(digest, after)
-        self.assertEqual(len(manifests), 1)
-
-    def test_green_repeat_returns_the_existing_evidence(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            repo = make_repo(Path(tmp))
-            home = home_dir(Path(tmp))
-            sha = to_green(repo, home)
-            result = cli(repo, home, "green", "--issue", "7")
-            state = run_state(home)
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(state["phase"], "green")
-        self.assertEqual(state["green_sha"], sha)
 
 
 

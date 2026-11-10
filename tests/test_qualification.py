@@ -350,8 +350,8 @@ class QualificationSafetyAndCapabilityTest(unittest.TestCase):
                 self.assertFalse(res["qualified"])
                 self.assertTrue(any("insufficient-permissions" in b for b in res["blockers"]))
 
-    def test_both_branch_protection_and_empty_contexts_prevent_qualification(self) -> None:
-        """Branch protection must cover both branches and reject empty required status check contexts."""
+    def test_both_branch_protection_empty_contexts_and_missing_seed_assets_prevent_qualification(self) -> None:
+        """Branch protection must cover both branches, reject empty required check contexts, and require seed assets."""
         # 1. 403 on branch protection read
         with _HostedQualificationFakeServer(protection_status=403) as gh:
             with tempfile.TemporaryDirectory() as tmp:
@@ -380,8 +380,7 @@ class QualificationSafetyAndCapabilityTest(unittest.TestCase):
                 self.assertFalse(res["qualified"])
                 self.assertTrue(any("empty-required-check-contexts" in b for b in res["blockers"]))
 
-    def test_missing_seed_assets_prevent_qualification(self) -> None:
-        """Missing seed assets (workflow or policy) on feature/demo prevent qualification."""
+        # 3. Missing seed assets (workflow or policy) on feature/demo
         with _HostedQualificationFakeServer(contents={}) as gh:
             with tempfile.TemporaryDirectory() as tmp:
                 ev_dir = Path(tmp) / "ev"
@@ -476,15 +475,6 @@ class QualificationSafetyAndCapabilityTest(unittest.TestCase):
                 self.assertEqual(ledger_lines[0]["seq"], 1)
                 self.assertEqual(ledger_lines[0]["actor"], "integrator")
 
-    def test_get_submitted_review_by_id(self) -> None:
-        """Read submitted PR review by ID from object endpoint rather than array responses."""
-        with _HostedQualificationFakeServer() as gh:
-            code, data, msg = get_submitted_review(gh.base_url, "turbo-factory/turbo-qual-67", 1, 42, "valid-int-tok")
-            self.assertEqual(code, 200)
-            self.assertEqual(data.get("id"), 42)
-            self.assertEqual(data.get("state"), "APPROVED")
-            self.assertEqual(data.get("user", {}).get("login"), "cone-orgs")
-
 
 class QualificationOfflineExecutionTest(unittest.TestCase):
     def test_offline_qualification_scenarios_and_evidence(self) -> None:
@@ -547,6 +537,12 @@ class QualificationCandidatePreparationTest(unittest.TestCase):
         self.assertTrue(qa_rec["qa_verified"])
         self.assertEqual(len(blockers), 0)
 
+        # Candidate commit fixture defines genuine operations and executable tests
+        for op in ("add", "multiply", "subtract"):
+            self.assertIn(f"def {op}", CALC_CANDIDATE_SRC)
+            self.assertIn(f"def test_{op}", CALC_CANDIDATE_TEST)
+        self.assertIn("class CalcTest", CALC_CANDIDATE_TEST)
+
     def test_qualification_pr_creation_and_actor_separation(self) -> None:
         """Validate candidate PR creation by competitor and rejection of self-review."""
         with _HostedQualificationFakeServer() as gh:
@@ -603,6 +599,13 @@ class QualificationCandidatePreparationTest(unittest.TestCase):
             self.assertFalse(ok_role)
             self.assertTrue(any("reviewer-role-violation" in b for b in role_blockers))
 
+            # 4. Submitted review is read by ID from the object endpoint, not an array response
+            code, data, msg = get_submitted_review(gh.base_url, "turbo-factory/turbo-qual-67", 1, 42, "valid-int-tok")
+            self.assertEqual(code, 200)
+            self.assertEqual(data.get("id"), 42)
+            self.assertEqual(data.get("state"), "APPROVED")
+            self.assertEqual(data.get("user", {}).get("login"), "cone-orgs")
+
     def test_qualification_pr_ci_verification(self) -> None:
         """Verify CI check run inspection against required context and trusted producer."""
         cand_sha = "c1234567890abcdef1234567890abcdef1234567"
@@ -625,8 +628,8 @@ class QualificationCandidatePreparationTest(unittest.TestCase):
             self.assertFalse(ok_miss)
             self.assertTrue(any("missing-ci-check" in b for b in miss_blockers))
 
-    def test_prepare_qualification_candidate_missing_reviewer_capability(self) -> None:
-        """Missing supported reviewer executable records unavailable and prevents preparation."""
+    def test_prepare_qualification_candidate_reviewer_capability(self) -> None:
+        """Missing reviewer executable records unavailable and blocks preparation; a supported one prepares."""
         cand_sha = "c1234567890abcdef1234567890abcdef1234567"
         base_sha = "b1234567890abcdef1234567890abcdef1234567"
         with _HostedQualificationFakeServer() as gh:
@@ -650,10 +653,7 @@ class QualificationCandidatePreparationTest(unittest.TestCase):
                 prep_file = ev_dir / "candidate-preparation.json"
                 self.assertTrue(prep_file.exists())
 
-    def test_prepare_qualification_candidate_with_supported_reviewer(self) -> None:
-        """When supported reviewer executable is provided, candidate preparation succeeds."""
-        cand_sha = "c1234567890abcdef1234567890abcdef1234567"
-        base_sha = "b1234567890abcdef1234567890abcdef1234567"
+        # When supported reviewer executable is provided, candidate preparation succeeds
         with _HostedQualificationFakeServer() as gh:
             with tempfile.TemporaryDirectory() as tmp:
                 ev_dir = Path(tmp) / "ev"
@@ -675,13 +675,6 @@ class QualificationCandidatePreparationTest(unittest.TestCase):
                 self.assertEqual(rec["prerequisites"]["ci"]["status"], "verified")
                 self.assertEqual(rec["prerequisites"]["github_review"]["state"], "APPROVED")
                 self.assertEqual(rec["builder"]["candidate_sha"], cand_sha)
-
-    def test_candidate_fixture_defines_new_operations_and_tests(self) -> None:
-        """Candidate commit fixture defines genuine operations and executable tests."""
-        for op in ("add", "multiply", "subtract"):
-            self.assertIn(f"def {op}", CALC_CANDIDATE_SRC)
-            self.assertIn(f"def test_{op}", CALC_CANDIDATE_TEST)
-        self.assertIn("class CalcTest", CALC_CANDIDATE_TEST)
 
 
 class HostedScenariosExecutionTest(unittest.TestCase):

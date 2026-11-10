@@ -24,16 +24,28 @@ class ResumeTest(unittest.TestCase):
         self.assertEqual(entry["verdict"], "refused")
         self.assertIn("pr-unknown", entry["reasons"])
 
-    def test_pr_none_and_consistent_head_resumes(self):
+    def test_pr_none_and_consistent_head_resumes_appends_history_without_gh(self):
         with tempfile.TemporaryDirectory() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             to_red(repo, home)
-            result = resume(repo, home, "none")
-            entry = run_state(home)["resume_history"][-1]
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(entry["verdict"], "consistent")
-        self.assertEqual(entry["reasons"], [])
+            fake_bin = Path(tmp) / "fake-bin"
+            fake_bin.mkdir()
+            marker = Path(tmp) / "gh-called"
+            gh = fake_bin / "gh"
+            gh.write_text(f"#!/bin/sh\ntouch {marker}\nexit 0\n", encoding="utf-8")
+            gh.chmod(0o755)
+            first = resume(repo, home, "none", extra_path=str(fake_bin))
+            second = resume(repo, home, "none", extra_path=str(fake_bin))
+            state = run_state(home)
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
+        self.assertEqual(len(state["resume_history"]), 2)
+        for entry in state["resume_history"]:
+            self.assertEqual(entry["verdict"], "consistent")
+            self.assertEqual(entry["reasons"], [])
+        self.assertEqual(state["counters"]["operations_used"], 1)
+        self.assertFalse(marker.exists())
 
     def test_dirty_tree_refuses_and_preserves_work(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -89,45 +101,23 @@ class ResumeTest(unittest.TestCase):
         self.assertEqual(state["phase"], "stopped")
         self.assertEqual(state["stop_reason"], "cancelled")
 
-    def test_budget_stop_recovers_after_spend_without_resetting_counters(self):
+    def test_budget_stop_recovers_only_with_no_pr_and_keeps_counters(self):
         with tempfile.TemporaryDirectory() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             to_red(repo, home)
             self.assertEqual(cli(repo, home, "stop", "--issue", "7", "--reason", "budget").returncode, 0)
             self.assertEqual(spend_record(repo, home, 20.0).returncode, 0)
+            refused = resume(repo, home, "exists")
+            refused_state = run_state(home)
             result = resume(repo, home, "none")
             state = run_state(home)
+        self.assertEqual(refused.returncode, 1)
+        self.assertEqual(refused_state["phase"], "stopped")
+        self.assertEqual(refused_state["stop_reason"], "budget")
+        self.assertIn("pr-exists", refused_state["resume_history"][-1]["reasons"])
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(state["phase"], "red")
-        self.assertEqual(state["counters"]["operations_used"], 1)
-
-    def test_resume_never_invokes_gh(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            repo = make_repo(Path(tmp))
-            home = home_dir(Path(tmp))
-            to_red(repo, home)
-            fake_bin = Path(tmp) / "fake-bin"
-            fake_bin.mkdir()
-            marker = Path(tmp) / "gh-called"
-            gh = fake_bin / "gh"
-            gh.write_text(f"#!/bin/sh\ntouch {marker}\nexit 0\n", encoding="utf-8")
-            gh.chmod(0o755)
-            result = resume(repo, home, "none", extra_path=str(fake_bin))
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertFalse(marker.exists())
-
-    def test_resume_appends_history_and_keeps_counters(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            repo = make_repo(Path(tmp))
-            home = home_dir(Path(tmp))
-            to_red(repo, home)
-            first = resume(repo, home, "none")
-            second = resume(repo, home, "none")
-            state = run_state(home)
-        self.assertEqual(first.returncode, 0)
-        self.assertEqual(second.returncode, 0)
-        self.assertEqual(len(state["resume_history"]), 2)
         self.assertEqual(state["counters"]["operations_used"], 1)
 
     def test_local_verified_run_resumes_consistently(self):
@@ -165,21 +155,6 @@ class ResumeTest(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertEqual(state["phase"], "stopped")
         self.assertIsNotNone(state["red"])
-
-
-    def test_refused_recovery_does_not_restore_the_run(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            repo = make_repo(Path(tmp))
-            home = home_dir(Path(tmp))
-            to_red(repo, home)
-            self.assertEqual(cli(repo, home, "stop", "--issue", "7", "--reason", "budget").returncode, 0)
-            self.assertEqual(spend_record(repo, home, 20.0).returncode, 0)
-            result = resume(repo, home, "exists")
-            state = run_state(home)
-        self.assertEqual(result.returncode, 1)
-        self.assertEqual(state["phase"], "stopped")
-        self.assertEqual(state["stop_reason"], "budget")
-        self.assertIn("pr-exists", state["resume_history"][-1]["reasons"])
 
 
 

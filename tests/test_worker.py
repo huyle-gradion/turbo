@@ -69,31 +69,27 @@ class WorkerExecutionTest(unittest.TestCase):
         res, payload = _run_fake_worker(script, task_id="task-empty-art")
         self.assertEqual((res.returncode, payload["completed"], payload["artifact"]["present"], payload["_stored_artifact_text"]), (0, True, True, ""))
 
-    def test_missing_artifact_even_with_exit_zero_and_success_message_is_incomplete(self):
-        script = "import json\nprint(json.dumps({'event': 'result', 'result': {'conversation_id': 'c1', 'status': 'SUCCESS', 'response': 'Done!'}}))\n"
-        res, payload = _run_fake_worker(script)
-        self.assertEqual((res.returncode, payload["status"], payload["completed"]), (1, "missing-artifact", False))
-
-    def test_malformed_stdout_even_when_artifact_written_and_exit_zero_is_incomplete(self):
-        script = "import pathlib\npathlib.Path('artifact.txt').write_text('ok\\n', encoding='utf-8')\nprint('COMPLETE SUCCESS but not json')\n"
-        res, payload = _run_fake_worker(script)
-        self.assertEqual((res.returncode, payload["status"], payload["completed"]), (1, "malformed-output", False))
-
-    def test_false_success_text_when_structured_result_status_is_error_is_incomplete(self):
-        script = "import json, pathlib\npathlib.Path('artifact.txt').write_text('ok\\n', encoding='utf-8')\nprint(json.dumps({'event': 'result', 'result': {'conversation_id': 'c1', 'status': 'ERROR', 'response': 'SUCCESS!'}}))\n"
-        res, payload = _run_fake_worker(script)
-        self.assertEqual((res.returncode, payload["status"], payload["completed"]), (1, "failed", False))
-
-    def test_permission_denial_in_stream_or_diagnostics_is_classified_permission_denied(self):
-        script = (
-            "import json, pathlib, sys\n"
-            "pathlib.Path('artifact.txt').write_text('partial\\n', encoding='utf-8')\n"
-            "sys.stderr.write('tool run_command denied by sandbox policy: permission denied\\n')\n"
-            "print(json.dumps({'event': 'step_update', 'step_update': {'step_index': 1, 'state': 'ERROR', 'step_type': 'tool_call', 'error': 'permission denied'}}))\n"
-            "print(json.dumps({'event': 'result', 'result': {'conversation_id': 'c1', 'status': 'SUCCESS', 'response': 'Done'}}))\n"
+    def test_false_success_signals_are_classified_incomplete(self):
+        cases = (
+            # missing artifact even with exit zero and a success message
+            ("missing-artifact", "import json\nprint(json.dumps({'event': 'result', 'result': {'conversation_id': 'c1', 'status': 'SUCCESS', 'response': 'Done!'}}))\n"),
+            # malformed stdout even when the artifact is written and exit is zero
+            ("malformed-output", "import pathlib\npathlib.Path('artifact.txt').write_text('ok\\n', encoding='utf-8')\nprint('COMPLETE SUCCESS but not json')\n"),
+            # false success text when the structured result status is error
+            ("failed", "import json, pathlib\npathlib.Path('artifact.txt').write_text('ok\\n', encoding='utf-8')\nprint(json.dumps({'event': 'result', 'result': {'conversation_id': 'c1', 'status': 'ERROR', 'response': 'SUCCESS!'}}))\n"),
+            # permission denial in the stream or diagnostics
+            ("permission-denied", (
+                "import json, pathlib, sys\n"
+                "pathlib.Path('artifact.txt').write_text('partial\\n', encoding='utf-8')\n"
+                "sys.stderr.write('tool run_command denied by sandbox policy: permission denied\\n')\n"
+                "print(json.dumps({'event': 'step_update', 'step_update': {'step_index': 1, 'state': 'ERROR', 'step_type': 'tool_call', 'error': 'permission denied'}}))\n"
+                "print(json.dumps({'event': 'result', 'result': {'conversation_id': 'c1', 'status': 'SUCCESS', 'response': 'Done'}}))\n"
+            )),
         )
-        res, payload = _run_fake_worker(script)
-        self.assertEqual((res.returncode, payload["status"], payload["completed"]), (1, "permission-denied", False))
+        for status, script in cases:
+            with self.subTest(status):
+                res, payload = _run_fake_worker(script)
+                self.assertEqual((res.returncode, payload["status"], payload["completed"]), (1, status, False))
 
     def test_timeout_terminates_owned_worker_processes_preserves_output_and_reports_incomplete(self):
         script = (
