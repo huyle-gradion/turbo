@@ -157,8 +157,9 @@ class EvidenceIndexOutcomeTest(unittest.TestCase):
 
             # Reruns into the same evidence directory must not leave an earlier run's claims behind.
             ev = Path(tmp) / "ev-rerun"
+            import qualification_offline  # offline simulation lives in tests/ (#97)
             with self.subTest(rerun="passing-offline"):
-                rc = _run_main(["--mode", "offline", "--evidence-dir", str(ev)])
+                rc = _run_main(["--mode", "offline", "--evidence-dir", str(ev)], qualification_offline.main)
                 self.assertEqual(rc, 0, "a fully passing offline run must exit 0")
                 self.assertEqual(self._load(ev)[1]["exit_status"], 0)
             ev_raise = Path(tmp) / "ev-rerun-raise"
@@ -172,10 +173,12 @@ class EvidenceIndexOutcomeTest(unittest.TestCase):
                 for ac, entry in self._persisted(ev)[1].items():
                     self.assertEqual(entry.get("exit_status"), rc, f"stale {ac} index entry beside the hosted summary")
             with self.subTest(rerun="then-raising-offline"), \
-                    mock.patch("factory.qualification.integrate_approved_child", side_effect=RuntimeError("forced crash")):
-                with contextlib.suppress(Exception):
-                    _run_main(["--mode", "offline", "--evidence-dir", str(ev_raise)])
+                    mock.patch.object(qualification_offline, "integrate_approved_child", side_effect=RuntimeError("forced crash")):
+                with self.assertRaises(RuntimeError):  # the crash propagates after evidence is recorded
+                    _run_main(["--mode", "offline", "--evidence-dir", str(ev_raise)], qualification_offline.main)
                 summary, index = self._persisted(ev_raise)
+                self.assertEqual(summary.get("exit_status"), 1, "a crashed offline run records exit_status 1")
+                self.assertEqual(summary.get("outcome"), "failed")
                 for where, rec in [("summary", summary), *index.items()]:
                     if rec:
                         self.assertNotEqual(rec.get("exit_status"), 0, f"stale {where} claims exit 0")
