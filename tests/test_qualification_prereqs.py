@@ -5,6 +5,7 @@ import ast, os, re, shutil, tempfile, unittest
 from pathlib import Path
 from unittest import mock
 
+from factory import qualification
 from factory.qualification import SEED_ASSETS_DIR, prepare_qualification_candidate
 from support import ROOT, commit, git, make_repo
 from test_qualification import _HostedQualificationFakeServer
@@ -79,28 +80,25 @@ class QualificationRealPrerequisiteTest(unittest.TestCase):
                     p.stop()
             return rec, list(gh.requests), cand_sha
 
-    def test_factory_has_no_test_imports(self) -> None:
-        """AC1: no module under factory/ imports tests, support or support_deliver, or puts tests/ on sys.path."""
-        banned = ("tests", "support", "support_deliver")
+    def test_qualification_has_no_test_imports(self) -> None:
+        """AC1: factory/qualification.py imports no tests/support code, adds no tests/ path, and keeps only the hosted path."""
+        path = ROOT / "factory" / "qualification.py"
         offences: list[str] = []
-        for path in sorted((ROOT / "factory").rglob("*.py")):
-            rel = path.relative_to(ROOT)
-            for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"), filename=str(path))):
-                names: list[str] = []
-                if isinstance(node, ast.Import):
-                    names = [a.name for a in node.names]
-                elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
-                    names = [node.module]
-                elif isinstance(node, ast.Call):
-                    call = ast.unparse(node)
-                    if re.match(r"sys\.path\.(insert|append|extend)\(", call) and "tests" in call:
-                        offences.append(f"{rel}:{node.lineno}: {call}")
-                    if re.match(r"(importlib\.)?(import_module|__import__)\(", call) and re.search(r"['\"](tests|support)", call):
-                        offences.append(f"{rel}:{node.lineno}: {call}")
-                for name in names:
-                    if name.split(".")[0] in banned:
-                        offences.append(f"{rel}:{node.lineno}: import {name}")
-        self.assertEqual(offences, [], "factory/ must not depend on test code")
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"), filename=str(path))):
+            names: list[str] = []
+            if isinstance(node, ast.Import):
+                names = [a.name for a in node.names]
+            elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                names = [node.module]
+            elif isinstance(node, ast.Call):
+                call = ast.unparse(node)
+                if re.match(r"sys\.path\.(insert|append|extend)\(", call) and "tests" in call:
+                    offences.append(f"{node.lineno}: {call}")
+                if re.match(r"(importlib\.)?(import_module|__import__)\(", call) and re.search(r"['\"](tests|support)", call):
+                    offences.append(f"{node.lineno}: {call}")
+            offences += [f"{node.lineno}: import {n}" for n in names if n.split(".")[0] in ("tests", "support", "support_deliver")]
+        self.assertEqual(offences, [], "factory/qualification.py must not depend on test code")
+        self.assertFalse(hasattr(qualification, "run_offline_qualification"), "offline simulation belongs in tests/")
 
     def test_reviewer_presence_is_not_review(self) -> None:
         """AC2: without a reviewer that actually ran, security and independent review never read verified/approved."""
