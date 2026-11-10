@@ -121,7 +121,7 @@ def workspace():
         ws.active = False
 
 
-def _snapshotted(step):
+def snapshotted(step):
     @functools.wraps(step)
     def wrapper(first: Path, *args: object, **kwargs: object) -> object:
         ws = _WORKSPACE
@@ -158,7 +158,7 @@ def _snapshotted(step):
     return wrapper
 
 
-@_snapshotted
+@snapshotted
 def make_repo(tmp: Path) -> Path:
     repo = tmp / "repo"
     repo.mkdir()
@@ -298,7 +298,7 @@ def prepare(
     return cli(repo, home, *args)
 
 
-@_snapshotted
+@snapshotted
 def to_ready(repo: Path, home: Path, **kwargs: object) -> None:
     config(repo, home, **kwargs)
     result = prepare(repo, home)
@@ -335,7 +335,7 @@ def configure_turbo(
         spend_record(repo, home, spend, source)
 
 
-@_snapshotted
+@snapshotted
 def staged_turbo(repo: Path, home: Path, *, operations: int = 5, issue: int = 7, **kwargs: object) -> str:
     configure_turbo(repo, home, **kwargs)
     result = prepare(repo, home, issue=issue, operations=operations)
@@ -366,7 +366,7 @@ def marker_gate(marker: Path) -> list[str]:
     ]
 
 
-@_snapshotted
+@snapshotted
 def to_red(repo: Path, home: Path, issue: int = 7) -> None:
     to_ready(repo, home)
     git(repo, "switch", "-q", "-c", f"run-issue-{issue}")
@@ -381,7 +381,7 @@ def to_red(repo: Path, home: Path, issue: int = 7) -> None:
     assert result.returncode == 0, result.stdout + result.stderr
 
 
-@_snapshotted
+@snapshotted
 def to_staged(repo: Path, home: Path, issue: int = 7) -> str:
     to_red(repo, home, issue)
     sha = commit_probe(repo, 42, "implementation")
@@ -390,7 +390,7 @@ def to_staged(repo: Path, home: Path, issue: int = 7) -> str:
     return sha
 
 
-@_snapshotted
+@snapshotted
 def to_green(repo: Path, home: Path, issue: int = 7) -> str:
     sha = to_staged(repo, home, issue)
     for gate in ("1", "2", "3"):
@@ -421,7 +421,7 @@ def red(
     )
 
 
-@_snapshotted
+@snapshotted
 def staged(repo: Path, home: Path, *, issue: int = 7, **config_kwargs: object) -> str:
     config(repo, home, **config_kwargs)
     assert prepare(repo, home, issue=issue).returncode == 0
