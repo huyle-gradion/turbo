@@ -8,7 +8,8 @@ from types import SimpleNamespace
 from typing import Any
 from urllib.parse import quote, urlparse
 
-from factory import automated_qa, ci_gate, config as config_module, deliver as deliver_module, gitio
+from factory import (automated_qa, ci_gate, config as config_module, deliver as deliver_module, gitio, independent_review,
+                     security_review)
 from factory.ci_selection import build_required_ci_checks
 from factory.deliver_checks import collect_redaction_secrets, git_timed
 from factory.errors import UsageError
@@ -20,6 +21,8 @@ FACTORY_ROOT = Path(__file__).resolve().parents[1]
 SEED_ASSETS_DIR = FACTORY_ROOT / "examples" / "qualification" / "seed"
 
 HOSTED_API_ORIGIN = "https://api.github.com"
+# The hosted harness builds the candidate itself; reviewers must run in sessions other than this builder (#104).
+QUALIFICATION_BUILDER_SESSION = "qual-builder"
 HOSTED_CLONE_URL_TEMPLATE = "https://github.com/{repo_slug}.git"
 DISPOSABLE_REPO_ALLOWLIST = frozenset(["turbo-factory/turbo-qual-67"])
 ALLOWED_TARGET_BRANCHES = frozenset(["feature/demo"])
@@ -889,6 +892,45 @@ def _gated_ci_and_qa(
     return ci, qa, blockers
 
 
+def _hosted_reviews(
+    ctx: Any, agy: str, qa_rec: dict[str, Any], *, head_branch: str, candidate_sha: str, base_sha: str, tokens: list[str],
+    limit_s: int = 900,
+) -> tuple[dict[str, Any], dict[str, Any], list[str]]:
+    """Security, then independent review from the factory's own entry points for the exact head (#104), wired as
+    delivery wires them for a child; the records they write in `ctx.child_dir` are the evidence."""
+    common = {"repo": ctx.repo, "home": ctx.home, "child_dir": ctx.child_dir, "child": {**ctx.child_contract, "head_branch": head_branch},
+              "conf": ctx.conf, "base_sha": base_sha, "candidate_sha": candidate_sha, "agy_bin": agy,
+              "builder_session_id": QUALIFICATION_BUILDER_SESSION}
+    recs: dict[str, dict[str, Any]] = {}
+    sec_record: dict[str, Any] | None = None
+    blockers: list[str] = []
+    for key, role, ok_key in (("security", "security", "ready"), ("independent_review", "independent", "review_verified")):
+        base = {"candidate_sha": candidate_sha, "reviewer_bin": agy, "builder_session_id": QUALIFICATION_BUILDER_SESSION}
+        if key == "independent_review" and recs["security"]["status"] != "verified":
+            recs[key] = {**base, "status": "not-run", "reason": "security-review-not-verified", "reviewer_session_id": None}
+            continue
+        try:
+            if key == "security":
+                rec = security_review.review_candidate_security(**common, deadline=time.monotonic() + limit_s, limit_s=limit_s)
+            else:
+                rec = independent_review.review_candidate_independently(
+                    **common, qa_record=qa_rec, security_record=sec_record,
+                    deadline=time.monotonic() + limit_s, limit_s=limit_s)
+        except Exception as exc:  # the entry point could not run: no record, unavailable, blocked
+            msg = str(redact_qualification_tokens(str(exc), tokens))
+            recs[key] = {**base, "status": "unavailable", "reason": msg, "reviewer_session_id": None}
+            blockers.append(f"{role}-review-unavailable for {candidate_sha}: {msg}")
+            continue
+        ok = rec.get(ok_key) is True and rec.get("reviewed_revision") == candidate_sha
+        sec_record = rec if key == "security" else sec_record
+        recs[key] = {**base, "status": "verified" if ok else "not-verified", "outcome": rec.get("outcome"),
+                     "reviewer_session_id": rec.get("reviewer_session_id"),
+                     "record_path": str(ctx.child_dir / f"{role}-review.json")}  # the entry point's own record
+        if not ok:
+            blockers.append(f"{role}-review-not-verified ({rec.get('outcome')}) for {candidate_sha}")
+    return recs["security"], recs["independent_review"], blockers
+
+
 def prepare_qualification_candidate(
     base_url: str,
     repo_slug: str,
@@ -935,6 +977,7 @@ def prepare_qualification_candidate(
                 "kind": "deterministic-qualification-process",
                 "process_name": "turbo-qualification-builder",
                 "actor": "cone-orgs",
+                "session_id": QUALIFICATION_BUILDER_SESSION,
                 "candidate_sha": pr.get("head_sha", candidate_sha) if pr else candidate_sha,
                 "base_sha": pr.get("base_sha", base_sha) if pr else base_sha,
                 "head_branch": head_branch,
@@ -1068,16 +1111,22 @@ def prepare_qualification_candidate(
         prep_blockers.extend(qa_blockers)
 
     # 5. Security & independent review: only a reviewer-produced record counts; an executable on PATH is not a review.
-    # Preparation does not run a reviewer, so both records stay unavailable and block.
+    # The real reviewers run (#104) only in the scenario context, after CI and QA verified this exact head.
     resolved_agy = resolve_agy_bin(agy_bin)
-    reason = "reviewer-not-run" if resolved_agy else "unsupported-reviewer-capability"
-    sec_rec = {"status": "unavailable", "ready": False, "reason": reason}
-    ir_rec = {"status": "unavailable", "approved": False, "reason": reason}
-    for role in ("security", "independent"):
-        prep_blockers.append(
-            f"reviewer-not-run: no {role} review record was produced for {pr_head_sha}" if resolved_agy
-            else f"unsupported-reviewer-capability: genuine {role} reviewer requires supported agy runtime"
-        )
+    if resolved_agy and scenario_ctx is not None and ok_ci and ok_qa:
+        sec_rec, ir_rec, rev_blockers = _hosted_reviews(
+            scenario_ctx, resolved_agy, qa_rec, head_branch=head_branch, candidate_sha=pr_head_sha, base_sha=pr_base_sha,
+            tokens=tokens)
+        prep_blockers.extend(rev_blockers)
+    else:
+        reason = "reviewer-not-run" if resolved_agy else "unsupported-reviewer-capability"
+        sec_rec = {"status": "unavailable", "ready": False, "reason": reason}
+        ir_rec = {"status": "unavailable", "approved": False, "reason": reason}
+        for role in ("security", "independent"):
+            prep_blockers.append(
+                f"reviewer-not-run: no {role} review record was produced for {pr_head_sha}" if resolved_agy
+                else f"unsupported-reviewer-capability: genuine {role} reviewer requires supported agy runtime"
+            )
 
     # 6. Operator-account approval (not an independent review): submitted only after every prerequisite for this head passed.
     gh_rev_rec: dict[str, Any] = {}
@@ -1326,7 +1375,7 @@ def run_scenario_1_confirmed_landing(
     code, base_c, _ = get_remote_commit(base_url, repo_slug, base_branch, integrator_token, ledger=sc_ledger)
     base_sha = base_c.get("sha", ctx.base_sha) if code == 200 else ctx.base_sha
     main_sha_before = gitio.remote_ref(ctx.repo, "main") or gitio.commit_sha(ctx.repo, "refs/heads/main")
-    sc1_child = ctx.child_dir  # preparation's CI and QA records live here; the delivery gate reads them (#108)
+    sc1_child = ctx.child_dir  # the folder where preparation stored this head's CI, QA and reviewer records (#104)
     pr_num, cand_sha = 1, ctx.cand_sha
     if not allow_test_origin:
         code_pr, pr_live, _ = _http_req("GET", f"{base_url.rstrip('/')}/repos/{repo_slug}/pulls/5", integrator_token, base_url, [], time.monotonic() + 15.0, 15)
@@ -1785,10 +1834,13 @@ def run_hosted_qualification(
         if not all_preflight_blockers and base_url.rstrip("/") != HOSTED_API_ORIGIN:
             scenario_blockers.append(f"scenario-context-unavailable: hosted scenarios need a clone from {HOSTED_API_ORIGIN}, not {base_url}")
         elif not all_preflight_blockers:
-            ws_root = safe_dir(evidence_dir / "workspace", create=True)
-            with contextlib.suppress(_ScenarioContextUnavailable):
-                ctx = stack.enter_context(hosted_scenario_context(
-                    ws_root, repo_slug, integrator_token, branch=branch, blockers=scenario_blockers))
+            try:  # a workspace that cannot be made private (e.g. a symlink) blocks; it is never written through
+                ws_root = safe_dir(evidence_dir / "workspace", create=True)
+                with contextlib.suppress(_ScenarioContextUnavailable):
+                    ctx = stack.enter_context(hosted_scenario_context(
+                        ws_root, repo_slug, integrator_token, branch=branch, blockers=scenario_blockers))
+            except UsageError as exc:
+                scenario_blockers.append(f"scenario-context-unavailable: {exc}")
 
         # 5. Candidate preparation (observes preflight blockers or prepares candidate)
         prep_record = prepare_qualification_candidate(
