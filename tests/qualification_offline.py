@@ -206,9 +206,24 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--evidence-dir", type=Path, default=Path("/tmp/turbo-issue-67-evidence"))
     argv = list(sys.argv[1:] if argv is None else argv)
     args = parser.parse_args(argv)
-    res = run_offline_qualification(args.evidence_dir)
+    ev_dir, command = Path(args.evidence_dir), ["python3", "-m", "qualification_offline", *argv]
+    for stale in ("qualification-summary.json", "parent-evidence-index.json"):
+        (ev_dir / stale).unlink(missing_ok=True)  # persisted results describe only this run
+    try:
+        res = run_offline_qualification(ev_dir)
+    except BaseException as exc:
+        ev_dir.mkdir(parents=True, exist_ok=True)
+        (ev_dir / "parent-evidence-index.json").unlink(missing_ok=True)
+        crashed = {
+            "schema": 1, "role": "offline-qualification-summary", "mode": "offline-simulated",
+            "status": "failed", "outcome": "failed", "qualified": False,
+            "blockers": [f"qualification-run-raised: {type(exc).__name__}: {exc}"],
+            "recorded_at": approval_mod.now(),
+        }
+        _record_invocation(ev_dir, crashed, command, 1, [])
+        raise
     rc = 0 if res.get("outcome") == "offline-simulated-verified" else 2
-    _record_invocation(Path(args.evidence_dir), res, ["python3", "-m", "qualification_offline", *argv], rc, [])
+    _record_invocation(ev_dir, res, command, rc, [])
     print(json.dumps(res, indent=2))
     return rc
 
