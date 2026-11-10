@@ -327,7 +327,8 @@ class ApprovalGateGroup1Test(unittest.TestCase):
             res_bclaim_tampered = run_gate("claim-builder-tampered", review_record={**valid_rev, "builder_summary_claim": {"summary": "passed", "treated_as_execution_evidence": True, "contradicted_by_observed_execution": False}})
             self.assertEqual((res_bclaim_tampered["delivery_approved"], res_bclaim_tampered["status"]), (False, "unsupported-success-claim"))
             concealed_rev = {**valid_rev, "builder_summary_claim": {"summary": "All checks passed.", "treated_as_execution_evidence": False, "contradicted_by_observed_execution": False}, "observed_verification": {**valid_rev["observed_verification"], "ok": True, "checks": [{**valid_rev["observed_verification"]["checks"][0], "ok": False, "exit_code": 1}, *valid_rev["observed_verification"]["checks"][1:]]}}
-            self.assertEqual((run_gate("m4-concealed-contra", review_record=concealed_rev)["delivery_approved"], run_gate("m4-concealed-contra", review_record=concealed_rev)["status"]), (False, "unsupported-success-claim"))
+            res_concealed = run_gate("m4-concealed-contra", review_record=concealed_rev)
+            self.assertEqual((res_concealed["delivery_approved"], res_concealed["status"]), (False, "unsupported-success-claim"))
 
             old_diff_p, bad_p1_p, bad_p2_p = home / "m4-old.diff", home / "m4-p1.txt", home / "m4-p2.txt"
             old_diff_txt = "diff --git a/src/chat_bridge/auth.py b/src/chat_bridge/auth.py\n--- a/src/chat_bridge/auth.py\n+++ b/src/chat_bridge/auth.py\n@@ -1 +1 @@\n-# old\n+# new\n"
