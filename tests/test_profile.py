@@ -5,59 +5,38 @@ from pathlib import Path
 
 from support import (
     cli, config, config_json, configure_turbo, home_dir, make_repo,
-    prepare, run_state, spend_record, to_ready,
+    prepare, spend_record, to_ready,
 )
 
 
 class ProfileConfigurationTest(unittest.TestCase):
-    def test_default_profile_is_manual_with_no_attestation(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            repo = make_repo(Path(tmp))
-            home = home_dir(Path(tmp))
-            self.assertEqual(cli(repo, home, "init").returncode, 0)
-            saved = config_json(home)
-        self.assertEqual(saved["execution_profile"], "manual")
-        self.assertIsNone(saved.get("native_turbo_attestation"))
-
     def test_native_turbo_needs_the_explicit_attestation(self):
         with tempfile.TemporaryDirectory() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             self.assertEqual(cli(repo, home, "init").returncode, 0)
+            saved = config_json(home)
+            self.assertEqual(saved["execution_profile"], "manual")
+            self.assertIsNone(saved.get("native_turbo_attestation"))
             result = cli(repo, home, "configure", "--profile", "native-turbo")
             saved = config_json(home)
-        self.assertEqual(result.returncode, 2)
-        self.assertEqual(saved["execution_profile"], "manual")
-        self.assertIn("attest", result.stderr.lower())
-
-    def test_attestation_without_the_profile_is_refused(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            repo = make_repo(Path(tmp))
-            home = home_dir(Path(tmp))
-            self.assertEqual(cli(repo, home, "init").returncode, 0)
+            self.assertEqual(result.returncode, 2)
+            self.assertEqual(saved["execution_profile"], "manual")
+            self.assertIn("attest", result.stderr.lower())
+            # The attestation without the profile is refused too.
             result = cli(repo, home, "configure", "--attest-native-turbo", "antigravity-native")
             saved = config_json(home)
         self.assertEqual(result.returncode, 2)
         self.assertEqual(saved["execution_profile"], "manual")
-
-    def test_turbo_records_the_operator_host_attestation(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            repo = make_repo(Path(tmp))
-            home = home_dir(Path(tmp))
-            self.assertEqual(cli(repo, home, "init").returncode, 0)
-            result = cli(repo, home, "configure", "--profile", "native-turbo", "--attest-native-turbo", "antigravity-native")
-            saved = config_json(home)
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(saved["execution_profile"], "native-turbo")
-        self.assertEqual(saved["native_turbo_attestation"]["host"], "antigravity-native")
-        self.assertEqual(saved["native_turbo_attestation"]["declaration"], "host-policy-operator-probed")
-        self.assertIn("operator", saved["native_turbo_attestation"]["statement"].lower())
 
     def test_manual_reset_removes_the_old_attestation(self):
         with tempfile.TemporaryDirectory() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             configure_turbo(repo, home)
+            gate = config_json(home)["gates"]["1"]
+            self.assertEqual(gate["declaration"], "host-policy-operator-probed")
+            self.assertFalse(gate["declare_host_deny"])
             result = cli(repo, home, "configure", "--profile", "manual")
             saved = config_json(home)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -69,7 +48,13 @@ class ProfileConfigurationTest(unittest.TestCase):
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             self.assertEqual(cli(repo, home, "init").returncode, 0)
-            self.assertEqual(cli(repo, home, "configure", "--profile", "native-turbo", "--attest-native-turbo", "antigravity-native").returncode, 0)
+            result = cli(repo, home, "configure", "--profile", "native-turbo", "--attest-native-turbo", "antigravity-native")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            attestation = config_json(home)["native_turbo_attestation"]
+            self.assertEqual(config_json(home)["execution_profile"], "native-turbo")
+            self.assertEqual(attestation["host"], "antigravity-native")
+            self.assertEqual(attestation["declaration"], "host-policy-operator-probed")
+            self.assertIn("operator", attestation["statement"].lower())
             result = cli(repo, home, "configure", "--gate", "1", "--declare-host-deny", "--", "python3", "-c", "pass")
             saved = config_json(home)
         self.assertEqual(result.returncode, 2)
@@ -80,47 +65,25 @@ class ProfileConfigurationTest(unittest.TestCase):
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             config(repo, home)
+            gate = config_json(home)["gates"]["1"]
+            self.assertEqual(gate["declaration"], "host-denies-writes")
+            self.assertTrue(gate["declare_host_deny"])
             result = cli(repo, home, "configure", "--profile", "native-turbo", "--attest-native-turbo", "antigravity-native")
             saved = config_json(home)
         self.assertEqual(result.returncode, 2)
         self.assertEqual(saved["execution_profile"], "manual")
 
-    def test_manual_gate_one_keeps_the_host_deny_declaration_compatibility(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            repo = make_repo(Path(tmp))
-            home = home_dir(Path(tmp))
-            config(repo, home)
-            saved = config_json(home)
-        self.assertEqual(saved["gates"]["1"]["declaration"], "host-denies-writes")
-        self.assertTrue(saved["gates"]["1"]["declare_host_deny"])
-
-    def test_turbo_gate_one_records_the_operator_probe(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            repo = make_repo(Path(tmp))
-            home = home_dir(Path(tmp))
-            configure_turbo(repo, home)
-            saved = config_json(home)
-        self.assertEqual(saved["gates"]["1"]["declaration"], "host-policy-operator-probed")
-        self.assertFalse(saved["gates"]["1"]["declare_host_deny"])
-
 
 class DigestTest(unittest.TestCase):
-    def test_doctor_still_passes_after_a_new_weekly_spend_declaration(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            repo = make_repo(Path(tmp))
-            home = home_dir(Path(tmp))
-            configure_turbo(repo, home)
-            self.assertEqual(prepare(repo, home, operations=5).returncode, 0)
-            spend_record(repo, home, 20.0)
-            result = cli(repo, home, "doctor")
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-
     def test_doctor_reports_drift_after_a_profile_change(self):
         with tempfile.TemporaryDirectory() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             configure_turbo(repo, home)
             self.assertEqual(prepare(repo, home, operations=5).returncode, 0)
+            spend_record(repo, home, 20.0)
+            passed = cli(repo, home, "doctor")
+            self.assertEqual(passed.returncode, 0, passed.stdout + passed.stderr)
             self.assertEqual(cli(repo, home, "configure", "--profile", "manual").returncode, 0)
             result = cli(repo, home, "doctor")
         self.assertEqual(result.returncode, 1)
@@ -141,17 +104,6 @@ class DigestTest(unittest.TestCase):
 
 
 class RunSnapshotTest(unittest.TestCase):
-    def test_prepare_snapshots_the_profile_and_attestation(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            repo = make_repo(Path(tmp))
-            home = home_dir(Path(tmp))
-            configure_turbo(repo, home)
-            self.assertEqual(prepare(repo, home, operations=5).returncode, 0)
-            state = run_state(home)
-        self.assertEqual(state["execution_profile"], "native-turbo")
-        self.assertEqual(state["profile_attestation"]["host"], "antigravity-native")
-        self.assertEqual(state["verified_by"], "manual")
-
     def test_old_run_fixture_defaults_to_manual(self):
         with tempfile.TemporaryDirectory() as tmp:
             repo = make_repo(Path(tmp))
@@ -192,6 +144,9 @@ class RunSnapshotTest(unittest.TestCase):
             self.assertEqual(prepare(repo, home, operations=5).returncode, 0)
             path = home / "runs" / "7.json"
             state = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(state["execution_profile"], "native-turbo")
+            self.assertEqual(state["profile_attestation"]["host"], "antigravity-native")
+            self.assertEqual(state["verified_by"], "manual")
             state["profile_attestation"] = None
             path.write_text(json.dumps(state), encoding="utf-8")
             result = cli(repo, home, "status", "--issue", "7")

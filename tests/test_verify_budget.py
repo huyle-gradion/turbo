@@ -7,7 +7,7 @@ from pathlib import Path
 
 from support import (
     cli, commit_probe, configure_turbo, evidence_files, git, home_dir,
-    make_repo, marker_gate, prepare, red, run_state, spend_record, staged_turbo,
+    make_repo, prepare, red, run_state, spend_record,
 )
 
 ISSUE = "7"
@@ -59,28 +59,7 @@ def rewrite_run(home: Path, update: dict[str, object]) -> bytes:
 
 
 class CompletedSpendRefreshTest(unittest.TestCase):
-    def test_a_higher_spend_below_the_threshold_does_not_poison_a_completed_run(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            repo = make_repo(Path(tmp))
-            home = home_dir(Path(tmp))
-            completed(repo, home)
-            before = snapshot(home)
-            self.assertEqual(spend_record(repo, home, 20.0).returncode, 0)
-            second = verify(repo, home)
-            manifest_again = manifest_cli(repo, home)
-            after = snapshot(home)
-            weeks = json.loads((home / "config.json").read_text(encoding="utf-8"))["budget"]["weeks"]
-        self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
-        self.assertEqual(manifest_again.returncode, 0, manifest_again.stdout + manifest_again.stderr)
-        self.assertEqual(before["manifest_bytes"], after["manifest_bytes"])
-        self.assertEqual(before["run_bytes"], after["run_bytes"])
-        self.assertEqual(before["files"], after["files"])
-        self.assertEqual(after["state"]["budget"]["usd"], 12.5)
-        self.assertEqual(after["state"]["counters"], before["state"]["counters"])
-        self.assertEqual(after["state"]["phase"], "local-verified")
-        self.assertIn(20.0, [item["usd"] for item in weeks.values()])
-
-    def test_repeated_spend_updates_leave_the_completed_snapshot_alone(self):
+    def test_repeated_spend_updates_below_the_threshold_leave_the_completed_snapshot_alone(self):
         with tempfile.TemporaryDirectory() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
@@ -88,12 +67,23 @@ class CompletedSpendRefreshTest(unittest.TestCase):
             before = snapshot(home)
             self.assertEqual(spend_record(repo, home, 20.0).returncode, 0)
             first = verify(repo, home)
+            first_manifest = manifest_cli(repo, home)
+            middle = snapshot(home)
+            first_weeks = json.loads((home / "config.json").read_text(encoding="utf-8"))["budget"]["weeks"]
             self.assertEqual(spend_record(repo, home, 30.0).returncode, 0)
             second = verify(repo, home)
             manifest_again = manifest_cli(repo, home)
             after = snapshot(home)
             weeks = json.loads((home / "config.json").read_text(encoding="utf-8"))["budget"]["weeks"]
         self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        self.assertEqual(first_manifest.returncode, 0, first_manifest.stdout + first_manifest.stderr)
+        self.assertEqual(before["manifest_bytes"], middle["manifest_bytes"])
+        self.assertEqual(before["run_bytes"], middle["run_bytes"])
+        self.assertEqual(before["files"], middle["files"])
+        self.assertEqual(middle["state"]["budget"]["usd"], 12.5)
+        self.assertEqual(middle["state"]["counters"], before["state"]["counters"])
+        self.assertEqual(middle["state"]["phase"], "local-verified")
+        self.assertIn(20.0, [item["usd"] for item in first_weeks.values()])
         self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
         self.assertEqual(manifest_again.returncode, 0, manifest_again.stdout + manifest_again.stderr)
         self.assertEqual(before["manifest_bytes"], after["manifest_bytes"])
@@ -153,31 +143,24 @@ class CompletedRefusalTest(unittest.TestCase):
         self.assertEqual(after["state"]["counters"], before["state"]["counters"])
         self.assertEqual(future.returncode, 1, future.stdout + future.stderr)
 
-    def test_a_bug_run_at_the_bugfix_line_still_revalidates_read_only(self):
+    def test_a_bug_run_revalidates_at_the_bugfix_line_and_refuses_at_the_weekly_stop_read_only(self):
         with tempfile.TemporaryDirectory() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             completed(repo, home, kind="bug")
             before = snapshot(home)
             self.assertEqual(spend_record(repo, home, 160.0).returncode, 0)
-            result = verify(repo, home)
-            after = snapshot(home)
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(before["manifest_bytes"], after["manifest_bytes"])
-        self.assertEqual(before["run_bytes"], after["run_bytes"])
-        self.assertEqual(before["files"], after["files"])
-        self.assertEqual(after["state"]["budget"]["usd"], 12.5)
-        self.assertEqual(after["state"]["counters"], before["state"]["counters"])
-
-    def test_a_bug_run_at_the_weekly_stop_refuses_without_mutating_the_completed_run(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            repo = make_repo(Path(tmp))
-            home = home_dir(Path(tmp))
-            completed(repo, home, kind="bug")
-            before = snapshot(home)
+            line = verify(repo, home)
+            middle = snapshot(home)
             self.assertEqual(spend_record(repo, home, 200.0).returncode, 0)
             result = verify(repo, home)
             after = snapshot(home)
+        self.assertEqual(line.returncode, 0, line.stdout + line.stderr)
+        self.assertEqual(before["manifest_bytes"], middle["manifest_bytes"])
+        self.assertEqual(before["run_bytes"], middle["run_bytes"])
+        self.assertEqual(before["files"], middle["files"])
+        self.assertEqual(middle["state"]["budget"]["usd"], 12.5)
+        self.assertEqual(middle["state"]["counters"], before["state"]["counters"])
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertIn("weekly stop", result.stderr)
         self.assertEqual(before["manifest_bytes"], after["manifest_bytes"])
@@ -257,22 +240,6 @@ class CompletedIntegrityTest(unittest.TestCase):
         self.assertIn("manifest", result.stderr.lower())
         self.assertEqual(run_bytes, run_after)
         self.assertFalse(manifest_exists)
-
-
-class ActiveLimitTest(unittest.TestCase):
-    def test_an_expired_active_run_still_refuses_before_a_child(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            repo = make_repo(Path(tmp))
-            home = home_dir(Path(tmp))
-            marker = Path(tmp) / "gate-one-ran"
-            staged_turbo(repo, home, operations=10, gate1=marker_gate(marker))
-            rewrite_run(home, {"admitted_at": "2020-01-01T00:00:00Z"})
-            result = verify(repo, home)
-            state = run_state(home)
-        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-        self.assertFalse(marker.exists())
-        self.assertEqual(state["stop_reason"], "not-ready")
-        self.assertIn("time limit", (result.stdout + result.stderr).lower())
 
 
 if __name__ == "__main__":

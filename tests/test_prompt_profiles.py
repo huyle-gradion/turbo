@@ -48,22 +48,16 @@ class NativeTurboPromptTest(unittest.TestCase):
         self.assertIn("never creates commits or branches", output)
         self.assertIn("never calls a model or network service", output)
 
-    def test_turbo_gates_prompt_keeps_the_native_wording_and_verify_bundle(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            repo = make_repo(Path(tmp))
-            home = home_dir(Path(tmp))
-            staged_turbo(repo, home, operations=5)
-            result = cli(repo, home, "prompt", "--issue", ISSUE)
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertNotIn(OLD_MANUAL_APPROVAL, result.stdout)
-        self.assertIn(NATIVE_HOST, result.stdout)
-        self.assertIn(f"factory verify --issue {ISSUE}", result.stdout)
-
     def test_turbo_local_verified_prompt_keeps_the_native_wording(self):
         with tempfile.TemporaryDirectory() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             staged_turbo(repo, home, operations=5)
+            gates = cli(repo, home, "prompt", "--issue", ISSUE)
+            self.assertEqual(gates.returncode, 0, gates.stdout + gates.stderr)
+            self.assertNotIn(OLD_MANUAL_APPROVAL, gates.stdout)
+            self.assertIn(NATIVE_HOST, gates.stdout)
+            self.assertIn(f"factory verify --issue {ISSUE}", gates.stdout)
             verified = cli(repo, home, "verify", "--issue", ISSUE)
             state = run_state(home)
             result = cli(repo, home, "prompt", "--issue", ISSUE)
