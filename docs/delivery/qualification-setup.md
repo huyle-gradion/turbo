@@ -34,6 +34,7 @@ This document defines the reproducible setup, identity capabilities, and evidenc
   - Credentials come **only** from the proxy-supplied launch environment: `TURBO_QUAL_INTEGRATOR_TOKEN` and `TURBO_QUAL_COMPETITOR_TOKEN`.
   - Never request, paste, print, persist, or repair token values.
   - Do not pass tokens on the command line or write them to files.
+- **Expected identities**: `TURBO_QUAL_EXPECTED_INTEGRATOR` and `TURBO_QUAL_EXPECTED_COMPETITOR` name the expected logins; the runner holds no logins, PR numbers or SHAs. Without both, the observed logins are used, preflight records `identity_expectations: "unconfigured"`, and an `identity-expectations-unconfigured` blocker keeps the run from qualifying.
 
 ## 3. Coordinated Competing-Actor Protocol
 
@@ -70,6 +71,7 @@ DEMO_KEEP_EVIDENCE_DIR="$(mktemp -d /tmp/turbo-qual-67.XXXXXX)" \
 - An index entry is `failed` when any of its scenarios failed, and `unavailable` when a scenario is missing, a scenario recorded no artifact or a missing/empty one, or a preflight or preparation blocker exists. Fully observed simulated entries read `passed-offline-simulated` offline and `passed-simulated` when hosted mode ran against a test origin. `qualified` stays false in every one of these cases.
 - Offline scenario results record `outcome: "verified"` when the integration produced the expected status (`expected_status`) and `"failed"` otherwise; the integration's own outcome is kept in `integration_outcome`.
 - Hosted scenarios 2 and 3 read `main` from the provider before and after the attempt; `main_preserved` is `null` when either read fails. Provider messages are recorded verbatim or as `null`.
+- Each hosted run (#98) creates its own candidate branches `feat/qual-<run_id>-sc1|sc2|sc3|sc3-advance` from the current `feature/demo` and its own PRs, and drives every merge attempt through `integrate_approved_child`: scenario 1 lands its candidate; scenario 2's candidate passes the factory gate without a provider approval, so protection denies it; in scenario 3 the competitor lands its advance through the factory inside `on_before_merge`, so the candidate is rejected; scenario 4 judges scenario 3's evidence stale against the new base, renews the head with `update-branch` (no force push, checked in the provider's ref activity), re-verifies, re-approves and lands it. The competitor's landing reads branch protection, which GitHub allows only with admin access. Every PR the run opened that is left unmerged is closed; the summary records `run_id` and `cleanup`.
 
 > **Current status (Slice 3)**: Seed assets, deterministic QA cases, factory contracts, workflow template, and genuine candidate preparation machinery are implemented under `examples/qualification/seed/` and `factory/qualification.py`. The disposable test repository (`turbo-factory/turbo-qual-67`) has NOT had the seed installed on `feature/demo` and its required check contexts remain empty (`contexts: []`). Hosted qualification preflight honestly reports `status: "blocked"` with `missing-seed` and `empty-required-check-contexts`. No hosted success is claimed until external reviewed installation and check configuration are performed.
 

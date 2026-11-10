@@ -62,14 +62,13 @@ CALC_SC3_TEST = (
     '    def test_divide(self):\n        self.assertEqual(divide(6, 2), 3)\n\n'
     'if __name__ == "__main__":\n    unittest.main()\n'
 )
-ADVANCE_MARKER_CONTENT = '{"scenario": "competing_base_rejection", "actor": "cone-orgs"}\n'
 
 REAL_SETUP_METADATA: dict[str, Any] = {
     "repo_slug": "turbo-factory/turbo-qual-67",
     "identities": {
-        "integrator": "huyhuyhuy8s",  # Admin on the org repo
-        "competitor": "cone-orgs",    # Write collaborator
-        "restricted_reader": "huyle-turbo",  # Read-only identity
+        "integrator": "admin; login from TURBO_QUAL_EXPECTED_INTEGRATOR",
+        "competitor": "write collaborator; login from TURBO_QUAL_EXPECTED_COMPETITOR",
+        "restricted_reader": "read-only identity",
     },
     "tokens": {
         "type": "classic_pat",
@@ -173,12 +172,13 @@ def observe_identity_and_permissions(
     base_url: str,
     repo_slug: str,
     token: str | None,
-    expected_login: str,
+    expected_login: str | None,
     expected_role: str,
     role_name: str,
     ledger: QualificationLedger | None = None,
 ) -> tuple[bool, dict[str, Any], list[str]]:
-    """Observe user identity and repository permissions via GitHub API object endpoints."""
+    """Observe user identity and repository permissions via GitHub API object endpoints; with no expected login the
+    observed one is accepted (the caller records that identities were unconfigured)."""
     if not token:
         rec = {"role": role_name, "status": "unavailable", "reason": "missing-credentials"}
         return False, rec, [f"missing-token: {role_name} token is missing"]
@@ -193,7 +193,7 @@ def observe_identity_and_permissions(
         return False, rec, [f"identity-read-failed: {role_name} identity check returned HTTP {code}: {err_msg}"]
 
     observed_login = user_data.get("login")
-    if observed_login != expected_login:
+    if expected_login is not None and observed_login != expected_login:
         rec = {"role": role_name, "status": "wrong-identity", "observed_login": observed_login, "expected_login": expected_login}
         return False, rec, [f"wrong-identity: {role_name} token belongs to {observed_login!r}, expected {expected_login!r}"]
 
@@ -692,6 +692,42 @@ def get_remote_pulls(
         return []
 
 
+def _get_list(url: str, token: str) -> list[dict[str, Any]] | None:
+    """GET a JSON list without following redirects (`_http_req` reads lists as {}); None when no list came back."""
+    from factory.intake import NoRedirectHandler
+    from urllib.request import Request, build_opener
+    req = Request(url, headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"})
+    try:
+        with build_opener(NoRedirectHandler).open(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode("utf-8", "replace"))
+    except Exception:
+        return None
+    return data if isinstance(data, list) else None
+
+
+def _api(
+    method: str, base_url: str, repo_slug: str, path: str, token: str, payload: dict[str, Any] | None = None,
+    ledger: QualificationLedger | None = None, actor: str = "integrator",
+) -> tuple[int, dict[str, Any], str]:
+    """One provider request on the repository, recorded in the ledger."""
+    url = f"{base_url.rstrip('/')}/repos/{repo_slug}/{path}"
+    code, data, msg = _http_req(method, url, token, base_url, [], time.monotonic() + 15.0, 15, payload=payload)
+    if ledger:
+        ledger.record(method, url, actor, code, msg)
+    return code, data, msg
+
+
+def _candidate_ctx(ctx: Any, branch: str, suffix: str = "") -> SimpleNamespace:
+    """The scenario context with this candidate's own child folder, so records of different candidates never mix."""
+    sub = ctx.home / "candidates" / (branch.removeprefix(CANDIDATE_BRANCH_PREFIX) + suffix)
+    return SimpleNamespace(**{**vars(ctx), "child_dir": safe_dir(sub, create=True)})
+
+
+def _calc_changes(branch: str) -> dict[str, str]:
+    """Candidate content unique to `branch`, so every run's candidate differs from the base it starts from."""
+    return {"src/calc.py": CALC_CANDIDATE_SRC + f"\n# qualification candidate {branch}\n", "tests/test_calc.py": CALC_CANDIDATE_TEST}
+
+
 def poll_ci_check(
     base_url: str,
     repo_slug: str,
@@ -952,15 +988,24 @@ def prepare_qualification_candidate(
     live_enabled: bool = True,
     required_contexts: tuple[str, ...] = ("build",),
     scenario_ctx: Any = None,
+    file_changes: dict[str, str] | None = None,
+    approve: bool = True,
+    expected_logins: dict[str, str] | None = None,
+    builder: str = "integrator",
 ) -> dict[str, Any]:
     """Prepare genuine qualification candidate, PR, and prerequisite evidence.
 
-    With `scenario_ctx` (#108), CI and QA come from the delivery chain's own entry points for the exact head.
+    With `scenario_ctx` (#108), CI and QA come from the delivery chain's own entry points for the exact head. The
+    `builder` role's token builds `head_branch` from `file_changes` (or reuses its open PR) and the other role approves;
+    `approve=False` stops before the operator-account approval.
     """
     evidence_dir = Path(evidence_dir)
     evidence_dir.mkdir(parents=True, exist_ok=True)
     tokens = [integrator_token or "", competitor_token or ""]
     local_ledger = ledger or QualificationLedger(evidence_dir / "operation-ledger.jsonl", tokens)
+    who: dict[str, dict[str, Any]] = {}  # observed identities by role
+    approver = "competitor" if builder == "integrator" else "integrator"
+    role_tok = {"integrator": integrator_token, "competitor": competitor_token}
 
     # 1. Preflight authorization and capabilities
     def _make_prep_record(st: str, out: str, blk: list[str], prereqs: dict[str, Any] | None = None, pr: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -976,7 +1021,7 @@ def prepare_qualification_candidate(
             "builder": {
                 "kind": "deterministic-qualification-process",
                 "process_name": "turbo-qualification-builder",
-                "actor": "cone-orgs",
+                "actor": (who.get(builder) or {}).get("login"),  # the builder role's token creates the candidate
                 "session_id": QUALIFICATION_BUILDER_SESSION,
                 "candidate_sha": pr.get("head_sha", candidate_sha) if pr else candidate_sha,
                 "base_sha": pr.get("base_sha", base_sha) if pr else base_sha,
@@ -1000,11 +1045,11 @@ def prepare_qualification_candidate(
 
     # Preflight identity & topology checks
     ok_int, obs_int, int_blockers = observe_identity_and_permissions(
-        base_url, repo_slug, integrator_token, expected_login="huyhuyhuy8s",
+        base_url, repo_slug, integrator_token, expected_login=(expected_logins or {}).get("integrator"),
         expected_role="admin", role_name="integrator", ledger=local_ledger,
     )
     ok_comp, obs_comp, comp_blockers = observe_identity_and_permissions(
-        base_url, repo_slug, competitor_token, expected_login="cone-orgs",
+        base_url, repo_slug, competitor_token, expected_login=(expected_logins or {}).get("competitor"),
         expected_role="write", role_name="competitor", ledger=local_ledger,
     )
     ok_prot, top_rec, prot_blockers = check_branch_protection_and_topology(
@@ -1014,6 +1059,7 @@ def prepare_qualification_candidate(
         base_url, repo_slug, target_branch, integrator_token, ledger=local_ledger,
     )
 
+    who.update(integrator=obs_int, competitor=obs_comp)
     preflight_blockers = int_blockers + comp_blockers + prot_blockers + seed_blockers
     if preflight_blockers:
         return _make_prep_record("blocked", "unavailable", preflight_blockers)
@@ -1036,10 +1082,10 @@ def prepare_qualification_candidate(
             pr_head_sha = pr_data.get("head", {}).get("sha", candidate_sha)
         else:
             c_sha, _ = create_qualification_candidate_commit(
-                base_url, repo_slug, base_sha, head_branch, integrator_token,
-                file_changes={"src/calc.py": CALC_CANDIDATE_SRC, "tests/test_calc.py": CALC_CANDIDATE_TEST},
+                base_url, repo_slug, base_sha, head_branch, role_tok[builder],
+                file_changes=file_changes or {"src/calc.py": CALC_CANDIDATE_SRC, "tests/test_calc.py": CALC_CANDIDATE_TEST},
                 message=f"feat: qualification candidate on {head_branch} (#67)",
-                actor="integrator", ledger=local_ledger,
+                actor=builder, ledger=local_ledger,
             )
             pr_head_sha = c_sha or "unavailable"
             if not c_sha:
@@ -1059,7 +1105,7 @@ def prepare_qualification_candidate(
             base_url, repo_slug, head_branch, target_branch,
             title="feat: qualification candidate arithmetic (#67)",
             body="Genuine qualification candidate PR for issue #67. Refs #67, Refs #24.",
-            token=integrator_token, actor="integrator", ledger=local_ledger,
+            token=role_tok[builder], actor=builder, ledger=local_ledger,
         )
         if code_pr not in (200, 201):
             prep_blockers.append(f"pr-creation-failed: candidate PR creation returned HTTP {code_pr}: {pr_msg}")
@@ -1131,11 +1177,11 @@ def prepare_qualification_candidate(
     # 6. Operator-account approval (not an independent review): submitted only after every prerequisite for this head passed.
     gh_rev_rec: dict[str, Any] = {}
     prereqs_passed = ok_ci and ok_qa and sec_rec["status"] == ir_rec["status"] == "verified" and not prep_blockers
-    if pr_num and prereqs_passed:
+    if pr_num and prereqs_passed and approve:
         code_rev, rev_sub_data, rev_msg = submit_qualification_pr_review(
             base_url, repo_slug, pr_num, pr_head_sha, event="APPROVE",
             body=f"Operator-account approval: CI, QA, security and independent review passed for {pr_head_sha}.",
-            token=competitor_token, actor="competitor", ledger=local_ledger,
+            token=role_tok[approver], actor=approver, ledger=local_ledger,
         )
         if code_rev not in (200, 201):
             prep_blockers.append(f"review-submission-failed: PR review submission returned HTTP {code_rev}: {rev_msg}")
@@ -1143,13 +1189,14 @@ def prepare_qualification_candidate(
         else:
             rid = rev_sub_data.get("id", 0)
             ok_vrev, gh_rev_rec, vrev_blockers = verify_qualification_pr_review(
-                base_url, repo_slug, pr_num, rid, pr_head_sha, expected_reviewer="cone-orgs",
+                base_url, repo_slug, pr_num, rid, pr_head_sha, expected_reviewer=who[approver].get("login"),
                 token=integrator_token, ledger=local_ledger,
             )
             gh_rev_rec = {**gh_rev_rec, "kind": "operator-account-approval", "independent_review": False}
             prep_blockers.extend(vrev_blockers)
     else:
-        gh_rev_rec = {"status": "not-requested", "reason": "prerequisites-not-passed" if pr_num else "no-pr", "head_sha": pr_head_sha}
+        reason = "approval-not-requested" if prereqs_passed and approve is False else "prerequisites-not-passed"
+        gh_rev_rec = {"status": "not-requested", "reason": reason if pr_num else "no-pr", "head_sha": pr_head_sha}
 
     all_prep_blockers = preflight_blockers + prep_blockers
     pr_summary = {"number": pr_num, "head_sha": pr_head_sha, "base_sha": pr_base_sha} if pr_data else None
@@ -1368,27 +1415,18 @@ def run_scenario_1_confirmed_landing(
     allow_test_origin: bool = False, cand_branch: str = "feat/qual-candidate-101",
     prep_record: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Scenario 1: Confirmed landing with opposite-account review and authoritative verification."""
+    """Scenario 1: the PR preparation created in this run lands through the factory boundary, then is verified."""
     sdir = safe_dir(evidence_dir / "scenarios" / "confirmed_landing", create=True)
     tokens = [integrator_token, competitor_token]
     sc_ledger = ledger or QualificationLedger(sdir / "operation-ledger.jsonl", tokens)
     code, base_c, _ = get_remote_commit(base_url, repo_slug, base_branch, integrator_token, ledger=sc_ledger)
-    base_sha = base_c.get("sha", ctx.base_sha) if code == 200 else ctx.base_sha
     main_sha_before = gitio.remote_ref(ctx.repo, "main") or gitio.commit_sha(ctx.repo, "refs/heads/main")
     sc1_child = ctx.child_dir  # the folder where preparation stored this head's CI, QA and reviewer records (#104)
-    pr_num, cand_sha = 1, ctx.cand_sha
+    pr = (prep_record or {}).get("pr") or {}  # the PR, head and base preparation created and verified in this run
+    pr_num, cand_sha = int(pr.get("number") or 0), pr.get("head_sha") or ctx.cand_sha
+    base_sha = pr.get("base_sha") or (base_c.get("sha", ctx.base_sha) if code == 200 else ctx.base_sha)
+    cand_branch = (prep_record or {}).get("head_branch") or cand_branch
     if not allow_test_origin:
-        code_pr, pr_live, _ = _http_req("GET", f"{base_url.rstrip('/')}/repos/{repo_slug}/pulls/5", integrator_token, base_url, [], time.monotonic() + 15.0, 15)
-        if code_pr == 200 and pr_live.get("state") == "closed" and pr_live.get("merged") is True:
-            pr_num = 5
-            cand_sha = pr_live.get("head", {}).get("sha", "30cbaf71300424c241d0ead5e2f890dabda8091a")
-            base_sha = pr_live.get("base", {}).get("sha", "eb4b4a8f952843cd8941461357e4509aed842093")
-            cand_branch = pr_live.get("head", {}).get("ref", cand_branch)
-        atomic_json(sc1_child / "integration-request.json", {
-            "role": "child-integration-request", "repo_slug": repo_slug, "pr_number": pr_num,
-            "base_branch": base_branch, "head_branch": cand_branch,
-            "candidate_sha": cand_sha, "base_sha": base_sha,
-        }, ctx.home)
         fetch_remote_repo(ctx.repo, repo_slug, integrator_token)
     pre = (prep_record or {}).get("prerequisites") or {}
     ci, rev = pre.get("ci") or {}, pre.get("github_review") or {}  # credited only for the SHA this scenario lands
@@ -1431,14 +1469,27 @@ def run_scenario_2_prereq_missing_and_denied(
     base_url: str, repo_slug: str, evidence_dir: Path, ctx: Any,
     integrator_token: str, competitor_token: str, *,
     base_branch: str = "feature/demo", ledger: QualificationLedger | None = None,
-    allow_test_origin: bool = False,
+    allow_test_origin: bool = False, run_id: str = "", opened: list[int] | None = None,
 ) -> dict[str, Any]:
-    """Scenario 2: Missing/stale prereqs, protection denial (405), and permissions denial (403)."""
+    """Scenario 2: Missing/stale prereqs, protection denial (405), and permissions denial (403).
+
+    Hosted, the run builds its own candidate whose factory prerequisites pass but which has no provider approval, so
+    the factory attempts the merge and the provider's protection is what denies it."""
     sdir = safe_dir(evidence_dir / "scenarios" / "prereq_missing_and_denied", create=True)
     tokens = [integrator_token, competitor_token]
     sc_ledger = ledger or QualificationLedger(sdir / "operation-ledger.jsonl", tokens)
     main_sha_before = _read_remote_main(base_url, repo_slug, integrator_token, sc_ledger)
     cand_sha, base_sha = ctx.cand_sha, ctx.base_sha
+    unapp_branch, unapp_pr_num = f"{CANDIDATE_BRANCH_PREFIX}{run_id}-sc2", 0
+    if not allow_test_origin:
+        c2 = _candidate_ctx(ctx, unapp_branch)
+        prep2 = prepare_qualification_candidate(
+            base_url, repo_slug, sdir, target_branch=base_branch, head_branch=unapp_branch, integrator_token=integrator_token,
+            competitor_token=competitor_token, ledger=sc_ledger, file_changes=_calc_changes(unapp_branch), approve=False,
+            scenario_ctx=c2)
+        pr2 = prep2.get("pr") or {}
+        unapp_pr_num, cand_sha, base_sha = int(pr2.get("number") or 0), pr2.get("head_sha") or cand_sha, pr2.get("base_sha") or base_sha
+        if opened is not None and unapp_pr_num: opened.append(unapp_pr_num)
     fake_child_dir = safe_dir(ctx.home / "missing-child", create=True)
     gate_missing = deliver_module.enforce_delivery_approval(
         candidate_sha=cand_sha, base_sha=base_sha, repo=ctx.repo, home=ctx.home,
@@ -1451,24 +1502,18 @@ def run_scenario_2_prereq_missing_and_denied(
         child_dir=ctx.child_dir, child=ctx.child_contract, conf=ctx.conf,
     )
     stale_prereq_ok = (gate_stale.get("delivery_approved") is False)
-    unapp_branch = "feat/qual-unapp-sc2-r2"
-    unapp_cand_sha, unapp_pr_num = cand_sha, 2
+    unapp_cand_sha = cand_sha
     protection_denial_observed, permission_denial_observed, pr_still_open = True, True, True
     prot_res: dict[str, Any] = {"status": "denied-protection", "blockers": []}
     perm_res = {"status": "denied-permissions", "blockers": []}
     if not allow_test_origin:
-        code_pr2, pr_unapp, _ = _http_req("GET", f"{base_url.rstrip('/')}/repos/{repo_slug}/pulls/6", integrator_token, base_url, [], time.monotonic() + 15.0, 15)
-        if code_pr2 == 200:
-            unapp_pr_num = 6
-            unapp_branch = pr_unapp.get("head", {}).get("ref", unapp_branch)
-            unapp_cand_sha = pr_unapp.get("head", {}).get("sha", unapp_cand_sha)
-            base_sha = pr_unapp.get("base", {}).get("sha", base_sha)
         fetch_remote_repo(ctx.repo, repo_slug, integrator_token)
         unapp_res = integrate_approved_child(
-            repo=ctx.repo, home=ctx.home, child_dir=safe_dir(ctx.home / "attempt-sc2-unapproved", create=True),
+            repo=ctx.repo, home=ctx.home, child_dir=c2.child_dir,
             child={**ctx.child_contract, "head_branch": unapp_branch}, conf=ctx.conf, pr_number=unapp_pr_num,
             candidate_sha=unapp_cand_sha, base_sha=base_sha, head_branch=unapp_branch, base_branch=base_branch,
-            approval_record=gate_missing, repo_slug=repo_slug, base_url=base_url, token=integrator_token,
+            approval_record=_delivery_gate(c2, unapp_cand_sha, base_sha, c2.child_dir, unapp_branch),
+            repo_slug=repo_slug, base_url=base_url, token=integrator_token,
         )
         code_chk, pr_chk_data, _ = _http_req("GET", f"{base_url.rstrip('/')}/repos/{repo_slug}/pulls/{unapp_pr_num}", integrator_token, base_url, [], time.monotonic() + 15.0, 15)
         pr_still_open = (pr_chk_data.get("state") == "open" and pr_chk_data.get("merged") is not True) if code_chk == 200 else None
@@ -1502,81 +1547,73 @@ def run_scenario_3_competing_base_rejection(
     base_url: str, repo_slug: str, evidence_dir: Path, ctx: Any,
     integrator_token: str, competitor_token: str, *,
     base_branch: str = "feature/demo", ledger: QualificationLedger | None = None,
-    allow_test_origin: bool = False,
+    allow_test_origin: bool = False, run_id: str = "", opened: list[int] | None = None,
 ) -> tuple[dict[str, Any], str, str, int]:
-    """Scenario 3: Controlled competing-base update inside on_before_merge forces boundary rejection."""
+    """Scenario 3: a verified candidate of this run meets a competitor advance that the competitor merges inside the
+    factory's pre-merge boundary (on_before_merge); integrate_approved_child must reject it and leave it unmerged."""
     sdir = safe_dir(evidence_dir / "scenarios" / "competing_base_rejection", create=True)
     tokens = [integrator_token, competitor_token]
     sc_ledger = ledger or QualificationLedger(sdir / "operation-ledger.jsonl", tokens)
-    code, base_c, _ = get_remote_commit(base_url, repo_slug, base_branch, integrator_token, ledger=sc_ledger)
-    base_sha_b = base_c.get("sha", ctx.base_sha) if code == 200 else ctx.base_sha
     main_sha_before = _read_remote_main(base_url, repo_slug, integrator_token, sc_ledger)
-    cand_branch = "feat/qual-cand-sc3-r3"
-    cand_sha, cand_pr_num, adv_pr_num = ctx.cand_sha, 3, 4
-    new_base_b_prime = base_sha_b
-    adv_merge_obs: dict[str, Any] = {}
-    rejection_observed, cand_unmerged = False, True
-    cand_merge_status, cand_blockers, denial_source = "rejected-competing-base", [], None
-    sc3_child = safe_dir(ctx.home / "attempt-sc3", create=True)
+    cand_branch, adv_branch = f"{CANDIDATE_BRANCH_PREFIX}{run_id}-sc3", f"{CANDIDATE_BRANCH_PREFIX}{run_id}-sc3-advance"
+    c3 = _candidate_ctx(ctx, cand_branch)
+    prep = prepare_qualification_candidate(
+        base_url, repo_slug, sdir, target_branch=base_branch, head_branch=cand_branch, integrator_token=integrator_token,
+        competitor_token=competitor_token, ledger=sc_ledger, file_changes=_calc_changes(cand_branch), scenario_ctx=c3)
+    pr = prep.get("pr") or {}
+    cand_pr_num, cand_sha, base_sha_b = int(pr.get("number") or 0), str(pr.get("head_sha") or ""), str(pr.get("base_sha") or "")
+    # The competitor's advance: its own verified candidate from the same base (touching only the tests file, so the
+    # renewal merges cleanly), approved by the integrator, and landed by the competitor through the factory.
+    adv_ctx = _candidate_ctx(ctx, adv_branch)
+    adv = prepare_qualification_candidate(
+        base_url, repo_slug, sdir / "advance", target_branch=base_branch, head_branch=adv_branch, base_sha=base_sha_b,
+        integrator_token=integrator_token, competitor_token=competitor_token, ledger=sc_ledger, scenario_ctx=adv_ctx,
+        file_changes={"tests/test_calc.py": CALC_CANDIDATE_TEST + f"\n# competing base advance {adv_branch}\n"},
+        builder="competitor")
+    adv_pr = adv.get("pr") or {}
+    adv_pr_num, adv_sha = int(adv_pr.get("number") or 0), str(adv_pr.get("head_sha") or "")
+    if opened is not None: opened.extend(n for n in (cand_pr_num, adv_pr_num) if n)
+    adv_merge: dict[str, Any] = {"attempted": False}
 
-    if not allow_test_origin:
-        cand_pr_num, adv_pr_num = 9, 10
-        fetch_remote_repo(ctx.repo, repo_slug, integrator_token)
-        code_p9, p9_data, _ = _http_req("GET", f"{base_url.rstrip('/')}/repos/{repo_slug}/pulls/9", integrator_token, base_url, [], time.monotonic() + 15.0, 15)
-        if code_p9 == 200:
-            cand_branch = p9_data.get("head", {}).get("ref", cand_branch)
-            cand_sha = p9_data.get("head", {}).get("sha", cand_sha)
-            base_sha_b = p9_data.get("base", {}).get("sha", base_sha_b)
-        code_p10, p10_data, _ = _http_req("GET", f"{base_url.rstrip('/')}/repos/{repo_slug}/pulls/10", integrator_token, base_url, [], time.monotonic() + 15.0, 15)
-        if code_p10 == 200 and p10_data.get("state") == "closed" and p10_data.get("merged") is True:
-            new_base_b_prime = p10_data.get("merge_commit_sha") or base_sha_b
-            adv_merge_obs = {"code": 200, "merged": True, "sha": new_base_b_prime}
-        gate_cand = _delivery_gate(ctx, cand_sha, base_sha_b, sc3_child, cand_branch)
-        res_cand = integrate_approved_child(
-            repo=ctx.repo, home=ctx.home, child_dir=sc3_child, child={**ctx.child_contract, "head_branch": cand_branch},
-            conf=ctx.conf, pr_number=cand_pr_num, candidate_sha=cand_sha, base_sha=base_sha_b,
-            head_branch=cand_branch, base_branch=base_branch, approval_record=gate_cand,
-            repo_slug=repo_slug, base_url=base_url, token=integrator_token,
+    def _advance() -> None:  # the competitor's own landing, made at the factory's pre-merge boundary
+        adv_res = integrate_approved_child(
+            repo=ctx.repo, home=ctx.home, child_dir=adv_ctx.child_dir, child={**ctx.child_contract, "head_branch": adv_branch},
+            conf=ctx.conf, pr_number=adv_pr_num, candidate_sha=adv_sha, base_sha=base_sha_b, head_branch=adv_branch,
+            base_branch=base_branch, approval_record=_delivery_gate(adv_ctx, adv_sha, base_sha_b, adv_ctx.child_dir, adv_branch),
+            repo_slug=repo_slug, base_url=base_url, token=competitor_token,
         )
-        rejection_observed = (res_cand.status in ("rejected-competing-base", "stale-base-revision"))
-        cand_merge_status, cand_blockers, denial_source = res_cand.status, res_cand.blockers, _denial_source(res_cand)
-        code_cchk, pr_c_data, _ = _http_req("GET", f"{base_url.rstrip('/')}/repos/{repo_slug}/pulls/{cand_pr_num}", integrator_token, base_url, [], time.monotonic() + 15.0, 15)
-        cand_unmerged = (pr_c_data.get("state") == "open" and pr_c_data.get("merged") is not True) if code_cchk == 200 else None
-    else:
-        gate_cand = _delivery_gate(ctx, cand_sha, base_sha_b, sc3_child, cand_branch)
-        child_c3 = {**ctx.child_contract, "head_branch": cand_branch}
-        gitio.git(ctx.bare, "update-ref", f"refs/heads/{cand_branch}", cand_sha)
-        def _adv_offline():
-            nonlocal new_base_b_prime
-            new_base_b_prime = gitio.git(ctx.bare, "-c", "user.name=CI", "-c", "user.email=ci@test", "commit-tree", f"{base_sha_b}^{{tree}}", "-p", base_sha_b, "-m", "Competitor advance").output
-            gitio.git(ctx.bare, "update-ref", f"refs/heads/{base_branch}", new_base_b_prime, base_sha_b)
-        res_cand = integrate_approved_child(
-            repo=ctx.repo, home=ctx.home, child_dir=sc3_child, child=child_c3,
-            conf=ctx.conf, pr_number=cand_pr_num, candidate_sha=cand_sha, base_sha=base_sha_b,
-            head_branch=cand_branch, base_branch=base_branch, approval_record=gate_cand,
-            repo_slug=repo_slug, base_url=base_url, token=integrator_token,
-            on_before_merge=_adv_offline,
-        )
-        rejection_observed = (res_cand.status in ("rejected-competing-base", "rejected"))
-        cand_merge_status, cand_blockers, denial_source = res_cand.status, res_cand.blockers, _denial_source(res_cand)
+        adv_merge.update(attempted=True, status=adv_res.status, merged=adv_res.status == "confirmed", sha=adv_res.landed_sha,
+                         blockers=adv_res.blockers)
 
+    fetch_remote_repo(ctx.repo, repo_slug, integrator_token)
+    res_cand = integrate_approved_child(
+        repo=ctx.repo, home=ctx.home, child_dir=c3.child_dir, child={**ctx.child_contract, "head_branch": cand_branch},
+        conf=ctx.conf, pr_number=cand_pr_num, candidate_sha=cand_sha, base_sha=base_sha_b, head_branch=cand_branch,
+        base_branch=base_branch, approval_record=_delivery_gate(c3, cand_sha, base_sha_b, c3.child_dir, cand_branch),
+        repo_slug=repo_slug, base_url=base_url, token=integrator_token, on_before_merge=_advance,
+    )
+    new_base_b_prime = adv_merge.get("sha") if adv_merge.get("merged") else None
+    code_c, pr_c, _ = _api("GET", base_url, repo_slug, f"pulls/{cand_pr_num}", integrator_token, ledger=sc_ledger)
+    cand_unmerged = (pr_c.get("state") == "open" and pr_c.get("merged") is not True) if code_c == 200 else None
+    rejection_observed = res_cand.status in ("rejected-competing-base", "stale-base-revision") and bool(new_base_b_prime)
     main_sha_after = _read_remote_main(base_url, repo_slug, integrator_token, sc_ledger)
     main_preserved = _main_preserved(main_sha_before, main_sha_after)
     passed = (rejection_observed and cand_unmerged is True and main_preserved is True)
     sc_data = {
         "name": "competing_base_rejection", "scenario": "competing_base_rejection",
-        "status": cand_merge_status, "outcome": "verified" if passed else "failed",
+        "status": res_cand.status, "outcome": "verified" if passed else "failed",
         "initial_base_sha": base_sha_b, "advanced_base_sha": new_base_b_prime,
-        "candidate_sha": cand_sha, "candidate_pr_number": cand_pr_num,
-        "advance_pr_number": adv_pr_num, "advance_merge": adv_merge_obs,
-        "candidate_merge_status": cand_merge_status, "candidate_merge_blockers": cand_blockers, "denial_source": denial_source,
-        "candidate_unmerged": cand_unmerged, "main_preserved": main_preserved,
+        "candidate_sha": cand_sha, "candidate_pr_number": cand_pr_num, "head_branch": cand_branch,
+        "candidate_prepared": prep.get("status") == "prepared",
+        "advance_pr_number": adv_pr_num, "advance_prepared": adv.get("status") == "prepared",
+        "advance_merge": adv_merge, "candidate_merge_status": res_cand.status, "candidate_merge_blockers": res_cand.blockers,
+        "denial_source": _denial_source(res_cand), "candidate_unmerged": cand_unmerged, "main_preserved": main_preserved,
         "main_sha_before": main_sha_before, "main_sha_after": main_sha_after,
         "simulated": allow_test_origin, "artifacts": [str(sdir / "scenario-result.json")],
         "recorded_at": approval_mod.now(),
     }
     atomic_json(sdir / "scenario-result.json", redact_qualification_tokens(sc_data, tokens), evidence_dir)
-    return sc_data, cand_branch, new_base_b_prime, cand_pr_num
+    return sc_data, cand_branch, new_base_b_prime or "", cand_pr_num
 
 
 def run_scenario_4_renewed_verification_after_base_change(
@@ -1586,59 +1623,63 @@ def run_scenario_4_renewed_verification_after_base_change(
     base_branch: str = "feature/demo", ledger: QualificationLedger | None = None,
     allow_test_origin: bool = False,
 ) -> dict[str, Any]:
-    """Scenario 4: Old evidence rejected, merge base without force push, renewed verification and landing."""
+    """Scenario 4: scenario 3's evidence is rejected as stale against B'; the provider merges B' into the head (no force
+    push, read from the provider's ref history); the renewed head is verified, approved and landed on B'."""
     sdir = safe_dir(evidence_dir / "scenarios" / "renewed_verification_after_base_change", create=True)
     tokens = [integrator_token, competitor_token]
     sc_ledger = ledger or QualificationLedger(sdir / "operation-ledger.jsonl", tokens)
     main_sha_before = gitio.remote_ref(ctx.repo, "main") or gitio.commit_sha(ctx.repo, "refs/heads/main")
-    sc4_old_child = safe_dir(ctx.home / "attempt-sc4-old", create=True)
-    stale_gate = deliver_module.enforce_delivery_approval(
-        candidate_sha=ctx.cand_sha, base_sha=base_sha_b_prime, repo=ctx.repo, home=ctx.home,
-        child_dir=sc4_old_child, child=ctx.child_contract, conf=ctx.conf,
+    _, pr_old, _ = _api("GET", base_url, repo_slug, f"pulls/{cand_pr_num}", integrator_token, ledger=sc_ledger)
+    old_sha = str((pr_old.get("head") or {}).get("sha") or "")
+    stale_gate = deliver_module.enforce_delivery_approval(  # scenario 3's records for the old head, judged against B'
+        candidate_sha=old_sha, base_sha=base_sha_b_prime, repo=ctx.repo, home=ctx.home,
+        child_dir=_candidate_ctx(ctx, cand_branch).child_dir, child={**ctx.child_contract, "head_branch": cand_branch}, conf=ctx.conf,
     )
-    old_evidence_rejected = (stale_gate.get("delivery_approved") is False)
-    cand_sha_c_prime = ctx.cand_sha
-    renewed_child_dir = safe_dir(ctx.home / "renewed-child-101", create=True)
-    if not allow_test_origin:
-        code_pr, pr11_data, _ = _http_req("GET", f"{base_url.rstrip('/')}/repos/{repo_slug}/pulls/11", integrator_token, base_url, [], time.monotonic() + 15.0, 15)
-        if code_pr == 200 and pr11_data.get("state") == "closed" and pr11_data.get("merged") is True:
-            cand_pr_num = 11
-            cand_sha_c_prime = pr11_data.get("head", {}).get("sha", "1242fb727d7b41d95ed9b40a69473a861e73a436")
-            base_sha_b_prime = pr11_data.get("base", {}).get("sha", "c65cd04a15315017a34bfc2ce0f0af5c73c456db")
-            cand_branch = pr11_data.get("head", {}).get("ref", cand_branch)
-        atomic_json(renewed_child_dir / "integration-request.json", {
-            "role": "child-integration-request", "repo_slug": repo_slug, "pr_number": cand_pr_num,
-            "base_branch": base_branch, "head_branch": cand_branch,
-            "candidate_sha": cand_sha_c_prime, "base_sha": base_sha_b_prime,
-        }, ctx.home)
+    old_evidence_status = stale_gate.get("status")
+    old_evidence_rejected = stale_gate.get("delivery_approved") is False and str(old_evidence_status).startswith("stale-")
+    u_code, _, u_msg = _api("PUT", base_url, repo_slug, f"pulls/{cand_pr_num}/update-branch", integrator_token,
+                            {"expected_head_sha": old_sha}, sc_ledger)
+    new_sha, deadline = old_sha, time.monotonic() + 120.0
+    while u_code in (200, 202) and new_sha == old_sha and time.monotonic() < deadline:  # the update is asynchronous
+        _, pr_now, _ = _api("GET", base_url, repo_slug, f"pulls/{cand_pr_num}", integrator_token)
+        new_sha = str((pr_now.get("head") or {}).get("sha") or old_sha)
+        time.sleep(0 if new_sha != old_sha else 2.0)
+    ref = quote(f"refs/heads/{cand_branch}", safe="")
+    forced = _get_list(f"{base_url.rstrip('/')}/repos/{repo_slug}/activity?ref={ref}&activity_type=force_push", integrator_token)
+    no_force_push = (not forced) if forced is not None else None  # None: the provider's ref history was not readable
+    int_res, landed_sha, renewed_sha, renewed_base = None, None, None, None
+    land_ok, land_details, blockers = False, {}, [] if u_code in (200, 202) else [f"update-branch HTTP {u_code}: {u_msg}"]
+    if new_sha != old_sha and no_force_push is True:
+        c4 = _candidate_ctx(ctx, cand_branch, "-renewed")
+        prep = prepare_qualification_candidate(
+            base_url, repo_slug, sdir, target_branch=base_branch, head_branch=cand_branch, base_sha=base_sha_b_prime,
+            integrator_token=integrator_token, competitor_token=competitor_token, ledger=sc_ledger, scenario_ctx=c4)
+        pr = prep.get("pr") or {}
+        renewed_sha, renewed_base = pr.get("head_sha"), pr.get("base_sha")
         fetch_remote_repo(ctx.repo, repo_slug, integrator_token)
-    else:
-        cand_sha_c_prime = gitio.git(ctx.bare, "-c", "user.name=CI", "-c", "user.email=ci@test", "commit-tree", f"{cand_sha_c_prime}^{{tree}}", "-p", cand_sha_c_prime, "-p", base_sha_b_prime, "-m", "Merge base").output
-        gitio.git(ctx.bare, "update-ref", f"refs/heads/{cand_branch}", cand_sha_c_prime)
-    gate_renewed = _delivery_gate(ctx, cand_sha_c_prime, base_sha_b_prime, renewed_child_dir, cand_branch)
-    child_c4 = {**ctx.child_contract, "head_branch": cand_branch}
-    int_res = integrate_approved_child(
-        repo=ctx.repo, home=ctx.home, child_dir=renewed_child_dir, child=child_c4,
-        conf=ctx.conf, pr_number=cand_pr_num, candidate_sha=cand_sha_c_prime, base_sha=base_sha_b_prime,
-        head_branch=cand_branch, base_branch=base_branch, approval_record=gate_renewed,
-        repo_slug=repo_slug, base_url=base_url, token=integrator_token,
-    )
-    landed_sha = int_res.landed_sha
-    land_ok, land_details, land_blks = (True, {}, []) if allow_test_origin else assert_landed_landing_properties(
-        ctx.repo, landed_sha or "", base_sha_b_prime, cand_sha_c_prime, int_res.tested_sha, base_branch, main_sha_before,
-        token=integrator_token, repo_slug=repo_slug,
-    )
-    passed = (int_res.status == "confirmed" and bool(landed_sha) and land_ok and old_evidence_rejected)
+        int_res = integrate_approved_child(
+            repo=ctx.repo, home=ctx.home, child_dir=c4.child_dir, child={**ctx.child_contract, "head_branch": cand_branch},
+            conf=ctx.conf, pr_number=cand_pr_num, candidate_sha=renewed_sha, base_sha=renewed_base, head_branch=cand_branch,
+            base_branch=base_branch, approval_record=_delivery_gate(c4, renewed_sha, renewed_base, c4.child_dir, cand_branch),
+            repo_slug=repo_slug, base_url=base_url, token=integrator_token,
+        )
+        landed_sha = int_res.landed_sha
+        land_ok, land_details, land_blks = assert_landed_landing_properties(
+            ctx.repo, landed_sha or "", renewed_base, renewed_sha, int_res.tested_sha, base_branch, main_sha_before,
+            token=integrator_token, repo_slug=repo_slug,
+        )
+        blockers += prep.get("blockers", []) + int_res.blockers + land_blks
+    passed = (int_res is not None and int_res.status == "confirmed" and bool(landed_sha) and land_ok and old_evidence_rejected
+              and renewed_base == base_sha_b_prime)
     sc_data = {
         "name": "renewed_verification_after_base_change",
         "scenario": "renewed_verification_after_base_change",
-        "status": int_res.status, "outcome": "verified" if passed else "failed",
-        "old_evidence_rejected": old_evidence_rejected,
-        "head_merged_without_force_push": True,
-        "renewed_candidate_sha": cand_sha_c_prime, "renewed_base_sha": base_sha_b_prime,
-        "landed_sha": landed_sha, "pr_number": cand_pr_num,
-        "landing_properties": land_details,
-        "blockers": int_res.blockers + land_blks,
+        "status": int_res.status if int_res else "not-renewed", "outcome": "verified" if passed else "failed",
+        "old_evidence_rejected": old_evidence_rejected, "old_evidence_status": old_evidence_status,
+        "old_candidate_sha": old_sha, "head_merged_without_force_push": no_force_push,
+        "renewed_candidate_sha": renewed_sha or (new_sha if new_sha != old_sha else None), "renewed_base_sha": renewed_base,
+        "landed_sha": landed_sha, "pr_number": cand_pr_num, "head_branch": cand_branch,
+        "landing_properties": land_details, "blockers": blockers,
         "simulated": allow_test_origin, "artifacts": [str(sdir / "scenario-result.json")],
         "recorded_at": approval_mod.now(),
     }
@@ -1752,8 +1793,13 @@ def run_hosted_qualification(
     base_url: str = HOSTED_API_ORIGIN,
     branch: str = "feature/demo",
     allow_test_origin: bool = False,
+    expected_logins: dict[str, str] | None = None,
 ) -> dict[str, Any]:
-    """Execute hosted qualification or retain explicit blocked/unavailable status without mutation."""
+    """Execute hosted qualification or retain explicit blocked/unavailable status without mutation.
+
+    `expected_logins` ({"integrator", "competitor"}) is configuration; without it the observed logins are accepted,
+    recorded as unconfigured, and the run is blocked from qualifying. Each run builds its own uniquely named candidate
+    branches and PRs under CANDIDATE_BRANCH_PREFIX and closes every PR it opened that is left unmerged."""
     evidence_dir = Path(evidence_dir)
     evidence_dir.mkdir(parents=True, exist_ok=True)
     f_rev = _factory_rev()
@@ -1796,11 +1842,11 @@ def run_hosted_qualification(
 
     # 1. Identity & permissions observations
     ok_int, obs_int, int_blockers = observe_identity_and_permissions(
-        base_url, repo_slug, integrator_token, expected_login="huyhuyhuy8s",
+        base_url, repo_slug, integrator_token, expected_login=(expected_logins or {}).get("integrator"),
         expected_role="admin", role_name="integrator", ledger=ledger,
     )
     ok_comp, obs_comp, comp_blockers = observe_identity_and_permissions(
-        base_url, repo_slug, competitor_token, expected_login="cone-orgs",
+        base_url, repo_slug, competitor_token, expected_login=(expected_logins or {}).get("competitor"),
         expected_role="write", role_name="competitor", ledger=ledger,
     )
 
@@ -1815,13 +1861,18 @@ def run_hosted_qualification(
     )
 
     all_preflight_blockers = int_blockers + comp_blockers + prot_blockers + seed_blockers
+    configured = bool((expected_logins or {}).get("integrator") and (expected_logins or {}).get("competitor"))
+    id_blockers = [] if configured else [
+        "identity-expectations-unconfigured: TURBO_QUAL_EXPECTED_INTEGRATOR and TURBO_QUAL_EXPECTED_COMPETITOR are not "
+        "both set; the observed logins were used and the run cannot qualify"]
     preflight_record = {
         "schema": 1, "role": "hosted-preflight-observations", "repo_slug": repo_slug,
         "base_url": base_url, "target_branch": branch,
         "identities": {"integrator": obs_int, "competitor": obs_comp},
+        "identity_expectations": "configured" if configured else "unconfigured",
         "topology": top_rec, "seed_capabilities": seed_rec,
-        "blockers": all_preflight_blockers,
-        "status": "verified" if not all_preflight_blockers else "blocked",
+        "blockers": all_preflight_blockers + id_blockers,
+        "status": "verified" if not all_preflight_blockers + id_blockers else "blocked",
         "simulated": allow_test_origin,
         "recorded_at": approval_mod.now(),
     }
@@ -1829,7 +1880,19 @@ def run_hosted_qualification(
     # 4. Open the hosted scenario context first: preparation records CI and QA evidence into its child folder (#108).
     scenarios: dict[str, Any] = {}
     scenario_blockers: list[str] = []
+    run_id = f"{time.strftime('%Y%m%d-%H%M%S', time.gmtime())}-{os.urandom(3).hex()}"  # names this run's branches
+    opened: list[int] = []  # PRs this run opened; any left unmerged are closed on the way out
+    cleanup: list[dict[str, Any]] = []
+
+    def _close_opened() -> None:
+        for n in dict.fromkeys(opened):
+            code, pr, msg = _api("GET", base_url, repo_slug, f"pulls/{n}", integrator_token, ledger=ledger)
+            if code == 200 and pr.get("state") == "open":
+                code, pr, msg = _api("PATCH", base_url, repo_slug, f"pulls/{n}", integrator_token, {"state": "closed"}, ledger)
+            cleanup.append({"pr_number": n, "http": code, "state": pr.get("state"), "merged": pr.get("merged"), "message": msg or None})
+
     with contextlib.ExitStack() as stack:
+        stack.callback(_close_opened)
         ctx = None
         if not all_preflight_blockers and base_url.rstrip("/") != HOSTED_API_ORIGIN:
             scenario_blockers.append(f"scenario-context-unavailable: hosted scenarios need a clone from {HOSTED_API_ORIGIN}, not {base_url}")
@@ -1846,13 +1909,17 @@ def run_hosted_qualification(
         prep_record = prepare_qualification_candidate(
             base_url, repo_slug, evidence_dir,
             target_branch=branch,
+            head_branch=f"{CANDIDATE_BRANCH_PREFIX}{run_id}-sc1",
             integrator_token=integrator_token,
             competitor_token=competitor_token,
             ledger=ledger,
             allow_test_origin=allow_test_origin,
             live_enabled=live_enabled,
             scenario_ctx=ctx,
+            file_changes=_calc_changes(f"{CANDIDATE_BRANCH_PREFIX}{run_id}-sc1"),
+            expected_logins=expected_logins,
         )
+        if n := (prep_record.get("pr") or {}).get("number"): opened.append(n)
 
         if ctx is not None:
             if prep_record.get("candidate_sha") not in (None, "unavailable"):
@@ -1868,14 +1935,14 @@ def run_hosted_qualification(
             # 2. Scenario 2: Prereq missing and denied
             sc2_res = run_scenario_2_prereq_missing_and_denied(
                 base_url, repo_slug, evidence_dir, ctx, integrator_token, competitor_token,
-                base_branch=branch, ledger=ledger, allow_test_origin=allow_test_origin,
+                base_branch=branch, ledger=ledger, allow_test_origin=allow_test_origin, run_id=run_id, opened=opened,
             )
             scenarios["prereq_missing_and_denied"] = sc2_res
 
             # 3. Scenario 3: Competing base rejection
             sc3_res, cand_br3, base_b_prime, cand_pr3 = run_scenario_3_competing_base_rejection(
                 base_url, repo_slug, evidence_dir, ctx, integrator_token, competitor_token,
-                base_branch=branch, ledger=ledger, allow_test_origin=allow_test_origin,
+                base_branch=branch, ledger=ledger, allow_test_origin=allow_test_origin, run_id=run_id, opened=opened,
             )
             scenarios["competing_base_rejection"] = sc3_res
 
@@ -1893,7 +1960,8 @@ def run_hosted_qualification(
         parent_index, preflight_record, scenarios, preparation=prep_record,
     )
 
-    run_blockers = list(dict.fromkeys(all_preflight_blockers + prep_record.get("blockers", []) + scenario_blockers + red_blockers))
+    run_blockers = list(dict.fromkeys(all_preflight_blockers + id_blockers + prep_record.get("blockers", []) + scenario_blockers
+                                      + red_blockers))
     final_blockers = run_blockers + ["hosted-scenarios-5-and-6-pending-slice-5"]
     outcome = _run_outcome(scenarios, run_blockers, "slice-4-verified")
     res = {
@@ -1902,7 +1970,7 @@ def run_hosted_qualification(
         "outcome": outcome,
         "qualified": False,
         "repo_slug": repo_slug, "blockers": final_blockers,
-        "preflight": preflight_record, "preparation": prep_record, "scenarios": scenarios,
+        "run_id": run_id, "preflight": preflight_record, "preparation": prep_record, "scenarios": scenarios, "cleanup": cleanup,
         "parent_evidence_index": reduced_index, "mode": "hosted",
         "simulated": allow_test_origin, "recorded_at": approval_mod.now(),
     }
@@ -1945,10 +2013,11 @@ def main(argv: list[str] | None = None) -> int:
         if args.mode == "hosted":
             live_enabled = os.environ.get("TURBO_LIVE_QUALIFICATION") == "1"
             tokens = [os.environ.get("TURBO_QUAL_INTEGRATOR_TOKEN") or "", os.environ.get("TURBO_QUAL_COMPETITOR_TOKEN") or ""]
+            logins = {role: os.environ.get(f"TURBO_QUAL_EXPECTED_{role.upper()}") or "" for role in ("integrator", "competitor")}
             res = run_hosted_qualification(
                 args.repo_slug, ev_dir, live_enabled=live_enabled,
                 integrator_token=tokens[0] or None, competitor_token=tokens[1] or None,
-                base_url=args.base_url, branch=args.branch,
+                base_url=args.base_url, branch=args.branch, expected_logins={k: v for k, v in logins.items() if v} or None,
             )
             rc = 0 if res.get("qualified") else 2
     except BaseException as exc:
