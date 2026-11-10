@@ -9,14 +9,6 @@ from support import ROOT, cli, config, git, home_dir, make_repo, private_mode
 
 
 class HelpTest(unittest.TestCase):
-    def test_help_lists_the_operator_surface(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            repo = make_repo(Path(tmp))
-            result = cli(repo, home_dir(Path(tmp)), "--help")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        for name in ("init", "configure", "doctor", "status", "spend", "prepare", "red", "stage", "replay", "gate", "green", "manifest", "prompt", "stop", "resume"):
-            self.assertIn(name, result.stdout)
-
     def test_launcher_runs_from_an_unrelated_directory(self):
         launcher = ROOT / "bin" / "factory"
         self.assertTrue(os.access(launcher, os.X_OK), "bin/factory must be executable")
@@ -29,6 +21,8 @@ class HelpTest(unittest.TestCase):
             on_path = subprocess.run(["factory", "--help"], cwd=tmp, capture_output=True, text=True, timeout=60, env=env)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("prepare", result.stdout)
+        for name in ("init", "configure", "doctor", "status", "spend", "prepare", "red", "stage", "replay", "gate", "green", "manifest", "prompt", "stop", "resume"):
+            self.assertIn(name, result.stdout)
         self.assertEqual(on_path.returncode, 0, on_path.stderr)
 
 
@@ -51,20 +45,19 @@ class InitTest(unittest.TestCase):
     def test_rejects_home_inside_the_repository(self):
         with tempfile.TemporaryDirectory() as tmp:
             repo = make_repo(Path(tmp))
-            result = cli(repo, repo / ".factory", "init")
-            self.assertFalse((repo / ".factory").exists())
-        self.assertEqual(result.returncode, 2)
-        self.assertIn("inside", result.stderr)
+            with self.subTest("direct path"):
+                result = cli(repo, repo / ".factory", "init")
+                self.assertFalse((repo / ".factory").exists())
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("inside", result.stderr)
 
-    def test_rejects_a_symlink_that_resolves_inside_the_repository(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            repo = make_repo(Path(tmp))
-            alias = Path(tmp) / "alias"
-            alias.symlink_to(repo, target_is_directory=True)
-            result = cli(repo, alias / "state", "init")
-            self.assertFalse((repo / "state").exists())
-        self.assertEqual(result.returncode, 2)
-        self.assertIn("inside", result.stderr)
+            with self.subTest("symlink path"):
+                alias = Path(tmp) / "alias"
+                alias.symlink_to(repo, target_is_directory=True)
+                result = cli(repo, alias / "state", "init")
+                self.assertFalse((repo / "state").exists())
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("inside", result.stderr)
 
     def test_creates_private_runtime_and_is_idempotent(self):
         with tempfile.TemporaryDirectory() as tmp:

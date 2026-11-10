@@ -108,6 +108,9 @@ class EvidenceTest(unittest.TestCase):
             home = home_dir(Path(tmp))
             self.assertEqual(cli(repo, home, "init").returncode, 0)
             self.assertEqual(cli(repo, home, "configure", "--timezone", "UTC").returncode, 0)
+            shown = cli(repo, home, "spend", "show")
+            refused = cli(repo, home, "spend", "record", "--usd", "nan", "--source", "bad export")
+            refused_weeks = json.loads((home / "config.json").read_text(encoding="utf-8"))["budget"]["weeks"]
             self.assertEqual(spend_record(repo, home, 42.5, source="manual export 2026-11-03").returncode, 0)
             config_data = json.loads((home / "config.json").read_text(encoding="utf-8"))
             week = next(iter(config_data["budget"]["weeks"].values()))
@@ -115,16 +118,10 @@ class EvidenceTest(unittest.TestCase):
         self.assertEqual(week["source"], "manual export 2026-11-03")
         self.assertIn("operator-declared", week["verification"])
         self.assertNotIn("invoice", json.dumps(config_data).lower())
-
-    def test_spend_show_marks_an_unrecorded_week_unpriced(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            repo = make_repo(Path(tmp))
-            home = home_dir(Path(tmp))
-            self.assertEqual(cli(repo, home, "init").returncode, 0)
-            self.assertEqual(cli(repo, home, "configure", "--timezone", "UTC").returncode, 0)
-            result = cli(repo, home, "spend", "show")
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn("UNPRICED", result.stdout)
+        self.assertEqual(shown.returncode, 0, shown.stdout + shown.stderr)
+        self.assertIn("UNPRICED", shown.stdout)
+        self.assertEqual(refused.returncode, 2)
+        self.assertEqual(refused_weeks, {})
 
 
 class DoctorTest(unittest.TestCase):
@@ -135,15 +132,6 @@ class DoctorTest(unittest.TestCase):
             config(repo, home)
             result = cli(repo, home, "doctor")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-
-    def test_doctor_fails_closed_without_gates(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            repo = make_repo(Path(tmp))
-            home = home_dir(Path(tmp))
-            self.assertEqual(cli(repo, home, "init").returncode, 0)
-            result = cli(repo, home, "doctor")
-        self.assertEqual(result.returncode, 1)
-        self.assertIn("gate", (result.stdout + result.stderr).lower())
 
     def test_doctor_reports_gate_drift_for_an_admitted_run(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -157,11 +145,14 @@ class DoctorTest(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn("digest", (result.stdout + result.stderr).lower())
 
-    def test_status_works_after_a_stop_without_gate_config(self):
+    def test_doctor_fails_closed_and_status_works_after_a_stop_without_gate_config(self):
         with tempfile.TemporaryDirectory() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             self.assertEqual(cli(repo, home, "init").returncode, 0)
+            doctor = cli(repo, home, "doctor")
+            self.assertEqual(doctor.returncode, 1)
+            self.assertIn("gate", (doctor.stdout + doctor.stderr).lower())
             self.assertEqual(cli(repo, home, "configure", "--timezone", "UTC").returncode, 0)
             assert prepare(repo, home).returncode == 1
             result = cli(repo, home, "status", "--issue", "7")
@@ -188,17 +179,6 @@ class PromptTest(unittest.TestCase):
             to_ready(repo, home)
             result = cli(repo, home, "stop", "--issue", "7", "--reason", "finished")
         self.assertEqual(result.returncode, 2)
-
-    def test_non_finite_spend_is_refused(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            repo = make_repo(Path(tmp))
-            home = home_dir(Path(tmp))
-            self.assertEqual(cli(repo, home, "init").returncode, 0)
-            self.assertEqual(cli(repo, home, "configure", "--timezone", "UTC").returncode, 0)
-            result = cli(repo, home, "spend", "record", "--usd", "nan", "--source", "bad export")
-            config_data = json.loads((home / "config.json").read_text(encoding="utf-8"))
-        self.assertEqual(result.returncode, 2)
-        self.assertEqual(config_data["budget"]["weeks"], {})
 
 
 

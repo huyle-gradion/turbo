@@ -39,23 +39,18 @@ def frontmatter(text: str) -> dict[str, str]:
 
 
 class BundleTest(unittest.TestCase):
-    def test_manual_skill_has_parseable_frontmatter(self):
-        text = SKILLS[0].read_text(encoding="utf-8")
-        fields = frontmatter(text)
-        self.assertEqual(fields.get("name"), "run-issue")
-        self.assertTrue(fields.get("description"))
-        self.assertIn("issue", fields["description"].lower())
-
-    def test_turbo_skill_has_parseable_frontmatter(self):
-        text = SKILLS[1].read_text(encoding="utf-8")
-        fields = frontmatter(text)
-        self.assertEqual(fields.get("name"), "run-issue-turbo")
-        self.assertTrue(fields.get("description"))
-        self.assertIn("turbo", fields["description"].lower())
-
-    def test_readme_and_launcher_are_present(self):
-        self.assertTrue((ROOT / "README.md").is_file())
-        self.assertTrue((ROOT / "bin" / "factory").is_file())
+    def test_skills_have_parseable_frontmatter(self):
+        cases = (
+            (SKILLS[0], "run-issue", "issue"),
+            (SKILLS[1], "run-issue-turbo", "turbo"),
+        )
+        for skill_path, name, keyword in cases:
+            with self.subTest(skill=name):
+                text = skill_path.read_text(encoding="utf-8")
+                fields = frontmatter(text)
+                self.assertEqual(fields.get("name"), name)
+                self.assertTrue(fields.get("description"))
+                self.assertIn(keyword, fields["description"].lower())
 
     def test_phases_stop_at_local_verified(self):
         from factory.model import PHASES
@@ -81,6 +76,8 @@ class BundleTest(unittest.TestCase):
     def test_release_metadata_agrees(self):
         from factory import __version__ as package_version
 
+        self.assertTrue((ROOT / "README.md").is_file())
+        self.assertTrue((ROOT / "bin" / "factory").is_file())
         version = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
         changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
         readme = (ROOT / "README.md").read_text(encoding="utf-8")

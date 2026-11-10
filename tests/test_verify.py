@@ -86,32 +86,23 @@ class TurboBundleTest(unittest.TestCase):
         self.assertEqual(state["counters"]["operations_used"], 1)
         self.assertEqual(state["gate_observations"], [])
 
-    def test_first_failure_stops_the_bundle(self):
-        failing_gate_two = ["python3", "-c", "import sys; sys.exit(1)"]
-        with tempfile.TemporaryDirectory() as tmp:
-            repo = make_repo(Path(tmp))
-            home = home_dir(Path(tmp))
-            turbo_staged(repo, home, operations=10, gate2=failing_gate_two)
-            result = verify(repo, home)
-            state = run_state(home)
-        self.assertEqual(result.returncode, 1)
-        self.assertEqual(state["gate_chain"], [])
-        self.assertEqual(state["gate_attempts"][-1]["gate"], "2")
-        self.assertIsNone(state.get("replay"))
-        self.assertIsNone(state.get("green"))
-        self.assertEqual([item["gate"] for item in state["gate_observations"]], ["1", "2"])
-        self.assertEqual(state["counters"]["operations_used"], 3)
-
-    def test_a_failed_gate_resets_the_prefix_and_the_next_verify_reruns_gate_one(self):
+    def test_first_failure_stops_the_bundle_and_the_next_verify_reruns_gate_one(self):
         failing_gate_two = ["python3", "-c", "import sys; sys.exit(1)"]
         with tempfile.TemporaryDirectory() as tmp:
             repo = make_repo(Path(tmp))
             home = home_dir(Path(tmp))
             turbo_staged(repo, home, operations=10, gate2=failing_gate_two)
             first = verify(repo, home)
+            stopped = run_state(home)
             second = verify(repo, home)
             state = run_state(home)
         self.assertEqual(first.returncode, 1)
+        self.assertEqual(stopped["gate_chain"], [])
+        self.assertEqual(stopped["gate_attempts"][-1]["gate"], "2")
+        self.assertIsNone(stopped.get("replay"))
+        self.assertIsNone(stopped.get("green"))
+        self.assertEqual([item["gate"] for item in stopped["gate_observations"]], ["1", "2"])
+        self.assertEqual(stopped["counters"]["operations_used"], 3)
         self.assertEqual(second.returncode, 1)
         self.assertEqual(state["gate_chain"], [])
         self.assertEqual([item["gate"] for item in state["gate_observations"]], ["1", "2", "1", "2"])
@@ -205,19 +196,33 @@ class TurboBundleTest(unittest.TestCase):
 
 
 class DriftAndTamperTest(unittest.TestCase):
-    def test_profile_drift_refuses_before_a_child(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            repo = make_repo(Path(tmp))
-            home = home_dir(Path(tmp))
-            marker = Path(tmp) / "gate-one-ran"
-            turbo_staged(repo, home, operations=5, gate1=marker_gate(marker))
+    def test_drift_refuses_before_a_child(self):
+        def profile(repo: Path, home: Path) -> None:
             self.assertEqual(cli(repo, home, "configure", "--profile", "manual").returncode, 0)
-            result = verify(repo, home)
-            state = run_state(home)
-        self.assertNotEqual(result.returncode, 0)
-        self.assertFalse(marker.exists())
-        self.assertEqual(state["counters"]["operations_used"], 1)
-        self.assertEqual(state["phase"], "gates")
+
+        def identity(repo: Path, home: Path) -> None:
+            path = home / "runs" / f"{ISSUE}.json"
+            state = json.loads(path.read_text(encoding="utf-8"))
+            state["red"]["test"]["blob_sha256"] = "0" * 64
+            path.write_text(json.dumps(state), encoding="utf-8")
+
+        def moved_head(repo: Path, home: Path) -> None:
+            commit(repo, "README.md", "# moved\n", "move head")
+
+        for drift in (profile, identity, moved_head):
+            with self.subTest(drift=drift.__name__), tempfile.TemporaryDirectory() as tmp:
+                repo = make_repo(Path(tmp))
+                home = home_dir(Path(tmp))
+                marker = Path(tmp) / "gate-one-ran"
+                turbo_staged(repo, home, operations=5, gate1=marker_gate(marker))
+                drift(repo, home)
+                result = verify(repo, home)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse(marker.exists())
+                if drift is profile:
+                    state = run_state(home)
+                    self.assertEqual(state["counters"]["operations_used"], 1)
+                    self.assertEqual(state["phase"], "gates")
 
     def test_a_tampered_gate_prefix_refuses_without_rerunning_it(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -255,59 +260,22 @@ class DriftAndTamperTest(unittest.TestCase):
         self.assertEqual(before, now)
         self.assertEqual(after["counters"]["operations_used"], 5)
 
-    def test_a_changed_test_identity_refuses_before_a_child(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            repo = make_repo(Path(tmp))
-            home = home_dir(Path(tmp))
-            marker = Path(tmp) / "gate-one-ran"
-            turbo_staged(repo, home, operations=5, gate1=marker_gate(marker))
-            path = home / "runs" / f"{ISSUE}.json"
-            state = json.loads(path.read_text(encoding="utf-8"))
-            state["red"]["test"]["blob_sha256"] = "0" * 64
-            path.write_text(json.dumps(state), encoding="utf-8")
-            result = verify(repo, home)
-        self.assertNotEqual(result.returncode, 0)
-        self.assertFalse(marker.exists())
-
-    def test_a_moved_head_refuses_before_a_child(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            repo = make_repo(Path(tmp))
-            home = home_dir(Path(tmp))
-            marker = Path(tmp) / "gate-one-ran"
-            turbo_staged(repo, home, operations=5, gate1=marker_gate(marker))
-            commit(repo, "README.md", "# moved\n", "move head")
-            result = verify(repo, home)
-        self.assertNotEqual(result.returncode, 0)
-        self.assertFalse(marker.exists())
-
 
 class BudgetAndTimeTest(unittest.TestCase):
-    def test_a_feature_above_the_bugfix_line_refuses_before_a_child(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            repo = make_repo(Path(tmp))
-            home = home_dir(Path(tmp))
-            marker = Path(tmp) / "gate-one-ran"
-            turbo_staged(repo, home, operations=10, gate1=marker_gate(marker))
-            self.assertEqual(spend_record(repo, home, 165.0).returncode, 0)
-            result = verify(repo, home)
-            state = run_state(home)
-        self.assertEqual(result.returncode, 1)
-        self.assertFalse(marker.exists())
-        self.assertEqual(state["stop_reason"], "budget")
-        self.assertEqual(state["counters"]["operations_used"], 1)
-
-    def test_the_weekly_stop_refuses_before_a_child(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            repo = make_repo(Path(tmp))
-            home = home_dir(Path(tmp))
-            marker = Path(tmp) / "gate-one-ran"
-            turbo_staged(repo, home, operations=10, gate1=marker_gate(marker))
-            self.assertEqual(spend_record(repo, home, 200.0).returncode, 0)
-            result = verify(repo, home)
-            state = run_state(home)
-        self.assertEqual(result.returncode, 1)
-        self.assertFalse(marker.exists())
-        self.assertEqual(state["stop_reason"], "budget")
+    def test_the_bugfix_line_and_the_weekly_stop_refuse_a_feature_before_a_child(self):
+        for spend in (165.0, 200.0):
+            with self.subTest(spend=spend), tempfile.TemporaryDirectory() as tmp:
+                repo = make_repo(Path(tmp))
+                home = home_dir(Path(tmp))
+                marker = Path(tmp) / "gate-one-ran"
+                turbo_staged(repo, home, operations=10, gate1=marker_gate(marker))
+                self.assertEqual(spend_record(repo, home, spend).returncode, 0)
+                result = verify(repo, home)
+                state = run_state(home)
+                self.assertEqual(result.returncode, 1)
+                self.assertFalse(marker.exists())
+                self.assertEqual(state["stop_reason"], "budget")
+                self.assertEqual(state["counters"]["operations_used"], 1)
 
     def test_an_expired_time_limit_refuses_before_a_child(self):
         with tempfile.TemporaryDirectory() as tmp:
