@@ -695,16 +695,25 @@ def get_remote_pulls(
         return []
 
 
-def _get_list(url: str, token: str) -> list[dict[str, Any]] | None:
-    """GET a JSON list without following redirects (`_http_req` reads lists as {}); None when no list came back."""
+def _get_list(url: str, token: str, ledger: QualificationLedger | None = None, actor: str = "integrator") -> list[dict[str, Any]] | None:
+    """GET a JSON list without following redirects (`_http_req` reads lists as {}); None when no list came back.
+
+    The read is recorded in `ledger` with its real status code, failures included (0 when no response came back)."""
+    import urllib.error
     from factory.intake import NoRedirectHandler
     from urllib.request import Request, build_opener
     req = Request(url, headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"})
+    code, msg, data = 0, "", None
     try:
         with build_opener(NoRedirectHandler).open(req, timeout=15) as resp:
+            code = resp.status
             data = json.loads(resp.read().decode("utf-8", "replace"))
-    except Exception:
-        return None
+    except urllib.error.HTTPError as exc:
+        code, msg = exc.code, str(exc)
+    except Exception as exc:
+        msg = str(exc)
+    if ledger:
+        ledger.record("GET", url, actor, code, msg)
     return data if isinstance(data, list) else None
 
 
@@ -1652,11 +1661,11 @@ def run_scenario_4_renewed_verification_after_base_change(
                             {"expected_head_sha": old_sha}, sc_ledger)
     new_sha, deadline = old_sha, time.monotonic() + 120.0
     while u_code in (200, 202) and new_sha == old_sha and time.monotonic() < deadline:  # the update is asynchronous
-        _, pr_now, _ = _api("GET", base_url, repo_slug, f"pulls/{cand_pr_num}", integrator_token)
+        _, pr_now, _ = _api("GET", base_url, repo_slug, f"pulls/{cand_pr_num}", integrator_token, ledger=sc_ledger)
         new_sha = str((pr_now.get("head") or {}).get("sha") or old_sha)
         time.sleep(0 if new_sha != old_sha else 2.0)
     ref = quote(f"refs/heads/{cand_branch}", safe="")
-    forced = _get_list(f"{base_url.rstrip('/')}/repos/{repo_slug}/activity?ref={ref}&activity_type=force_push", integrator_token)
+    forced = _get_list(f"{base_url.rstrip('/')}/repos/{repo_slug}/activity?ref={ref}&activity_type=force_push", integrator_token, sc_ledger)
     no_force_push = (not forced) if forced is not None else None  # None: the provider's ref history was not readable
     int_res, landed_sha, renewed_sha, renewed_base = None, None, None, None
     land_ok, land_details, blockers = False, {}, [] if u_code in (200, 202) else [f"update-branch HTTP {u_code}: {u_msg}"]
@@ -1936,7 +1945,7 @@ def run_hosted_qualification(
             scenario_ctx=ctx,
             file_changes=_calc_changes(f"{CANDIDATE_BRANCH_PREFIX}{run_id}-sc1"),
             expected_logins=expected_logins,
-            preflight_blockers=all_preflight_blockers,
+            preflight_blockers=all_preflight_blockers or (scenario_blockers if ctx is None else []),
         )
         if n := (prep_record.get("pr") or {}).get("number"): opened.append(n)
 
