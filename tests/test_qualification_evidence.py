@@ -89,7 +89,9 @@ def _hosted_fakes(*, failing: str | None = None, prep_blockers: list[str] = (), 
         for fn, name in (("run_scenario_1_confirmed_landing", "confirmed_landing"),
                          ("run_scenario_2_prereq_missing_and_denied", "prereq_missing_and_denied"),
                          ("run_scenario_3_competing_base_rejection", "competing_base_rejection"),
-                         ("run_scenario_4_renewed_verification_after_base_change", "renewed_verification_after_base_change")):
+                         ("run_scenario_4_renewed_verification_after_base_change", "renewed_verification_after_base_change"),
+                         ("run_scenario_5_concurrency_and_uncertain_reconciliation", "concurrency_and_uncertain_reconciliation"),
+                         ("run_scenario_6_wrong_target_rejected", "wrong_target_rejected")):
             st.enter_context(mock.patch(q + fn, scenario(name)))
         yield
 
@@ -191,6 +193,18 @@ class EvidenceIndexOutcomeTest(unittest.TestCase):
             p = ev / name
             return json.loads(p.read_text(encoding="utf-8")) if p.is_file() else {}
         return read("qualification-summary.json"), read("parent-evidence-index.json")
+
+    def test_simulated_hosted_run_never_qualifies(self) -> None:
+        """AC8/AC9 (#67 slice 5): a hosted run against a test origin, with all six scenarios verified and nothing
+        blocking, reads passed-simulated on every AC, never qualifies, and exits non-zero."""
+        env = {"TURBO_QUAL_READER_TOKEN": "fake-read-tok", **{f"TURBO_QUAL_EXPECTED_{r}": f"qual-{r.lower()}"
+                                                              for r in ("INTEGRATOR", "COMPETITOR", "READER")}}
+        with tempfile.TemporaryDirectory() as tmp, _hosted_fakes(), mock.patch.dict(os.environ, env):
+            ev = Path(tmp) / "ev"
+            rc = _run_main(["--mode", "hosted", "--evidence-dir", str(ev)])
+            index, summary = self._load(ev)
+        self.assertEqual({ac: e["outcome"] for ac, e in index.items()}, {f"AC{n}": "passed-simulated" for n in range(1, 7)})
+        self.assertEqual((summary["simulated"], summary["qualified"], rc), (True, False, 2))
 
     def test_reducer_never_passes_failed_missing_or_artifactless_outcomes(self) -> None:
         """AC2: the reducer reports failed/unavailable instead of trusting simulation or an empty artifact list."""

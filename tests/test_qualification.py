@@ -439,7 +439,7 @@ class QualificationSafetyAndCapabilityTest(unittest.TestCase):
                 )
                 self.assertFalse(res["qualified"], "Fake-provider tests must NEVER promote hosted status")
                 self.assertEqual(res["status"], "blocked")
-                self.assertIn("hosted-scenarios-5-and-6-pending-slice-5", res["blockers"])
+                self.assertNotIn("hosted-scenarios-5-and-6-pending-slice-5", res["blockers"], "slice 5 runs scenarios 5 and 6")
 
     def test_qualification_token_redaction_and_ledger(self) -> None:
         """Explicitly redact qualification tokens in persistence and record operation ledger."""
