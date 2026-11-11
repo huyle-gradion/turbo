@@ -103,7 +103,7 @@ def _render_phase1_prompt(child: dict[str, Any], base_sha: str, candidate_sha: s
     return (f"Role: independent-reviewer (fresh session separate from builder). Do not edit files or commit.\nPHASE: 1 (pre-summary independent hypothesis formation)\nSub-task: {child.get('gid')} ({child.get('name')})\n"
             f"Candidate revision: {candidate_sha} (base: {base_sha})\nIn scope: {scope.get('in_scope') or 'as specified'}\nOut of scope: {scope.get('out_of_scope') or 'none'}\nConstraints: {scope.get('constraints') or 'none'}\n"
             f"Requirements & Acceptance Criteria:\n{crit_lines}\nApplicable Project Standards:\n{std_lines}\nExact Base-to-Candidate Diff:\n{diff_text}\n"
-            'Respond with raw JSON only: {"hypotheses": ["<independent failure hypothesis 1>", ...]}\n')
+            'Respond with a single raw JSON object without markdown fences: {"hypotheses": ["<independent failure hypothesis 1>", ...]}\n')
 
 def build_phase1_prompt(child: dict[str, Any], base_sha: str, candidate_sha: str, diff_text: str, standards: list[dict[str, Any]]) -> str:
     return _render_phase1_prompt(child, base_sha, candidate_sha, diff_text, standards)
@@ -119,10 +119,11 @@ def build_phase2_prompt(child: dict[str, Any], base_sha: str, candidate_sha: str
     return (f"Role: independent-reviewer (fresh session separate from builder). Do not edit files or commit.\nPHASE: 2 (substantive-assessment after independent hypotheses were persisted)\nSub-task: {child.get('gid')} ({child.get('name')})\n"
             f"Candidate revision: {candidate_sha} (base: {base_sha})\nRequired Assessment Dimensions: {', '.join(ASSESSMENT_KEYS)}\nRequirements & Acceptance Criteria:\n{crit_lines}\nApplicable Project Standards:\n{std_lines}\n"
             f"Persisted Phase-1 Hypotheses:\n{hyp_lines}\nPrior Blocking Findings Requiring Verified Reconciliation:\n{prior_lines}\nSame-Candidate Automated QA Gate Summary: status={qa_eval['status']} verified={qa_eval['verified']}\n"
-            f"Same-Candidate Security Review Gate Summary: status={sec_eval['status']} verified={sec_eval['verified']}\nBuilder Summary (untrusted claim):\n{builder_summary or '(none provided)'}\nExact Base-to-Candidate Diff:\n{diff_text}\nRequired JSON response schema:\n{schema}\n")
+            f"Same-Candidate Security Review Gate Summary: status={sec_eval['status']} verified={sec_eval['verified']}\nBuilder Summary (untrusted claim):\n{builder_summary or '(none provided)'}\nExact Base-to-Candidate Diff:\n{diff_text}\nRequired JSON response schema:\n{schema}\n"
+            "Respond with a single raw JSON object without markdown fences.\n")
 
 def _parse_json_obj(text: str, phase: str) -> tuple[dict[str, Any] | None, list[str]]:
-    s = (text or "").strip()
+    s = security_review.unfence_json(text)
     if not (s.startswith("{") and s.endswith("}")): return None, [f"{phase} reviewer response must be a raw JSON object without markdown fences"]
     try: obj = json.loads(s)
     except json.JSONDecodeError as exc: return None, [f"{phase} reviewer response is not valid JSON: {exc}"]
