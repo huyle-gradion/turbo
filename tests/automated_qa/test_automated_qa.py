@@ -169,10 +169,9 @@ class AutomatedQADeliveryTest(unittest.TestCase):
             "import json, pathlib, subprocess\n"
             "m = '# rev-' + subprocess.run(['git', 'rev-list', '--count', 'HEAD'], capture_output=True, text=True, check=True).stdout.strip()\n"
             + SEEDED_INITIAL_COMMIT
-            + "for fn in ('src/chat_bridge/auth.py', 'tests/test_auth.py'):\n"
-            "    p = pathlib.Path(fn)\n"
-            "    p.write_text(p.read_text(encoding='utf-8') + m + '\\n', encoding='utf-8')\n"
-            "subprocess.run(['git', 'add', 'src/chat_bridge/auth.py', 'tests/test_auth.py'], check=True)\n"
+            + "p = pathlib.Path('src/chat_bridge/auth.py')\n"
+            "p.write_text(p.read_text(encoding='utf-8') + m + '\\n', encoding='utf-8')\n"
+            "subprocess.run(['git', 'add', 'src/chat_bridge/auth.py'], check=True)\n"
             "subprocess.run(['git', 'commit', '--amend', '-q', '-m', f'fix(auth): adjustment {m}'], check=True)\n" + RESULT_EMIT
         )
         with tempfile.TemporaryDirectory() as tmp:
