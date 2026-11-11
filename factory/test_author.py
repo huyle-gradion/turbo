@@ -188,7 +188,7 @@ def run_test_author(
         return _out("test-author-failed", f"test author exited with code {code} and result status {(final or {}).get('status')!r}")
     if decl is None:
         return _out("test-author-failed", f"test author response has no valid `{RED_PREFIX} <json>` declaration")
-    if gitio.status_porcelain(worktree, builder_copy=True):
+    if gitio.status_porcelain(worktree):
         return _out("test-author-failed", "test author left uncommitted changes in the worktree")
     if ta_sha == base_sha or not gitio.is_ancestor(worktree, base_sha, ta_sha):
         return _out("test-author-failed", "test author produced no new commit on the feature branch base")

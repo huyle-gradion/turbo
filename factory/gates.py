@@ -19,7 +19,7 @@ from factory.store import require_run, save_run
 def protected_changes(repo: Path, run: Run, protected: tuple[str, ...]) -> tuple[str, ...]:
     head = run.expected_green_sha or run.green_sha or gitio.head(repo)
     changed = set(gitio.changed_paths(repo, run.base_sha, head))
-    changed.update(gitio.dirty_paths(repo))
+    changed.update(gitio.dirty_paths(repo, operator_repo=True))
     return tuple(sorted(path for path in changed if config_module.protected_match(path, protected)))
 
 
@@ -40,7 +40,7 @@ def _require_inputs(paths: RuntimePaths, run: Run, name: str) -> config_module.C
         raise UsageError("HEAD does not match the staged expected commit; re-stage before gating")
     if gitio.branch(paths.repo) != run.branch:
         raise UsageError(f"current branch is not {run.branch}")
-    gitio.require_clean(paths.repo)
+    gitio.require_clean(paths.repo, operator_repo=True)
     if run.red is None:
         raise UsageError("no red evidence")
     raw = gitio.file_at_head(paths.repo, run.red.test.file)

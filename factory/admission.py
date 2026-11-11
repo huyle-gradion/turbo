@@ -124,7 +124,7 @@ def prepare(paths: RuntimePaths, args: object) -> Run:
         raise UsageError("prepare needs a non-empty --feature")
     if not str(getattr(args, "model") or "").strip():
         raise UsageError("prepare needs a non-empty --model")
-    gitio.require_clean(paths.repo)
+    gitio.require_clean(paths.repo, operator_repo=True)
     head = gitio.head(paths.repo)
     current = gitio.branch(paths.repo)
     if not current:

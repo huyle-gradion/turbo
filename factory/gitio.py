@@ -42,6 +42,8 @@ _BUILDER_SCOPES = frozenset({b"local", b"worktree", b"command"})
 # git-lfs reads its own repository-local program settings when an operator lfs filter runs (#134).
 _PROGRAM_KEYS = r"^filter\.|^lfs\.extension\..*\.(clean|smudge)$|^lfs\.customtransfer\..*\.path$|^lfs\.standalonetransferagent$"
 _OBJECT_ID = re.compile(r"[0-9a-f]{40}")
+_NAME = r"[\w/-]+(?:\.[\w/-]+)*"  # a plain ref name or object ID, with no revision syntax
+_RANGE = re.compile(rf"{_NAME}\.\.\.?{_NAME}")
 
 
 def _config_env(base: dict[str, str], pairs: list[tuple[str, str]]) -> dict[str, str]:
@@ -55,6 +57,7 @@ def _tree_to_tree_diff(argv: list[str], sub: int) -> bool:
     """`diff A B -- ...`, `diff A..B -- ...` or `diff OID OID`: no working-tree file is read, so no clean filter can run.
 
     Without `--`, `diff REV PATH` would compare against the working tree, so only two full object IDs count.
+    A range counts only between plain names: `HEAD^{/a..b}` is one revision. Anything else takes the lookup.
     """
     if argv[sub] != "diff" or "--no-index" in argv:
         return False
@@ -63,7 +66,7 @@ def _tree_to_tree_diff(argv: list[str], sub: int) -> bool:
     revs = [arg for arg in rest if not arg.startswith("-")]
     if not separated:
         return len(revs) == 2 and all(_OBJECT_ID.fullmatch(rev) for rev in revs)
-    return len(revs) == 2 or (len(revs) == 1 and ".." in revs[0])
+    return len(revs) == 2 or (len(revs) == 1 and bool(_RANGE.fullmatch(revs[0])))
 
 
 def _run_git(repo: Path, args: tuple[str, ...] | list[str], *, input: bytes | None = None,
@@ -86,7 +89,7 @@ def _run_git(repo: Path, args: tuple[str, ...] | list[str], *, input: bytes | No
     promisor remote are off, so reading a missing object fails instead of fetching.
     `status` gets `--ignore-submodules=dirty` (a flag, because `.gitmodules` overrides config), so
     it never runs a submodule's own filters, unless `trust_submodules` says the repository is the
-    operator's own; `status_entries` reports populated gitlinks in builder copies (#134).
+    operator's own; by default `status_entries` reports populated gitlinks instead (#134).
     Operator-owned global and system config still apply, so credential helpers keep working for
     push and fetch.
     Raises OSError or SubprocessError like `subprocess.run`.
@@ -175,22 +178,24 @@ def _nul_fields(payload: bytes) -> list[str]:
 
 
 def _populated_gitlinks(repo: Path) -> list[str]:
-    """Gitlink paths that hold a `.git`; the factory never populates submodules, so a builder did (#134)."""
+    """Gitlink paths holding a `.git` or any file; the factory never populates submodules, so a builder did (#134)."""
     code, payload = _git_bytes(repo, "ls-files", "-s", "-z")
     if code != 0:
         raise UsageError(f"git ls-files failed: {payload.decode('utf-8', 'replace').strip()}")
     paths = {field.partition("\t")[2] for field in _nul_fields(payload) if field.startswith("160000 ")}
-    return sorted(path for path in paths if os.path.lexists(repo / path / ".git"))
+    return sorted(path for path in paths if os.path.lexists(repo / path / ".git")
+                  or ((repo / path).is_dir() and any((repo / path).iterdir())))
 
 
-def status_entries(repo: Path, *, builder_copy: bool = False) -> tuple[tuple[str, str, str | None], ...]:
-    """`git status` entries; in a builder copy, also each populated gitlink status did not list, as ` M`.
+def status_entries(repo: Path, *, operator_repo: bool = False) -> tuple[tuple[str, str, str | None], ...]:
+    """`git status` entries plus, as ` M`, each populated gitlink that status did not already list.
 
-    In a builder copy status ignores dirty submodule content so that no filter of a nested
-    repository runs, and git never runs inside one, so a nested repository counts as dirty whether
-    or not it is. The operator's own repository gets plain status, submodules included.
+    Safe by default for builder copies: status ignores dirty submodule content so that no filter of
+    a nested repository runs, and git never runs inside one, so a nested repository counts as dirty
+    whether or not it is. `operator_repo=True` opts the operator's own repository in to plain
+    status, submodules included, with no gitlink report.
     """
-    code, payload = _git_bytes(repo, "status", "--porcelain", "-z", "--untracked-files=all", trust_submodules=not builder_copy)
+    code, payload = _git_bytes(repo, "status", "--porcelain", "-z", "--untracked-files=all", trust_submodules=operator_repo)
     if code != 0:
         raise UsageError(f"git status failed: {payload.decode('utf-8', 'replace').strip()}")
     fields = _nul_fields(payload)
@@ -207,20 +212,20 @@ def status_entries(repo: Path, *, builder_copy: bool = False) -> tuple[tuple[str
             entries.append((status, entry[3:], None))
             index += 1
     listed = {path for _, path, _ in entries}
-    if builder_copy:
+    if not operator_repo:
         entries.extend((" M", path, None) for path in _populated_gitlinks(repo) if path not in listed)
     return tuple(entries)
 
 
-def status_porcelain(repo: Path, *, builder_copy: bool = False) -> str:
+def status_porcelain(repo: Path, *, operator_repo: bool = False) -> str:
     lines: list[str] = []
-    for status, path, origin in status_entries(repo, builder_copy=builder_copy):
+    for status, path, origin in status_entries(repo, operator_repo=operator_repo):
         lines.append(f"{status} {origin} -> {path}" if origin else f"{status} {path}")
     return "\n".join(lines)
 
 
-def require_clean(repo: Path, *, builder_copy: bool = False) -> None:
-    dirty = status_porcelain(repo, builder_copy=builder_copy)
+def require_clean(repo: Path, *, operator_repo: bool = False) -> None:
+    dirty = status_porcelain(repo, operator_repo=operator_repo)
     if dirty:
         raise UsageError(f"working tree is dirty; commit or stash before proceeding:\n{dirty}")
 
@@ -259,9 +264,9 @@ def changed_paths(repo: Path, base: str, tip: str) -> tuple[str, ...]:
     return tuple(_nul_fields(payload))
 
 
-def dirty_paths(repo: Path) -> tuple[str, ...]:
+def dirty_paths(repo: Path, *, operator_repo: bool = False) -> tuple[str, ...]:
     paths: list[str] = []
-    for _, path, origin in status_entries(repo):
+    for _, path, origin in status_entries(repo, operator_repo=operator_repo):
         paths.append(path)
         if origin is not None:
             paths.append(origin)

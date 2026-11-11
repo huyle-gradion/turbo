@@ -19,7 +19,7 @@ GATES = ("1", "2", "3")
 
 def require_current(paths: RuntimePaths, run: Run) -> str:
     """The repository must still be the recorded green commit with the same red test."""
-    if gitio.status_porcelain(paths.repo):
+    if gitio.status_porcelain(paths.repo, operator_repo=True):
         raise PolicyError("working tree is dirty; green needs a clean tree")
     if gitio.branch(paths.repo) != run.branch:
         raise PolicyError(f"current branch is not {run.branch}")

@@ -393,7 +393,7 @@ def _execute_delivery(paths: RuntimePaths, spec: DeliverSpec, *, require_final_a
 
     eff_factory_repo = Path(spec.policy_repo).resolve() if spec.policy_repo else FACTORY_ROOT
     policy_res, policy_blockers = resolve_delivery_policy(spec, eff_factory_repo)
-    factory_dirty = bool(gitio.status_porcelain(eff_factory_repo))
+    factory_dirty = bool(gitio.status_porcelain(eff_factory_repo, operator_repo=True))
     if policy_blockers:
         st = f"policy-{policy_res.status}" if policy_res is not None else "policy-selection-failed"
         fail_policy = {
@@ -803,7 +803,7 @@ def _execute_delivery(paths: RuntimePaths, spec: DeliverSpec, *, require_final_a
         if sep is not None:
             sep["implementer"] = {"conversation_id": str((final_result or {}).get("conversation_id") or "") or None}
             sep["byte_identity"] = test_author.byte_identity(worktree_dir, sep_ta_sha, candidate_sha, authored.files)
-        dirty_after = gitio.status_porcelain(worktree_dir, builder_copy=True)
+        dirty_after = gitio.status_porcelain(worktree_dir)
         cand_diff_text = (
             git_timed(worktree_dir, deadline, limit_s, "candidate diff", "diff", "--binary", base_sha, candidate_sha).output
             if candidate_sha != base_sha else ""
