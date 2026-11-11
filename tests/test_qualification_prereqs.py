@@ -144,12 +144,13 @@ class QualificationRealPrerequisiteTest(unittest.TestCase):
 
     def _gated_prepare(self, *, src: str = CALC_CANDIDATE_SRC, ci: str = "pass", move_head: bool = False,
                        raise_in: str | None = None, reviewers: tuple[str, str] | None = None,
-                       ir_limit_s: int | None = None) -> SimpleNamespace:
+                       ir_limit_s: int | None = None, restamp: str | None = None) -> SimpleNamespace:
         """#108 in the hosted order: run_hosted_qualification opens the scenario context while the candidate branch does
         not exist on the origin yet; preparation's PR lookup is when it appears. CI comes from the delivery fake GitHub
         server (`ci`: pass | fail | missing). Scenario 1's delivery gate is captured, and its child folder is read back
         through the gate's own CI and QA checks; scenarios 2-4 only record the candidate SHA they were given.
-        #104: `reviewers` = (security, independent) script bodies behind ONE fake agy, which the resolver returns."""
+        #104: `reviewers` = (security, independent) script bodies behind ONE fake agy, which the resolver returns;
+        `restamp` names an entry point whose returned record is relabelled as a review of the base revision."""
         case = Path(tempfile.mkdtemp(dir=self.tmp))
         origin, bare, cand, base = _seeded_origin(case, src)
         git(bare, "update-ref", "-d", f"refs/heads/{HEAD_BRANCH}")  # fresh run: no candidate when the context clones
@@ -173,6 +174,7 @@ class QualificationRealPrerequisiteTest(unittest.TestCase):
                     raise RuntimeError(f"{fn} unavailable")
                 calls.append((fn, dict(kw)))
                 out = real(*a, **{**kw, **(override or {})})
+                out = {**out, "reviewed_revision": base} if restamp == fn else out
                 captured[fn] = json.loads(json.dumps(out))
                 return out
             return mock.patch.object(mod, fn, side_effect=call)
@@ -365,7 +367,7 @@ class QualificationRealPrerequisiteTest(unittest.TestCase):
                              ("verified", r.cand, r.agy, sid), pre)
         self.assertIs(r.gate.get("delivery_approved"), True, r.gate)
         self.assertEqual(r.sc1_gate_dirs[:1], [r.ctx_child_dir], "scenario 1 gated a folder other than ctx.child_dir")
-        self.assertIs(r.sc1["delivery_approved"], r.gate["delivery_approved"], r.sc1)
+        self.assertEqual((r.sc1["ci_verified"], r.sc1["competitor_approved"]), (True, True), r.sc1)
         self.assertEqual(len(r.approvals), 1, r.approvals)
         self.assertEqual((r.approvals[0]["candidate_sha"], r.calls[-1][0]), (r.cand, "submit_qualification_pr_review"))
         rev = r.rec["prerequisites"]["github_review"]
@@ -409,6 +411,20 @@ class QualificationRealPrerequisiteTest(unittest.TestCase):
                     self.assertNotEqual(r.rec["prerequisites"][key].get("status"), "verified", r.rec["prerequisites"][key])
                     self.assertTrue(any(role in b.lower() and r.cand in b and str(r.captured[fn]["outcome"]) in b
                                         for b in r.rec["blockers"]), r.rec["blockers"])
+        for fn, role, key in (("review_candidate_security", "security", "security"),
+                              ("review_candidate_independently", "independent", "independent_review")):
+            with self.subTest(f"{role} reviewer entry point raises: unavailable"):
+                r = self._gated_prepare(reviewers=_GOOD_REVIEWERS, raise_in=fn)
+                self.assertEqual((r.rec["status"], r.approvals), ("blocked", []), r.rec["blockers"])
+                self.assertEqual(r.rec["prerequisites"][key]["status"], "unavailable", r.rec["prerequisites"][key])
+                self.assertTrue(any(b.startswith(f"{role}-review-unavailable for {r.cand}") for b in r.rec["blockers"]),
+                                r.rec["blockers"])
+        with self.subTest("security record for another revision is not credited"):
+            r = self._gated_prepare(reviewers=_GOOD_REVIEWERS, restamp="review_candidate_security")
+            self.assertEqual((r.rec["status"], r.approvals), ("blocked", []), r.rec["blockers"])
+            self.assertEqual(r.rec["prerequisites"]["security"]["status"], "not-verified", r.rec["prerequisites"]["security"])
+            self.assertTrue(any(b.startswith("security-review-not-verified") and r.cand in b for b in r.rec["blockers"]),
+                            r.rec["blockers"])
         with self.subTest("workspace cannot be made private: scenario-context-unavailable"):
             ev = self.tmp / "ev-ws"
             ev.mkdir()
