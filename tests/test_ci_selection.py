@@ -226,7 +226,8 @@ class CiSelectionTest(unittest.TestCase):
         validator = textwrap.dedent(jobs["plan"].split("<<'PY'\n", 1)[1].split("\n          PY\n", 1)[0])
         full = [t.relative_to(ROOT).as_posix() for t in (ROOT / "tests").rglob("test_*.py")]
         for event, mode, tests, ok in (("push", "full", full, True), ("push", "full", full[1:], False),
-                                       ("push", "docs-only", [], False), ("pull_request", "docs-only", [], True)):
+                                       ("push", "docs-only", [], False), ("pull_request", "docs-only", [], True),
+                                       ("pull_request", "areas", ["tests/test a.py"], False)):
             with tempfile.TemporaryDirectory() as tmp, self.subTest(validator=(event, mode, len(tests))):
                 plan_file = Path(tmp) / "plan.json"
                 jobs_out = [{"name": "shard:1", "tests": tests}] if tests else []
@@ -238,6 +239,16 @@ class CiSelectionTest(unittest.TestCase):
         self.assertEqual(set(needs.split(", ")), {"plan", "guards", "tests", "smoke"})
         reads = dict(re.findall(r"(?m)^          (\w+): \$\{\{ needs\.(\w+)\.result \}\}$", jobs["ci"]))
         self.assertEqual(set(reads.values()), {"plan", "guards", "tests", "smoke"})
+        unit = jobs["tests"].split("- name: Unit tests\n", 1)[1].split("run: |\n", 1)[1]
+        with tempfile.TemporaryDirectory() as tmp:
+            stub = Path(tmp) / "python3"
+            stub.write_text('#!/bin/sh\nprintf "%s\\n" "$@"\n', encoding="utf-8")
+            stub.chmod(0o755)
+            ran = subprocess.run(["bash", "-c", textwrap.dedent(unit)], capture_output=True, text=True, env={
+                "PATH": f"{tmp}:/usr/bin:/bin", "TESTS": "tests/automated_qa/test_automated_qa.py tests/test_deliver.py"})
+        argv = ran.stdout.split()
+        self.assertEqual([a for a in argv[argv.index("unittest") + 1:] if not a.startswith("-")],
+                         ["automated_qa.test_automated_qa", "test_deliver"], "shards import as discover -s tests does")
         gate = jobs["ci"].split("run: |\n", 1)[1]
         ok_runs = ({}, {"tests": "skipped", "smoke": "skipped"})
         bad_runs = ({"plan": "failure"}, {"plan": "skipped"}, {"guards": "failure"}, {"tests": "failure"},

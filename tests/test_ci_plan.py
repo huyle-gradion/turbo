@@ -16,6 +16,7 @@ Area map pinned here (coarse; the planner owns the exact file lists):
 | factory/qualification.py, examples/qualification/**,      | area:qualification      |
 | tests/test_qualification*.py                              |                         |
 | any other factory/*.py and its tests                      | area:core               |
+| test modules other areas' tests import (SHARED_TEST_MODULES) | full, N shards       |
 | push event, no paths, unmapped path, deleted tests/**.py, | full, N shards          |
 | CI or verification-chain path (.github, scripts, bin,     |                         |
 | tests/support.py, factory/ci_selection.py, factory/cli.py)|                         |
@@ -23,6 +24,7 @@ Area map pinned here (coarse; the planner owns the exact file lists):
 Smoke runs when factory/, bin/, scripts/ or skills/ changed, and always on full.
 """
 
+import ast
 import json
 import shutil
 import subprocess
@@ -37,6 +39,13 @@ PLANNER = ROOT / "scripts" / "ci_plan.py"
 REVIEW_TESTS = ("tests/independent_review/", "tests/security_review/", "tests/automated_qa/")
 QUAL_TESTS = ("tests/test_qualification",)
 DELIVERY = "factory/deliver.py"
+# Test modules that tests in another area import for fixtures (directly or via support_deliver.py).
+SHARED_TEST_MODULES = (
+    "tests/support_deliver.py", "tests/test_deliver.py", "tests/test_deliver_checks.py", "tests/test_intake.py",
+    "tests/test_intake_eval.py", "tests/automated_qa/test_automated_qa_eval.py",
+    "tests/independent_review/test_approval_gate.py", "tests/independent_review/test_independent_review.py",
+    "tests/security_review/test_reviewer.py",
+)
 
 
 def all_tests(repo):
@@ -87,8 +96,7 @@ class CiPlanTest(unittest.TestCase):
                 "tests/security_review/test_security_review.py", "tests/automated_qa/test_automated_qa.py"}, QUAL_TESTS)
               for p in ("factory/independent_review/approval.py", "factory/security_review/delivery.py",
                         "factory/automated_qa/delivery.py", "factory/automated_qa/__init__.py",
-                        "tests/security_review/test_reviewer.py", "tests/independent_review/test_independent_review.py",
-                        "tests/automated_qa/test_automated_qa_eval.py")),
+                        "tests/automated_qa/test_automated_qa.py", "tests/security_review/test_thermos_regressions.py")),
             ("test read by two areas", ["skills/run-issue/SKILL.md", "factory/security_review/delivery.py"], [],
              "pull_request", "areas", {"skills", "review", "delivery"}, True,
              {"tests/test_bundle.py", "tests/security_review/test_security_review.py"}, ()),
@@ -108,6 +116,8 @@ class CiPlanTest(unittest.TestCase):
             ("unmapped path", ["newdir/unknown.txt"], [], "pull_request", "full", None, True, set(), ()),
             *((f"deleted {p}", [DELIVERY], [p], "pull_request", "full", None, True, set(), ())
               for p in ("tests/test_flow.py", "tests/automated_qa/test_automated_qa_eval.py", "tests/support_deliver.py")),
+            *((f"shared test module {p}", [p], [], "pull_request", "full", None, True, set(), ())
+              for p in SHARED_TEST_MODULES),
             *((f"chain file {p}", [p], [], "pull_request", "full", None, True, set(), ())
               for p in (".github/workflows/ci.yml", "factory/ci_selection.py", "tests/support.py",
                         "bin/factory", "factory/cli.py", "scripts/ci_plan.py")),
@@ -132,6 +142,40 @@ class CiPlanTest(unittest.TestCase):
                 if "area:delivery" in jobs:
                     self.assertIn("tests/test_deliver.py", jobs["area:delivery"])
                 self.assertEqual([t for t in planned if t.startswith(must_not)] if must_not else [], [])
+
+    def test_changing_a_test_module_runs_every_test_that_imports_it(self):
+        # importer -> {imported: True if the import can reach other modules (not inside a test_* function)}
+        files = {p.relative_to(ROOT).as_posix() for p in (ROOT / "tests").rglob("*.py")}
+        edges = {}
+
+        def visit(node, src, in_test):
+            for child in ast.iter_child_nodes(node):
+                in_test_here = in_test or (isinstance(child, ast.FunctionDef) and child.name.startswith("test"))
+                names = [a.name for a in child.names] if isinstance(child, ast.Import) else []
+                if isinstance(child, ast.ImportFrom) and child.module and not child.level:
+                    names = [child.module] + [f"{child.module}.{a.name}" for a in child.names]
+                for name in names:
+                    target = "tests/" + name.removeprefix("tests.").replace(".", "/") + ".py"
+                    if target in files and target != src:
+                        edges.setdefault(src, {})[target] = edges.get(src, {}).get(target, False) or not in_test_here
+                visit(child, src, in_test_here)
+
+        for src in files:
+            visit(ast.parse((ROOT / src).read_text(encoding="utf-8")), src, False)
+        for module in sorted({t for targets in edges.values() for t in targets}):
+            importers, todo = set(), [module]
+            while todo:
+                current = todo.pop()
+                for src, targets in edges.items():
+                    if current in targets and src not in importers:
+                        importers.add(src)
+                        if targets[current]:
+                            todo.append(src)
+            with self.subTest(module):
+                out = plan(ROOT, [module])
+                planned = {t for j in out["jobs"] for t in j["tests"]}
+                missing = {t for t in importers if Path(t).name.startswith("test_")} - planned
+                self.assertEqual(sorted(missing) if out["mode"] != "full" else [], [])
 
     def test_full_plan_shards_the_candidate_checkout_not_the_planner_checkout(self):
         with tempfile.TemporaryDirectory() as tmp:
