@@ -67,7 +67,8 @@ def _tree_to_tree_diff(argv: list[str], sub: int) -> bool:
 
 
 def _run_git(repo: Path, args: tuple[str, ...] | list[str], *, input: bytes | None = None,
-             timeout: float | None = GIT_TIMEOUT, text: bool = False) -> subprocess.CompletedProcess:
+             timeout: float | None = GIT_TIMEOUT, text: bool = False,
+             trust_submodules: bool = False) -> subprocess.CompletedProcess:
     """Run host git in `repo` so that repository config cannot make it run a program (#125).
 
     A builder controls its working copy's `.git/config` (and anything it includes), `.git/hooks`,
@@ -84,9 +85,10 @@ def _run_git(repo: Path, args: tuple[str, ...] | list[str], *, input: bytes | No
     diff, show and log get `--no-ext-diff --no-textconv`, and replace refs and lazy fetches from a
     promisor remote are off, so reading a missing object fails instead of fetching.
     `status` gets `--ignore-submodules=dirty` (a flag, because `.gitmodules` overrides config), so
-    it never runs a submodule's own filters; `status_entries` instead reports every populated
-    gitlink as modified (#134). Operator-owned global and system config still apply, so
-    credential helpers keep working for push and fetch.
+    it never runs a submodule's own filters, unless `trust_submodules` says the repository is the
+    operator's own; `status_entries` reports populated gitlinks in builder copies (#134).
+    Operator-owned global and system config still apply, so credential helpers keep working for
+    push and fetch.
     Raises OSError or SubprocessError like `subprocess.run`.
     """
     deadline = None if timeout is None else time.monotonic() + timeout
@@ -106,7 +108,7 @@ def _run_git(repo: Path, args: tuple[str, ...] | list[str], *, input: bytes | No
              *((key, "") for key in sorted(keys) if key.startswith("lfs."))]
     if sub is not None and argv[sub] in _NO_EXTERNAL_DIFF:
         argv[sub + 1:sub + 1] = ["--no-ext-diff", "--no-textconv"]
-    if sub is not None and argv[sub] == "status":
+    if sub is not None and argv[sub] == "status" and not trust_submodules:
         argv[sub + 1:sub + 1] = ["--ignore-submodules=dirty"]
     remaining = None if deadline is None else max(0.001, deadline - time.monotonic())
     return subprocess.run(["git", *argv], cwd=repo, input=input, capture_output=True, text=text,
@@ -126,9 +128,10 @@ def git(repo: Path, *args: str) -> GitResult:
         return GitResult(("git", *args), 127, str(exc))
 
 
-def _git_bytes(repo: Path, *args: str, input: bytes | None = None, timeout: float | None = GIT_TIMEOUT) -> tuple[int, bytes]:
+def _git_bytes(repo: Path, *args: str, input: bytes | None = None, timeout: float | None = GIT_TIMEOUT,
+               trust_submodules: bool = False) -> tuple[int, bytes]:
     try:
-        completed = _run_git(repo, args, input=input, timeout=timeout)
+        completed = _run_git(repo, args, input=input, timeout=timeout, trust_submodules=trust_submodules)
     except (OSError, subprocess.SubprocessError) as exc:
         raise UsageError(f"git {' '.join(args)} failed: {exc}") from exc
     return completed.returncode, completed.stdout
@@ -180,13 +183,14 @@ def _populated_gitlinks(repo: Path) -> list[str]:
     return sorted(path for path in paths if os.path.lexists(repo / path / ".git"))
 
 
-def status_entries(repo: Path) -> tuple[tuple[str, str, str | None], ...]:
-    """`git status` entries plus, as ` M`, each populated gitlink that status did not already list.
+def status_entries(repo: Path, *, builder_copy: bool = False) -> tuple[tuple[str, str, str | None], ...]:
+    """`git status` entries; in a builder copy, also each populated gitlink status did not list, as ` M`.
 
-    Status ignores dirty submodule content so that no filter of a nested repository runs, and git
-    never runs inside one here, so a nested repository counts as dirty whether or not it is.
+    In a builder copy status ignores dirty submodule content so that no filter of a nested
+    repository runs, and git never runs inside one, so a nested repository counts as dirty whether
+    or not it is. The operator's own repository gets plain status, submodules included.
     """
-    code, payload = _git_bytes(repo, "status", "--porcelain", "-z", "--untracked-files=all")
+    code, payload = _git_bytes(repo, "status", "--porcelain", "-z", "--untracked-files=all", trust_submodules=not builder_copy)
     if code != 0:
         raise UsageError(f"git status failed: {payload.decode('utf-8', 'replace').strip()}")
     fields = _nul_fields(payload)
@@ -203,19 +207,20 @@ def status_entries(repo: Path) -> tuple[tuple[str, str, str | None], ...]:
             entries.append((status, entry[3:], None))
             index += 1
     listed = {path for _, path, _ in entries}
-    entries.extend((" M", path, None) for path in _populated_gitlinks(repo) if path not in listed)
+    if builder_copy:
+        entries.extend((" M", path, None) for path in _populated_gitlinks(repo) if path not in listed)
     return tuple(entries)
 
 
-def status_porcelain(repo: Path) -> str:
+def status_porcelain(repo: Path, *, builder_copy: bool = False) -> str:
     lines: list[str] = []
-    for status, path, origin in status_entries(repo):
+    for status, path, origin in status_entries(repo, builder_copy=builder_copy):
         lines.append(f"{status} {origin} -> {path}" if origin else f"{status} {path}")
     return "\n".join(lines)
 
 
-def require_clean(repo: Path) -> None:
-    dirty = status_porcelain(repo)
+def require_clean(repo: Path, *, builder_copy: bool = False) -> None:
+    dirty = status_porcelain(repo, builder_copy=builder_copy)
     if dirty:
         raise UsageError(f"working tree is dirty; commit or stash before proceeding:\n{dirty}")
 

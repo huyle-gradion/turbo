@@ -236,7 +236,7 @@ def _run_repair_attempt(
         stderr_path = write_evidence(repair_dir, "repair-stderr", intake.redact_value(stderr_text, secrets), paths.home)
         events, final_result, parse_error = worker_module.parse_stream_events(stdout_text)
         repair_meas = worker_module.extract_measurements(final_result, worker_ms, spec.rates)
-        new_sha, dirty_after = gitio.head(worktree_dir), gitio.status_porcelain(worktree_dir)
+        new_sha, dirty_after = gitio.head(worktree_dir), gitio.status_porcelain(worktree_dir, builder_copy=True)
         unverified_child = {**child_rec, "ci_verified": False, "verified": False, "delivery_approved": False, "candidate_sha": new_sha}
         repair_record.update(candidate_sha=new_sha, builder_exit=exit_code, duration_ms=worker_ms, stdout_path=str(stdout_path), stderr_path=str(stderr_path), measurements=repair_meas)
         if timed_out or time.monotonic() >= deadline:

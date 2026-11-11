@@ -251,7 +251,7 @@ def deliver_with_security_review(paths: RuntimePaths, spec: DeliverSecuritySpec)
             )
 
             def _after_repair(repair_wt: Path, rctx: dict[str, Any]) -> dict[str, Any]:
-                new_sha, dirty_after = gitio.head(repair_wt), gitio.status_porcelain(repair_wt)
+                new_sha, dirty_after = gitio.head(repair_wt), gitio.status_porcelain(repair_wt, builder_copy=True)
                 if not rctx["probes_ok"] or rctx["timed_out"]:
                     d_path = write_evidence(repair_dir, "repair-diff", "", paths.home)
                     return {**rctx, "new_sha": new_sha, "dirty_after": dirty_after, "diff_path": d_path,

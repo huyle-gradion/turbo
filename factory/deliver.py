@@ -803,7 +803,7 @@ def _execute_delivery(paths: RuntimePaths, spec: DeliverSpec, *, require_final_a
         if sep is not None:
             sep["implementer"] = {"conversation_id": str((final_result or {}).get("conversation_id") or "") or None}
             sep["byte_identity"] = test_author.byte_identity(worktree_dir, sep_ta_sha, candidate_sha, authored.files)
-        dirty_after = gitio.status_porcelain(worktree_dir)
+        dirty_after = gitio.status_porcelain(worktree_dir, builder_copy=True)
         cand_diff_text = (
             git_timed(worktree_dir, deadline, limit_s, "candidate diff", "diff", "--binary", base_sha, candidate_sha).output
             if candidate_sha != base_sha else ""

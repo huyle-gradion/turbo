@@ -432,7 +432,7 @@ def review_candidate_security(
                     agent_findings, parse_issues = _parse_reviewer_findings(str(f_res.get("response") or ""), candidate_sha, round_num)
                     role_issues.extend(parse_issues)
 
-        worktree_mutated = gitio.head(rev_wt) != candidate_sha or bool(gitio.status_porcelain(rev_wt))
+        worktree_mutated = gitio.head(rev_wt) != candidate_sha or bool(gitio.status_porcelain(rev_wt, builder_copy=True))
         if worktree_mutated:
             role_issues.append("security reviewer mutated the candidate worktree; reviewer cannot approve its own edits")
         if builder_session_id and reviewer_session_id and reviewer_session_id == builder_session_id:

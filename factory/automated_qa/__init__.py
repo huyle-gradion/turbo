@@ -510,7 +510,7 @@ def evaluate_child_qa(
         reg_plan, reg_checks, reg_passed = _run_regression_checks(
             worktree_dir, qa_env, child, conf, changed_paths, deleted_paths, run_check
         )
-        head_after, dirty_after = gitio.head(worktree_dir), gitio.status_porcelain(worktree_dir)
+        head_after, dirty_after = gitio.head(worktree_dir), gitio.status_porcelain(worktree_dir, builder_copy=True)
         role_separation = {
             "role": "automated-qa", "head_before": resolved_sha, "head_after": head_after,
             "worktree_clean": dirty_after == "", "candidate_modified_by_qa": head_after != resolved_sha or dirty_after != "",
