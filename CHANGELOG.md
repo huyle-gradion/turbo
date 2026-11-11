@@ -23,6 +23,7 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ### Fixed
 
+- The security and independent reviewers accept a response that is exactly one fenced JSON object and parse it as if it were sent raw (#141). Prose around the JSON, several blocks, an unterminated fence or non-object JSON are still rejected, and the reviewer prompts now ask for a single raw JSON object without markdown fences.
 - Protected-path configuration rejects padded, blank, absolute, and parent-traversing entries at both the CLI and stored-config boundaries. Command configuration rejects blank executables while preserving literal data arguments.
 - Replay reuse now requires observed provenance. A staged run re-executes an untrusted replay, while a completed run refuses it without launching a child or changing state.
 - The manifest now keeps both budget positions honest. `budget_admission` is the position at `prepare` even when declared spend rises during gates, replay, green, or verify, and `budget_current` records the position at sealing.

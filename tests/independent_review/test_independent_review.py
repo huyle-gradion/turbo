@@ -411,6 +411,27 @@ class IndependentReviewTest(unittest.TestCase):
         out_ok, _, f_ok, i_ok = independent_review._parse_phase2_response(json.dumps({"outcome": "changes-requested", "assessment": unsat, "findings": [{"category": "bug", "blocking": True, "target": "src/a.py", "rule": "null-deref", "title": "Null", "evidence": "line 9", "actionable_correction": "Guard None."}]}))
         self.assertEqual((out_ok, len(f_ok), i_ok, f_ok[0]["finding_id"]), ("changes-requested", 1, [], "REV-BUG-src-a-py-null-deref"))
 
+    def test_single_fenced_json_object_is_accepted_and_prompts_forbid_fences(self) -> None:
+        obj = {"outcome": "review-passed", "assessment": DEFAULT_ASSESSMENT, "findings": []}
+        raw = json.dumps(obj)
+        self.assertEqual(independent_review._parse_json_obj(raw, "phase-2"), (obj, []))
+        for fenced in (f"```json\n{raw}\n```", f"```\n{raw}\n```", f"  \n```json\n{raw}\n```\n  "):
+            with self.subTest(fenced=fenced):
+                self.assertEqual(independent_review._parse_json_obj(fenced, "phase-2"), (obj, []))
+                self.assertEqual(independent_review._parse_phase2_response(fenced), independent_review._parse_phase2_response(raw))
+        for bad in (f"Here it is:\n```json\n{raw}\n```", f"```json\n{raw}\n```\nDone.", f"```json\n{raw}\n```\n```json\n{raw}\n```",
+                    f"```json\n{raw}\n", f"```json\n[{raw}]\n```"):
+            with self.subTest(bad=bad):
+                parsed, issues = independent_review._parse_json_obj(bad, "phase-2")
+                self.assertIsNone(parsed)
+                self.assertRegex(issues[0], "JSON")
+        a, c = "a" * 40, "c" * 40
+        ok = {"status": "verified", "verified": True}
+        for label, prompt in (("phase-1", independent_review.build_phase1_prompt(PARSED_CHILD, a, c, "diff", [])),
+                              ("phase-2", independent_review.build_phase2_prompt(PARSED_CHILD, a, c, "diff", [], ["h"], "", ok, ok))):
+            with self.subTest(prompt=label):
+                self.assertRegex(prompt, r"(?i)without markdown fences")
+
     def test_m8_preserve_evidence_on_operational_failure(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

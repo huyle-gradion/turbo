@@ -95,7 +95,8 @@ def build_security_reviewer_prompt(
             f"Inspected scope: {', '.join(diff_info.get('changed_paths') or ()) or 'none'}\n"
             f"In scope: {scope.get('in_scope') or 'as specified'}\nOut of scope: {scope.get('out_of_scope') or 'none'}\n"
             f"Sub-task constraints: {scope.get('constraints') or 'none'}\nApplicable security policies:\n{pol_lines}\n"
-            f"Prior blocking findings:\n{prior_lines}\nRequired JSON response schema:\n{schema}\n")
+            f"Prior blocking findings:\n{prior_lines}\nRequired JSON response schema:\n{schema}\n"
+            "Respond with a single raw JSON object without markdown fences.\n")
 
 
 def _make_finding(fid: str, pol_id: str, rule: str, category: str, severity: str, blocking: bool, title: str,
@@ -147,8 +148,18 @@ def _scan_candidate_files(worktree: Path, changed_paths: list[str], candidate_sh
     return list(by_id.values())
 
 
+_FENCED_JSON = re.compile(r"```(?:json)?[ \t]*\n((?:(?!```).)*)\n[ \t]*```", re.DOTALL)
+
+
+def unfence_json(text: str) -> str:
+    """Strip the text and unwrap it when it is exactly one fenced block; otherwise return it stripped."""
+    text = (text or "").strip()
+    match = _FENCED_JSON.fullmatch(text)
+    return match.group(1).strip() if match else text
+
+
 def _parse_reviewer_findings(response_text: str, candidate_sha: str, round_num: int) -> tuple[list[dict[str, Any]], list[str]]:
-    text = (response_text or "").strip()
+    text = unfence_json(response_text)
     if not (text.startswith("{") and text.endswith("}")):
         return [], ["reviewer response must be a raw JSON object without markdown fences"]
     try:
