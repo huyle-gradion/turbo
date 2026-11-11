@@ -1,6 +1,6 @@
 """Unit and evaluation tests for the standalone independent-review role (Issue #52)."""
 from __future__ import annotations
-import dataclasses, json, sys, tempfile, time, unittest
+import dataclasses, json, os, re, subprocess, sys, tempfile, time, unittest
 from pathlib import Path
 from unittest import mock
 
@@ -219,6 +219,18 @@ class IndependentReviewTest(unittest.TestCase):
             demo_dir = root / "demo"; demo_dir.mkdir(parents=True, exist_ok=True)
             summary = run_disposable_demo(demo_dir)
             self.assertEqual((summary["valid_review"]["outcome"], summary["valid_review"]["review_verified"], summary["valid_review"]["delivery_approved"]), ("review-passed", True, False))
+
+    def test_demo_script_runs_offline_from_outside_the_clone(self) -> None:
+        """#102 AC2: scripts/demo-independent-review.sh runs the disposable demo offline, without a caller-supplied PYTHONPATH or credentials."""
+        demo_sh = ROOT / "scripts" / "demo-independent-review.sh"
+        self.assertTrue(demo_sh.is_file(), "the disposable demo is invoked through scripts/demo-independent-review.sh")
+        env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH" and not re.search(r"TOKEN|ASANA|GITHUB|_API_URL", k)}
+        with tempfile.TemporaryDirectory() as tmp:
+            proc = subprocess.run(["bash", str(demo_sh)], cwd=tmp, env=env, capture_output=True, text=True, timeout=600, check=False)
+        self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
+        self.assertEqual(proc.stdout.rstrip().splitlines()[-1], "DEMO_INDEPENDENT_REVIEW_OK")
+        summary = json.loads(proc.stdout.rstrip().rsplit("\n", 1)[0])
+        self.assertEqual((summary["valid_review"]["outcome"], summary["valid_review"]["review_verified"], summary["valid_review"]["delivery_approved"]), ("review-passed", True, False))
 
     def test_m1_automated_qa_evidence_contract_and_integration_merge(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
