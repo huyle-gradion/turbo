@@ -47,7 +47,7 @@ class _HostedQualificationFakeServer:
         }
         self.repo_perms = repo_perms if repo_perms is not None else {
             "valid-int-tok": {"admin": True, "push": True, "pull": True},
-            "valid-comp-tok": {"admin": False, "push": True, "pull": True},
+            "valid-comp-tok": {"admin": True, "push": True, "pull": True},  # #98: the competitor is admin
         }
         self.protection_status = protection_status
         def_prot = {
@@ -446,7 +446,7 @@ class QualificationSafetyAndCapabilityTest(unittest.TestCase):
         secret_int = "ghp_SECRET_INTEGRATOR_ABC_123"
         secret_comp = "ghp_SECRET_COMPETITOR_XYZ_789"
         custom_users = {secret_int: {"login": "huyhuyhuy8s"}, secret_comp: {"login": "cone-orgs"}}
-        custom_perms = {secret_int: {"admin": True, "push": True, "pull": True}, secret_comp: {"admin": False, "push": True, "pull": True}}
+        custom_perms = {secret_int: {"admin": True, "push": True, "pull": True}, secret_comp: {"admin": True, "push": True, "pull": True}}
 
         with _HostedQualificationFakeServer(users=custom_users, repo_perms=custom_perms) as gh:
             with tempfile.TemporaryDirectory() as tmp:

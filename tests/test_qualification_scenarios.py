@@ -15,8 +15,9 @@ from support import git
 from test_deliver_checks import _DisposableGitHubServer
 from test_qualification_prereqs import _GOOD_REVIEWERS, _OK, REPO, _dispatching_agy, _seeded_origin
 
-TOKENS = {"int-tok": "qual-int", "comp-tok": "qual-comp"}  # test-only accounts; the runner must take them from config
-EXPECTED_LOGINS = {"integrator": "qual-int", "competitor": "qual-comp"}
+TOKENS = {"int-tok": "qual-int", "comp-tok": "qual-comp", "read-tok": "qual-read"}  # test-only accounts; the runner must take them from config
+EXPECTED_LOGINS = {"integrator": "qual-int", "competitor": "qual-comp", "reader": "qual-read"}
+ADMINS = ("qual-int", "qual-comp")  # the competitor is admin: it lands its advance through integrate_approved_child
 LIVE_LOGINS = ("huyhuyhuy8s", "cone-orgs", "huyle-turbo")  # the live accounts #98 found hardcoded
 API, SLUG = "/api/v3", f"/api/v3/repos/{REPO}"
 
@@ -63,9 +64,9 @@ class _ProviderGitHub(_DisposableGitHubServer):
         if (method, p) == ("GET", f"{API}/user"):
             return (200, {"login": who}) if who else (401, {"message": "Bad credentials"})
         if (method, p) == ("GET", SLUG):
-            return 200, {"full_name": REPO, "permissions": {"admin": who == TOKENS["int-tok"], "push": bool(who), "pull": True}}
+            return 200, {"full_name": REPO, "permissions": {"admin": who in ADMINS, "push": who in ADMINS, "pull": True}}
         if p == f"{SLUG}/actions/permissions":
-            return (200, {"enabled": True}) if who == TOKENS["int-tok"] else (403, {"message": "Must have admin rights to Repository."})
+            return (200, {"enabled": True}) if who in ADMINS else (403, {"message": "Must have admin rights to Repository."})
         if p == f"{SLUG}/activity":
             ref = q.get("ref", "")
             ref = ref if not ref or ref.startswith("refs/") else f"refs/heads/{ref}"
@@ -240,7 +241,7 @@ class HostedScenarioRunTest(unittest.TestCase):
             gh.ci_spec = {"checks": [(r["name"], r["kind"], _OK) for r in build_required_ci_checks(seed["child-contract"], conf)]}
             yield gh, origin, agy
 
-    def _run(self, gh: _ProviderGitHub, origin: Path, agy: str) -> SimpleNamespace:
+    def _run(self, gh: _ProviderGitHub, origin: Path, agy: str, reader: str | None = "read-tok") -> SimpleNamespace:
         """One hosted run, as an operator starts it, against the fake provider; integration attempts are recorded."""
         calls: list[dict] = []
         real = qualification.integrate_approved_child
@@ -257,7 +258,7 @@ class HostedScenarioRunTest(unittest.TestCase):
             calls.append({"kw": kw, "res": res, **seen, "pr_after": json.loads(json.dumps(gh.pulls.get(kw["pr_number"], {})))})
             return res
 
-        before, q = set(gh.pulls), "factory.qualification."
+        before, n_req, q = set(gh.pulls), len(gh.requests), "factory.qualification."
         with contextlib.ExitStack() as st:
             for name, val in (("HOSTED_API_ORIGIN", gh.base_url), ("HOSTED_CLONE_URL_TEMPLATE", f"{origin}/{{repo_slug}}.git")):
                 st.enter_context(mock.patch(q + name, val))
@@ -267,9 +268,11 @@ class HostedScenarioRunTest(unittest.TestCase):
             st.enter_context(mock.patch(q + "integrate_approved_child", side_effect=integrate))
             res = qualification.run_hosted_qualification(
                 REPO, self.tmp / "ev", live_enabled=True, integrator_token="int-tok", competitor_token="comp-tok",
-                base_url=gh.base_url, expected_logins=EXPECTED_LOGINS)
+                base_url=gh.base_url, expected_logins=EXPECTED_LOGINS, reader_token=reader)
         sc = res.get("scenarios") or {}
-        return SimpleNamespace(res=res, calls=calls, created=sorted(set(gh.pulls) - before),
+        probes = [q["auth"] for q in gh.requests[n_req:] if q["path"].endswith("/actions/permissions")]
+        return SimpleNamespace(res=res, calls=calls, created=sorted(set(gh.pulls) - before), probes=probes,
+                               s2=sc.get("prereq_missing_and_denied") or {},
                                s1=sc.get("confirmed_landing") or {}, s3=sc.get("competing_base_rejection") or {},
                                s4=sc.get("renewed_verification_after_base_change") or {})
 
@@ -298,6 +301,13 @@ class HostedScenarioRunTest(unittest.TestCase):
             probe = 'pr_num = 5\nx, cand_pr_num = 1, 9\nu = f"/pulls/11"\nf(expected_login="x", pr_number=3)\ns = "' + "ab12" * 10 + '"'
             self.assertEqual(len(_literal_live_state(probe)), 6, _literal_live_state(probe))
         self.assertEqual(_literal_live_state(Path(qualification.__file__).read_text(encoding="utf-8")), [])
+        with self.subTest("the CLI passes the reader token and expected reader login through"):
+            env = {"TURBO_QUAL_INTEGRATOR_TOKEN": "int-tok", "TURBO_QUAL_COMPETITOR_TOKEN": "comp-tok", "TURBO_QUAL_READER_TOKEN": "read-tok",
+                   **{f"TURBO_QUAL_EXPECTED_{k.upper()}": v for k, v in EXPECTED_LOGINS.items()}}
+            with mock.patch.dict(os.environ, env), mock.patch("builtins.print"), \
+                    mock.patch("factory.qualification.run_hosted_qualification", return_value={"qualified": False}) as run:
+                qualification.main(["--mode", "hosted", "--evidence-dir", str(self.tmp / "cli")])
+            self.assertEqual((run.call_args.kwargs.get("reader_token"), run.call_args.kwargs.get("expected_logins")), ("read-tok", EXPECTED_LOGINS))
 
     def test_each_run_lands_rejects_and_renews_its_own_prs(self) -> None:
         """AC2-AC4 and repeatability: two runs against one origin each create, verify and land their own uniquely named
@@ -311,8 +321,13 @@ class HostedScenarioRunTest(unittest.TestCase):
             s1, s3, s4 = r.s1, r.s3, r.s4
             with self.subTest(run=i, check="identities come from configuration"):
                 ids = r.res["preflight"]["identities"]
-                self.assertEqual((ids["integrator"].get("login"), ids["competitor"].get("login")), ("qual-int", "qual-comp"))
+                self.assertEqual({k: (ids.get(k) or {}).get("login") for k in EXPECTED_LOGINS}, EXPECTED_LOGINS)
+                self.assertEqual([(ids.get(k) or {}).get(f) for k in ("competitor", "reader") for f in ("expected_role", "observed_role")],
+                                 ["admin", "admin", "read", "read"], "competitor is admin, reader is read-only")
                 self.assertEqual(r.res["preparation"]["builder"]["actor"], "qual-int", "the integrator token builds the candidate")
+            with self.subTest(run=i, check="scenario 2 permission denial is the reader's real 403"):
+                self.assertEqual(r.probes, ["Bearer read-tok"], "the permission-denial probe must use only the reader token")
+                self.assertEqual((r.s2["permission_denial"]["observed"], r.s2["permission_denial"]["status"]), (True, "HTTP 403"))
             with self.subTest(run=i, check="AC2 scenario 1 lands the PR it created"):
                 self.assertEqual(s1.get("outcome"), "verified", s1)
                 pr = gh.pulls.get(s1.get("pr_number"), {})
@@ -359,10 +374,16 @@ class HostedScenarioRunTest(unittest.TestCase):
 
     def test_force_push_in_provider_ref_history_fails_renewal(self) -> None:
         """AC4: head_merged_without_force_push is read from the provider's ref history: a force push recorded there for
-        the renewed head fails scenario 4, and the run still closes every PR it left unmerged."""
+        the renewed head fails scenario 4, and the run still closes every PR it left unmerged. The run also has no reader
+        token: the permission-denial subcheck is unavailable (never probed with another token) and the run cannot qualify."""
         with self._provider() as (gh, origin, agy):
             gh.inject_force_push = True
-            r = self._run(gh, origin, agy)
+            r = self._run(gh, origin, agy, reader=None)
+        pd = r.s2.get("permission_denial") or {}
+        self.assertEqual((r.probes, pd.get("observed"), pd.get("status")), ([], None, "unavailable"), pd)
+        self.assertNotEqual(r.s2.get("outcome"), "verified")
+        self.assertIs(r.res["qualified"], False)
+        self.assertTrue(any("reader" in b for b in r.res["blockers"]), r.res["blockers"])
         self.assertIs(r.s4.get("head_merged_without_force_push"), False, r.s4)
         self.assertEqual(r.s4.get("outcome"), "failed")
         self.assertTrue(r.created)
