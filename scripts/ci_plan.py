@@ -78,7 +78,6 @@ AREA_ORDER = ("skills", "core", "delivery", "review", "qualification")
 # so a code or test change there also runs the delivery tests.
 REVIEW_PACKAGES = tuple(f"{root}/{pkg}/" for root in ("factory", "tests")
                         for pkg in ("independent_review", "security_review", "automated_qa"))
-SMOKE_PREFIXES = ("factory/", "bin/", "scripts/", "skills/")
 
 
 def matches(path: str, pattern: str) -> bool:
@@ -134,9 +133,8 @@ def plan(repo: Path, changed: list[str], deleted: list[str], event: str, shards:
         touched.update(areas)
         if path.startswith(REVIEW_PACKAGES):
             touched.add("delivery")
-    smoke = any(p.startswith(SMOKE_PREFIXES) for p in changed)
     if not touched:
-        return {"mode": "docs-only", "reason": "documentation and examples only", "smoke": smoke, "jobs": []}
+        return {"mode": "docs-only", "reason": "documentation and examples only", "smoke": False, "jobs": []}
     jobs, seen = [], set()
     for area in AREA_ORDER:
         if area not in touched:
@@ -148,7 +146,7 @@ def plan(repo: Path, changed: list[str], deleted: list[str], event: str, shards:
     if not jobs:
         return full_plan(repo, shards, "touched areas have no test files")
     names = ", ".join(sorted(touched))
-    return {"mode": "areas", "reason": f"touched areas: {names}", "smoke": smoke, "jobs": jobs}
+    return {"mode": "areas", "reason": f"touched areas: {names}", "smoke": True, "jobs": jobs}
 
 
 def read_paths(path: str | None) -> list[str]:
