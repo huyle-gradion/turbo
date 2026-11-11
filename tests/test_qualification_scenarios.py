@@ -328,6 +328,14 @@ class HostedScenarioRunTest(unittest.TestCase):
             with self.subTest(run=i, check="scenario 2 permission denial is the reader's real 403"):
                 self.assertEqual(r.probes, ["Bearer read-tok"], "the permission-denial probe must use only the reader token")
                 self.assertEqual((r.s2["permission_denial"]["observed"], r.s2["permission_denial"]["status"]), (True, "HTTP 403"))
+            with self.subTest(run=i, check="scenario 2 own candidate passes the factory gate and is denied by provider protection"):
+                self.assertEqual(r.s2.get("outcome"), "verified", r.s2)
+                self.assertEqual((r.s2["missing_prereq_rejected"], r.s2["stale_prereq_rejected"]), (True, True))
+                pd = r.s2["protection_denial"]
+                self.assertIn(pd["pr_number"], r.created)
+                self.assertEqual((pd["status"], pd["denial_source"], pd["pr_unmerged"]), ("denied-protection", "provider", True))
+                self.assertEqual((self._attempt(r, pd["pr_number"])["res"].status, gh.pulls[pd["pr_number"]]["merged"]), ("denied-protection", False))
+                self.assertNotIn(pd["pr_number"], [n for n, _ in gh.merges])
             with self.subTest(run=i, check="AC2 scenario 1 lands the PR it created"):
                 self.assertEqual(s1.get("outcome"), "verified", s1)
                 pr = gh.pulls.get(s1.get("pr_number"), {})
@@ -338,10 +346,12 @@ class HostedScenarioRunTest(unittest.TestCase):
                 cand_pr, adv_pr = s3.get("candidate_pr_number"), s3.get("advance_pr_number")
                 self.assertTrue({cand_pr, adv_pr} <= set(r.created), (cand_pr, adv_pr, r.created))
                 att = self._attempt(r, cand_pr, base_sha=s3["initial_base_sha"])
-                self.assertIn(att["res"].status, ("rejected-competing-base", "stale-base-revision"))
+                self.assertEqual((att["res"].status, s3["denial_source"]), ("rejected-competing-base", "provider"))
                 self.assertEqual(s3["candidate_merge_status"], att["res"].status)
                 self.assertIs(att["pr_after"].get("merged"), False, "the candidate PR merged in scenario 3")
                 adv = gh.pulls[adv_pr]
+                adv_att = self._attempt(r, adv_pr, token="comp-tok")  # the advance lands through the factory boundary, not a raw merge
+                self.assertEqual((adv_att["res"].status, adv_att["kw"]["base_sha"]), ("confirmed", s3["initial_base_sha"]))
                 self.assertEqual((adv["user"]["login"], adv["merged"], adv["merge_commit_sha"]), ("qual-comp", True, s3["advanced_base_sha"]))
                 self.assertIn(("PUT", f"{SLUG}/pulls/{adv_pr}/merge", "Bearer comp-tok"),
                               [(q["method"], unquote(q["path"]), q["auth"]) for q in att["hook_requests"] or []],
@@ -389,6 +399,20 @@ class HostedScenarioRunTest(unittest.TestCase):
         self.assertTrue(r.created)
         for n in r.created:
             self.assertEqual(gh.pulls[n]["state"], "closed", f"PR {n} left open")
+
+    def test_reader_with_wrong_login_or_write_access_blocks_preflight(self) -> None:
+        """The reader behind scenario 2's 403 is pinned: a token of another login, or one with push or admin rights,
+        is a preflight blocker, so no scenario runs, nothing integrates and the permission-denial probe never fires."""
+        root = self.tmp
+        for case, patch, blocker in (("wrong login", mock.patch.dict(TOKENS, {"read-tok": "qual-other"}), "wrong-identity: reader"),
+                                     ("write access", mock.patch(f"{__name__}.ADMINS", ADMINS + ("qual-read",)), "excess-permissions: reader")):
+            self.tmp = Path(tempfile.mkdtemp(dir=root))
+            with self.subTest(case), self._provider() as (gh, origin, agy), patch, \
+                    mock.patch("factory.qualification.poll_ci_check", return_value=(False, {}, ["ci-not-polled"])):  # blocked: no 180 s wait
+                r = self._run(gh, origin, agy)
+                self.assertTrue(any(b.startswith(blocker) for b in r.res["preflight"]["blockers"]), r.res["preflight"]["blockers"])
+                self.assertEqual((r.probes, r.calls, r.res.get("scenarios") or {}, r.res["qualified"]), ([], [], {}, False))
+                self.assertEqual([gh.pulls[n]["merged"] for n in r.created], [False] * len(r.created))
 
 
 if __name__ == "__main__":
