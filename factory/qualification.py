@@ -10,6 +10,7 @@ from urllib.parse import quote
 
 from factory import ci_gate, config as config_module, deliver as deliver_module, gitio
 from factory.deliver_checks import collect_redaction_secrets, git_timed
+from factory.errors import UsageError
 from factory.independent_review import approval as approval_mod
 from factory.integration import _factory_rev, _http_req, integrate_approved_child
 from factory.paths import RuntimePaths, atomic_json, safe_dir
@@ -18,6 +19,7 @@ FACTORY_ROOT = Path(__file__).resolve().parents[1]
 SEED_ASSETS_DIR = FACTORY_ROOT / "examples" / "qualification" / "seed"
 
 HOSTED_API_ORIGIN = "https://api.github.com"
+HOSTED_CLONE_URL_TEMPLATE = "https://github.com/{repo_slug}.git"
 DISPOSABLE_REPO_ALLOWLIST = frozenset(["turbo-factory/turbo-qual-67"])
 ALLOWED_TARGET_BRANCHES = frozenset(["feature/demo"])
 CANDIDATE_BRANCH_PREFIX = "feat/qual-"
@@ -761,14 +763,14 @@ def _hosted_git(args: list[str], repo_slug: str, token: str, cwd: Path | None = 
 
 def clone_remote_repo(dest: Path, repo_slug: str, token: str) -> None:
     """Clone a hosted repository; the stored origin URL carries no credential."""
-    _hosted_git(["clone", "-q", f"https://github.com/{repo_slug}.git", str(dest)], repo_slug, token)
+    _hosted_git(["clone", "-q", HOSTED_CLONE_URL_TEMPLATE.format(repo_slug=repo_slug), str(dest)], repo_slug, token)
 
 
 def fetch_remote_repo(repo: Path, repo_slug: str, token: str) -> None:
     """Fetch remote repository heads and pull refs using ephemeral credential."""
     for attempt in range(3):
         try:
-            _hosted_git(["fetch", "-q", f"https://github.com/{repo_slug}.git", "+refs/heads/*:refs/remotes/origin/*", "+refs/pull/*:refs/remotes/origin/pr/*"], repo_slug, token, cwd=repo)
+            _hosted_git(["fetch", "-q", HOSTED_CLONE_URL_TEMPLATE.format(repo_slug=repo_slug), "+refs/heads/*:refs/remotes/origin/*", "+refs/pull/*:refs/remotes/origin/pr/*"], repo_slug, token, cwd=repo)
             return
         except RuntimeError:
             if attempt == 2: raise
@@ -976,11 +978,12 @@ def prepare_qualification_candidate(
     if pdir is None and not allow_test_origin and pr_head_sha != "unavailable":
         pdir = evidence_dir / "candidate-checkout"
         try:
+            safe_dir(pdir, create=False)  # refuse a symlinked checkout; never write through the link
             shutil.rmtree(pdir, ignore_errors=True)  # never reuse a leftover checkout
             clone_remote_repo(pdir, repo_slug, integrator_token)
             fetch_remote_repo(pdir, repo_slug, integrator_token)
             subprocess.run(["git", "checkout", "-q", "--detach", pr_head_sha], cwd=pdir, check=True, capture_output=True)
-        except (RuntimeError, subprocess.CalledProcessError) as exc:
+        except (RuntimeError, subprocess.CalledProcessError, UsageError) as exc:
             prep_blockers.append(f"candidate-checkout-failed: {exc}")
             pdir = None
     ok_qa, qa_rec, qa_blockers = _qa_on_candidate(pdir, pr_head_sha, qa_cases)
@@ -1531,6 +1534,7 @@ def hosted_scenario_context(
     reviewer records exist for a candidate.
     """
     shutil.rmtree(ws_root, ignore_errors=True)  # fresh clone and private home every run
+    safe_dir(ws_root, create=True)
     repo, home = ws_root / "live_repo", safe_dir(ws_root / "home", create=True)
     clone_remote_repo(repo, repo_slug, token)
     fetch_remote_repo(repo, repo_slug, token)
