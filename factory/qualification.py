@@ -67,8 +67,8 @@ REAL_SETUP_METADATA: dict[str, Any] = {
     "repo_slug": "turbo-factory/turbo-qual-67",
     "identities": {
         "integrator": "admin; login from TURBO_QUAL_EXPECTED_INTEGRATOR",
-        "competitor": "write collaborator; login from TURBO_QUAL_EXPECTED_COMPETITOR",
-        "restricted_reader": "read-only identity",
+        "competitor": "admin (lands its base advance through the factory); login from TURBO_QUAL_EXPECTED_COMPETITOR",
+        "restricted_reader": "read-only; login from TURBO_QUAL_EXPECTED_READER",
     },
     "tokens": {
         "type": "classic_pat",
@@ -212,6 +212,9 @@ def observe_identity_and_permissions(
     if expected_role == "write" and not perms.get("push"):
         rec = {"role": role_name, "login": observed_login, "permissions": perms, "status": "insufficient-permissions"}
         return False, rec, [f"insufficient-permissions: {role_name} requires push/write permissions on {repo_slug}"]
+    if expected_role == "read" and (perms.get("push") or perms.get("admin")):
+        rec = {"role": role_name, "login": observed_login, "permissions": perms, "status": "excess-permissions"}
+        return False, rec, [f"excess-permissions: {role_name} must be read-only on {repo_slug}"]
 
     rec = {
         "role": role_name,
@@ -1050,7 +1053,7 @@ def prepare_qualification_candidate(
     )
     ok_comp, obs_comp, comp_blockers = observe_identity_and_permissions(
         base_url, repo_slug, competitor_token, expected_login=(expected_logins or {}).get("competitor"),
-        expected_role="write", role_name="competitor", ledger=local_ledger,
+        expected_role="admin", role_name="competitor", ledger=local_ledger,
     )
     ok_prot, top_rec, prot_blockers = check_branch_protection_and_topology(
         base_url, repo_slug, integrator_token, branches=("main", target_branch), ledger=local_ledger,
@@ -1469,14 +1472,14 @@ def run_scenario_2_prereq_missing_and_denied(
     base_url: str, repo_slug: str, evidence_dir: Path, ctx: Any,
     integrator_token: str, competitor_token: str, *,
     base_branch: str = "feature/demo", ledger: QualificationLedger | None = None,
-    allow_test_origin: bool = False, run_id: str = "", opened: list[int] | None = None,
+    allow_test_origin: bool = False, run_id: str = "", opened: list[int] | None = None, reader_token: str | None = None,
 ) -> dict[str, Any]:
-    """Scenario 2: Missing/stale prereqs, protection denial (405), and permissions denial (403).
+    """Scenario 2: Missing/stale prereqs, protection denial (405), and permissions denial (403) for the read-only reader.
 
     Hosted, the run builds its own candidate whose factory prerequisites pass but which has no provider approval, so
     the factory attempts the merge and the provider's protection is what denies it."""
     sdir = safe_dir(evidence_dir / "scenarios" / "prereq_missing_and_denied", create=True)
-    tokens = [integrator_token, competitor_token]
+    tokens = [integrator_token, competitor_token, reader_token or ""]
     sc_ledger = ledger or QualificationLedger(sdir / "operation-ledger.jsonl", tokens)
     main_sha_before = _read_remote_main(base_url, repo_slug, integrator_token, sc_ledger)
     cand_sha, base_sha = ctx.cand_sha, ctx.base_sha
@@ -1519,14 +1522,18 @@ def run_scenario_2_prereq_missing_and_denied(
         pr_still_open = (pr_chk_data.get("state") == "open" and pr_chk_data.get("merged") is not True) if code_chk == 200 else None
         protection_denial_observed = (_denial_source(unapp_res) == "provider" and pr_still_open is True)
         prot_res = {"status": unapp_res.status, "blockers": unapp_res.blockers, "denial_source": _denial_source(unapp_res)}
-        perm_code, perm_data, perm_msg = _http_req("GET", f"{base_url.rstrip('/')}/repos/{repo_slug}/actions/permissions", competitor_token, base_url, [], time.monotonic() + 15.0, 15)
-        sc_ledger.record("GET", f"{base_url.rstrip('/')}/repos/{repo_slug}/actions/permissions", "competitor", perm_code, perm_msg)
-        permission_denial_observed = (perm_code == 403)
-        provider_message = perm_data.get("message") if isinstance(perm_data, dict) and isinstance(perm_data.get("message"), str) else None
-        perm_res = {"status": f"HTTP {perm_code}", "provider_message": provider_message, "blockers": [provider_message] if provider_message else []}
+        if not reader_token:  # only the read-only reader probes; no other token stands in for it
+            permission_denial_observed = None
+            perm_res = {"status": "unavailable", "blockers": ["reader-unavailable: no TURBO_QUAL_READER_TOKEN for the permission-denial probe"]}
+        else:
+            perm_code, perm_data, perm_msg = _api("GET", base_url, repo_slug, "actions/permissions", reader_token, ledger=sc_ledger, actor="reader")
+            permission_denial_observed = (perm_code == 403)
+            provider_message = perm_data.get("message") if isinstance(perm_data, dict) and isinstance(perm_data.get("message"), str) else None
+            perm_res = {"status": f"HTTP {perm_code}", "provider_message": provider_message, "blockers": [provider_message] if provider_message else []}
     main_sha_after = _read_remote_main(base_url, repo_slug, integrator_token, sc_ledger)
     main_preserved = _main_preserved(main_sha_before, main_sha_after)
-    all_passed = (missing_prereq_ok and stale_prereq_ok and protection_denial_observed and permission_denial_observed and main_preserved is True)
+    all_passed = (missing_prereq_ok and stale_prereq_ok and protection_denial_observed and permission_denial_observed is True
+                  and main_preserved is True)
     sc_data = {
         "name": "prereq_missing_and_denied", "scenario": "prereq_missing_and_denied",
         "status": "verified" if all_passed else "failed",
@@ -1794,16 +1801,17 @@ def run_hosted_qualification(
     branch: str = "feature/demo",
     allow_test_origin: bool = False,
     expected_logins: dict[str, str] | None = None,
+    reader_token: str | None = None,
 ) -> dict[str, Any]:
     """Execute hosted qualification or retain explicit blocked/unavailable status without mutation.
 
-    `expected_logins` ({"integrator", "competitor"}) is configuration; without it the observed logins are accepted,
+    `expected_logins` ({"integrator", "competitor", "reader"}) is configuration; without it the observed logins are accepted,
     recorded as unconfigured, and the run is blocked from qualifying. Each run builds its own uniquely named candidate
     branches and PRs under CANDIDATE_BRANCH_PREFIX and closes every PR it opened that is left unmerged."""
     evidence_dir = Path(evidence_dir)
     evidence_dir.mkdir(parents=True, exist_ok=True)
     f_rev = _factory_rev()
-    tokens = [integrator_token or "", competitor_token or ""]
+    tokens = [integrator_token or "", competitor_token or "", reader_token or ""]
     ledger = QualificationLedger(evidence_dir / "operation-ledger.jsonl", tokens)
 
     auth_ok, auth_msg = check_hosted_authorization(
@@ -1847,7 +1855,7 @@ def run_hosted_qualification(
     )
     ok_comp, obs_comp, comp_blockers = observe_identity_and_permissions(
         base_url, repo_slug, competitor_token, expected_login=(expected_logins or {}).get("competitor"),
-        expected_role="write", role_name="competitor", ledger=ledger,
+        expected_role="admin", role_name="competitor", ledger=ledger,
     )
 
     # 2. Both-branch protection and topology preflight
@@ -1860,15 +1868,21 @@ def run_hosted_qualification(
         base_url, repo_slug, branch, integrator_token, ledger=ledger,
     )
 
-    all_preflight_blockers = int_blockers + comp_blockers + prot_blockers + seed_blockers
-    configured = bool((expected_logins or {}).get("integrator") and (expected_logins or {}).get("competitor"))
-    id_blockers = [] if configured else [
-        "identity-expectations-unconfigured: TURBO_QUAL_EXPECTED_INTEGRATOR and TURBO_QUAL_EXPECTED_COMPETITOR are not "
-        "both set; the observed logins were used and the run cannot qualify"]
+    obs_read, read_blockers = {"role": "reader", "status": "unavailable", "reason": "missing-credentials"}, []
+    if reader_token:
+        _, obs_read, read_blockers = observe_identity_and_permissions(
+            base_url, repo_slug, reader_token, expected_login=(expected_logins or {}).get("reader"),
+            expected_role="read", role_name="reader", ledger=ledger)
+    all_preflight_blockers = int_blockers + comp_blockers + read_blockers + prot_blockers + seed_blockers
+    configured = all((expected_logins or {}).get(k) for k in ("integrator", "competitor", "reader"))
+    id_blockers = ([] if configured else [
+        "identity-expectations-unconfigured: TURBO_QUAL_EXPECTED_INTEGRATOR, _COMPETITOR and _READER are not all set; "
+        "the observed logins were used and the run cannot qualify"]) + ([] if reader_token else [
+        "reader-unavailable: no TURBO_QUAL_READER_TOKEN; the read-only reader's permission-denial probe was not run"])
     preflight_record = {
         "schema": 1, "role": "hosted-preflight-observations", "repo_slug": repo_slug,
         "base_url": base_url, "target_branch": branch,
-        "identities": {"integrator": obs_int, "competitor": obs_comp},
+        "identities": {"integrator": obs_int, "competitor": obs_comp, "reader": obs_read},
         "identity_expectations": "configured" if configured else "unconfigured",
         "topology": top_rec, "seed_capabilities": seed_rec,
         "blockers": all_preflight_blockers + id_blockers,
@@ -1936,6 +1950,7 @@ def run_hosted_qualification(
             sc2_res = run_scenario_2_prereq_missing_and_denied(
                 base_url, repo_slug, evidence_dir, ctx, integrator_token, competitor_token,
                 base_branch=branch, ledger=ledger, allow_test_origin=allow_test_origin, run_id=run_id, opened=opened,
+                reader_token=reader_token,
             )
             scenarios["prereq_missing_and_denied"] = sc2_res
 
@@ -2012,12 +2027,13 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.mode == "hosted":
             live_enabled = os.environ.get("TURBO_LIVE_QUALIFICATION") == "1"
-            tokens = [os.environ.get("TURBO_QUAL_INTEGRATOR_TOKEN") or "", os.environ.get("TURBO_QUAL_COMPETITOR_TOKEN") or ""]
-            logins = {role: os.environ.get(f"TURBO_QUAL_EXPECTED_{role.upper()}") or "" for role in ("integrator", "competitor")}
+            tokens = [os.environ.get(f"TURBO_QUAL_{r}_TOKEN") or "" for r in ("INTEGRATOR", "COMPETITOR", "READER")]
+            logins = {role: os.environ.get(f"TURBO_QUAL_EXPECTED_{role.upper()}") or "" for role in ("integrator", "competitor", "reader")}
             res = run_hosted_qualification(
                 args.repo_slug, ev_dir, live_enabled=live_enabled,
                 integrator_token=tokens[0] or None, competitor_token=tokens[1] or None,
                 base_url=args.base_url, branch=args.branch, expected_logins={k: v for k, v in logins.items() if v} or None,
+                reader_token=tokens[2] or None,
             )
             rc = 0 if res.get("qualified") else 2
     except BaseException as exc:
