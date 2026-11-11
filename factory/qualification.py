@@ -827,11 +827,15 @@ def assert_landed_landing_properties(
     return len(blockers) == 0, details, blockers
 
 
+GATED_CI_QA_LIMIT_S = 900  # preparation's CI and QA wait (#108); read at call time
+
+
 def _gated_ci_and_qa(
     ctx: Any, base_url: str, repo_slug: str, token: str, pr_data: dict[str, Any], *,
-    head_branch: str, base_branch: str, candidate_sha: str, base_sha: str, tokens: list[str], limit_s: int = 900,
+    head_branch: str, base_branch: str, candidate_sha: str, base_sha: str, tokens: list[str],
 ) -> tuple[dict[str, Any], dict[str, Any], list[str]]:
     """CI and QA evidence from the factory's own entry points for the exact candidate head (#108); nothing synthesized."""
+    limit_s = GATED_CI_QA_LIMIT_S
     child = {**ctx.child_contract, "head_branch": head_branch}
     parent = {"gid": "qualification-67", "name": "Protected repository qualification (#67)", "criteria": []}
     p = urlparse(base_url)
@@ -1321,7 +1325,7 @@ def run_scenario_1_confirmed_landing(
     code, base_c, _ = get_remote_commit(base_url, repo_slug, base_branch, integrator_token, ledger=sc_ledger)
     base_sha = base_c.get("sha", ctx.base_sha) if code == 200 else ctx.base_sha
     main_sha_before = gitio.remote_ref(ctx.repo, "main") or gitio.commit_sha(ctx.repo, "refs/heads/main")
-    sc1_child = safe_dir(ctx.home / "attempt-sc1", create=True)
+    sc1_child = ctx.child_dir  # preparation's CI and QA records live here; the delivery gate reads them (#108)
     pr_num, cand_sha = 1, ctx.cand_sha
     if not allow_test_origin:
         code_pr, pr_live, _ = _http_req("GET", f"{base_url.rstrip('/')}/repos/{repo_slug}/pulls/5", integrator_token, base_url, [], time.monotonic() + 15.0, 15)
@@ -1736,6 +1740,8 @@ def run_hosted_qualification(
         )
 
         if ctx is not None:
+            if prep_record.get("candidate_sha") not in (None, "unavailable"):
+                ctx.cand_sha = prep_record["candidate_sha"]  # the context opened before the candidate existed (#108)
             # 1. Scenario 1: Confirmed landing
             sc1_res = run_scenario_1_confirmed_landing(
                 base_url, repo_slug, evidence_dir, ctx, integrator_token, competitor_token,
