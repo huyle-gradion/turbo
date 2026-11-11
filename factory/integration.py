@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-import json, time
+import json, re, time
 from pathlib import Path
 from typing import Any, Callable
 from urllib.error import HTTPError, URLError
@@ -165,6 +165,28 @@ def _confirm_landing(
         return False, "landed-commit-not-on-base", f"landed commit {landed_sha} is not an ancestor of origin/{base_branch} ({rem_base})", None
 
     return True, "confirmed", "", landed_sha
+
+
+_PROTECTION_DENIAL_RE = re.compile(r"approving review|review is required|required status check|status checks? .*(expected|required|failing)", re.I)
+
+
+def _base_moved_after_denial(
+    *, repo: Path, eff_base_url: str, eff_token: str, repo_slug: str, pr_number: int, base_sha: str,
+    base_branch: str, trace: list[dict[str, Any]], dl: float, limit_s: int,
+) -> tuple[bool, str | None]:
+    """Re-observe the base after a 405; (moved, read error). Never infers a move it did not observe."""
+    try:
+        code, pr_data, msg = _http_req("GET", f"{eff_base_url}/repos/{repo_slug}/pulls/{pr_number}", eff_token, eff_base_url, trace, dl, limit_s)
+        pr_base = str(((pr_data or {}).get("base") or {}).get("sha") or "").strip() if code == 200 else ""
+        fetch_res = git_timed(repo, dl, limit_s, "git fetch origin", "fetch", "origin")
+        rem_base = gitio.remote_ref(repo, base_branch) if fetch_res.ok else None
+    except Exception as exc:
+        return False, f"could not re-read base after merge denial: {exc}"
+    if (pr_base and pr_base != base_sha) or (rem_base and rem_base != base_sha):
+        return True, None
+    if not pr_base or not rem_base:
+        return False, f"could not re-read base after merge denial: PR HTTP {code} {msg}; fetch {'ok' if fetch_res.ok else fetch_res.output}"
+    return False, None
 
 
 def integrate_approved_child(
@@ -490,9 +512,22 @@ def integrate_approved_child(
                     landed_sha = None
                     blockers.append(msg_conf)
         elif m_code == 405:
-            status, outcome, mut_outcome = "rejected-competing-base", "rejected", "rejected"
-            conf_status = "unconfirmed"
-            blockers.append(f"provider rejected merge: base branch was modified ({m_msg})")
+            # GitHub returns 405 for several causes; classify by the re-read base, then the message (#111).
+            outcome, mut_outcome, conf_status = "rejected", "rejected", "unconfirmed"
+            moved, read_err = _base_moved_after_denial(
+                repo=repo, eff_base_url=eff_base_url, eff_token=eff_token, repo_slug=repo_slug, pr_number=pr_number,
+                base_sha=base_sha, base_branch=base_branch, trace=trace, dl=dl, limit_s=limit_s,
+            )
+            if moved:
+                status = "rejected-competing-base"
+                blockers.append(f"provider rejected merge: base branch was modified ({m_msg})")
+            elif read_err is None and _PROTECTION_DENIAL_RE.search(m_msg or ""):
+                status, mut_outcome = "denied-protection", "denied"
+                blockers.append(f"provider denied merge by branch protection (HTTP 405): {m_msg}")
+            else:
+                status = "rejected-provider-error"
+                blockers.append(f"provider rejected merge (HTTP 405): {m_msg}")
+                if read_err: blockers.append(read_err)
         elif m_code == 409:
             status, outcome, mut_outcome = "rejected-head-mismatch", "rejected", "rejected"
             conf_status = "unconfirmed"

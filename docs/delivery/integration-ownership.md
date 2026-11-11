@@ -46,6 +46,8 @@ This document specifies the execution topology, authoritative ownership model, a
 
 - **Rejection**:
   Deterministic client-side checks or provider rejections (HTTP 400, 404, 405, 409, 422) produce explicit rejection statuses (`rejected-competing-base`, `rejected-head-mismatch`, `stale-candidate-revision`, `unsupported-protection`, etc.).
+- **Classified HTTP 405**:
+  After a 405 the base is re-read: a moved base gives `rejected-competing-base`; an unchanged base with a missing-approval or required-check message gives `denied-protection` (provider message verbatim); anything else, or a failed re-read, gives `rejected-provider-error`.
 - **Denied Permissions**:
   HTTP 401 or 403 results in `denied-permissions`.
 - **Uncertain Outcomes, Reconciliation & Recovery**:
