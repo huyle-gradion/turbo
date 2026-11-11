@@ -35,7 +35,9 @@ _FILTER_FREE = frozenset({
     "branch", "cat-file", "config", "fetch", "for-each-ref", "log", "ls-remote", "ls-tree", "merge-base",
     "push", "remote", "rev-list", "rev-parse", "show", "show-ref", "symbolic-ref", "update-ref",
 })
-_NO_PROGRAMS = (("core.fsmonitor", "false"), ("core.hooksPath", os.devnull))
+_NO_PROGRAMS = (("core.fsmonitor", "false"), ("core.hooksPath", os.devnull), ("diff.submodule", "short"),
+                ("core.alternateRefsCommand", ""))
+_BUILDER_SCOPES = frozenset({b"local", b"worktree", b"command"})
 
 
 def _config_env(base: dict[str, str], pairs: list[tuple[str, str]]) -> dict[str, str]:
@@ -45,32 +47,52 @@ def _config_env(base: dict[str, str], pairs: list[tuple[str, str]]) -> dict[str,
     return env
 
 
+def _tree_to_tree_diff(argv: list[str], sub: int) -> bool:
+    """`diff A B` or `diff A..B`: no working-tree file is read, so no clean filter can run."""
+    if argv[sub] != "diff" or "--no-index" in argv:
+        return False
+    rest = argv[sub + 1:argv.index("--")] if "--" in argv[sub + 1:] else argv[sub + 1:]
+    revs = [arg for arg in rest if not arg.startswith("-")]
+    return len(revs) == 2 or (len(revs) == 1 and ".." in revs[0])
+
+
 def _run_git(repo: Path, args: tuple[str, ...] | list[str], *, input: bytes | None = None,
              timeout: float | None = GIT_TIMEOUT, text: bool = False) -> subprocess.CompletedProcess:
     """Run host git in `repo` so that repository config cannot make it run a program (#125).
 
-    A builder controls its working copy's `.git/config` (and anything it includes), `.git/hooks`
-    and `.git/info/attributes`, and the host then runs git there. GIT_CONFIG_COUNT overrides have
-    command-line scope, beat repository config and reach child git processes: no fsmonitor, no
-    hooks, and (unless the subcommand never touches working-tree files) every configured filter
-    driver emptied so clean/smudge/process never run. diff, show and log get `--no-ext-diff
-    --no-textconv`, and replace refs are ignored. Operator-owned global
-    and system config still apply, so credential helpers keep working for push and fetch.
+    A builder controls its working copy's `.git/config` (and anything it includes), `.git/hooks`,
+    `.git/info/attributes`, `.gitmodules` and its submodules' config, and the host then runs git
+    there. GIT_CONFIG_COUNT overrides have command-line scope, beat repository config and reach
+    child git processes: no fsmonitor, no hooks, no alternate-refs command, and short submodule
+    diffs so no child diff runs in a submodule. Unless the subcommand never touches working-tree
+    files, every filter driver with a key in local, worktree or command scope is emptied so
+    clean/smudge/process never run; drivers defined only in operator global or system config (LFS)
+    keep working. diff, show and log get `--no-ext-diff --no-textconv`, and replace refs and lazy
+    fetches from a promisor remote are off, so reading a missing object fails instead of fetching.
+    `status` gets `--ignore-submodules=dirty` (a flag, because `.gitmodules` overrides config), so
+    it never runs a submodule's own filters; the trade-off is that dirty content inside a submodule
+    is not reported, though a moved gitlink still is. Operator-owned global and system config still
+    apply, so credential helpers keep working for push and fetch.
     Raises OSError or SubprocessError like `subprocess.run`.
     """
     deadline = None if timeout is None else time.monotonic() + timeout
-    env = _config_env(dict(_env(), GIT_NO_REPLACE_OBJECTS="1"), list(_NO_PROGRAMS))
+    env = _config_env(dict(_env(), GIT_NO_REPLACE_OBJECTS="1", GIT_NO_LAZY_FETCH="1"), list(_NO_PROGRAMS))
     argv = list(args)
     sub = next((i for i, arg in enumerate(argv) if not arg.startswith("-")), None)
-    drivers: list[str] = []
-    if sub is None or argv[sub] not in _FILTER_FREE or any(arg.startswith(("--filters", "--textconv")) for arg in argv):
-        listed = subprocess.run(["git", "config", "-z", "--name-only", "--get-regexp", r"^filter\."],
+    drivers: set[str] = set()
+    if (sub is None or (argv[sub] not in _FILTER_FREE and not _tree_to_tree_diff(argv, sub))
+            or any(arg.startswith(("--filters", "--textconv")) for arg in argv)):
+        listed = subprocess.run(["git", "config", "--show-scope", "-z", "--name-only", "--get-regexp", r"^filter\."],
                                 cwd=repo, capture_output=True, timeout=timeout, env=env)
-        drivers = sorted({key.decode("utf-8", "surrogateescape")[7:].rpartition(".")[0] for key in listed.stdout.split(b"\0") if key})
-    pairs = [*_NO_PROGRAMS, *((f"filter.{name}.{key}", value) for name in drivers
+        fields = listed.stdout.split(b"\0")
+        drivers = {key.decode("utf-8", "surrogateescape")[7:].rpartition(".")[0]
+                   for scope, key in zip(fields[::2], fields[1::2]) if scope in _BUILDER_SCOPES}
+    pairs = [*_NO_PROGRAMS, *((f"filter.{name}.{key}", value) for name in sorted(drivers)
               for key, value in (("clean", ""), ("smudge", ""), ("process", ""), ("required", "false")))]
     if sub is not None and argv[sub] in _NO_EXTERNAL_DIFF:
         argv[sub + 1:sub + 1] = ["--no-ext-diff", "--no-textconv"]
+    if sub is not None and argv[sub] == "status":
+        argv[sub + 1:sub + 1] = ["--ignore-submodules=dirty"]
     remaining = None if deadline is None else max(0.001, deadline - time.monotonic())
     return subprocess.run(["git", *argv], cwd=repo, input=input, capture_output=True, text=text,
                           timeout=remaining, env=_config_env(env, pairs))
