@@ -207,9 +207,15 @@ class SeedCiAndInstallTest(unittest.TestCase):
                 env_blk = blk.split("Write CI evidence", 1)[1]
                 (ev := repo / "ci-ev").mkdir(exist_ok=True)
                 (ev / "log.txt").write_text("ok\n", encoding="utf-8")
-                env = {**os.environ, "CHECK_NAME": _scalars(env_blk, "CHECK_NAME")[0], "COMMAND": "c", "EXIT_CODE": "0",
+                env = {**os.environ, "CHECK_NAME": _scalars(env_blk, "CHECK_NAME")[0], "COMMAND": "c",
                        "GITHUB_RUN_ID": "4242", "GITHUB_RUN_ATTEMPT": "1"}
-                subprocess.run([sys.executable, "-"], input=textwrap.dedent(scripts[0]), text=True, cwd=repo, env=env, check=True)
+                for code, want in (("3", (3, "failure")), ("", (1, "failure"))):
+                    subprocess.run([sys.executable, "-"], input=textwrap.dedent(scripts[0]), text=True, cwd=repo,
+                                   env={**env, "EXIT_CODE": code}, check=True)
+                    rec = json.loads((ev / "turbo-ci-evidence.json").read_text(encoding="utf-8"))["checks"][check]
+                    self.assertEqual((rec["exit_code"], rec["conclusion"]), want, f"EXIT_CODE={code!r}")
+                subprocess.run([sys.executable, "-"], input=textwrap.dedent(scripts[0]), text=True, cwd=repo,
+                               env={**env, "EXIT_CODE": "0"}, check=True)
                 manifest = json.loads((ev / "turbo-ci-evidence.json").read_text(encoding="utf-8"))
                 self.assertEqual((manifest["workflow_run_id"], manifest["run_attempt"]), (4242, 1))
                 self.assertEqual(list(manifest["checks"]), [check], "manifest key must equal check_name")
@@ -238,6 +244,7 @@ class SeedCiAndInstallTest(unittest.TestCase):
             prot = [r for r in writes if r["path"].endswith("/protection/required_status_checks")]
             self.assertEqual([r["path"].split("/branches/")[1].split("/")[0] for r in prot], ["feature%2Fdemo"])
             self.assertCountEqual(prot[0]["body"]["contexts"], self.required)
+            self.assertIs(prot[0]["body"]["strict"], True)
             self.assertFalse([r for r in gh.requests if "main" in r["path"] or (r["body"] or {}).get("base") == "main"])
         clean = {k: v for k, v in os.environ.items() if not k.startswith("TURBO_")}
         for extra in ({}, {"TURBO_QUAL_INTEGRATOR_TOKEN": "tok", "TURBO_QUAL_COMPETITOR_TOKEN": "tok2"}):
