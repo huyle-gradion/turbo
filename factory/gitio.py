@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import time
 from dataclasses import dataclass
@@ -38,6 +39,9 @@ _FILTER_FREE = frozenset({
 _NO_PROGRAMS = (("core.fsmonitor", "false"), ("core.hooksPath", os.devnull), ("diff.submodule", "short"),
                 ("core.alternateRefsCommand", ""))
 _BUILDER_SCOPES = frozenset({b"local", b"worktree", b"command"})
+# git-lfs reads its own repository-local program settings when an operator lfs filter runs (#134).
+_PROGRAM_KEYS = r"^filter\.|^lfs\.extension\..*\.(clean|smudge)$|^lfs\.customtransfer\..*\.path$|^lfs\.standalonetransferagent$"
+_OBJECT_ID = re.compile(r"[0-9a-f]{40}")
 
 
 def _config_env(base: dict[str, str], pairs: list[tuple[str, str]]) -> dict[str, str]:
@@ -48,11 +52,17 @@ def _config_env(base: dict[str, str], pairs: list[tuple[str, str]]) -> dict[str,
 
 
 def _tree_to_tree_diff(argv: list[str], sub: int) -> bool:
-    """`diff A B` or `diff A..B`: no working-tree file is read, so no clean filter can run."""
+    """`diff A B -- ...`, `diff A..B -- ...` or `diff OID OID`: no working-tree file is read, so no clean filter can run.
+
+    Without `--`, `diff REV PATH` would compare against the working tree, so only two full object IDs count.
+    """
     if argv[sub] != "diff" or "--no-index" in argv:
         return False
-    rest = argv[sub + 1:argv.index("--")] if "--" in argv[sub + 1:] else argv[sub + 1:]
+    separated = "--" in argv[sub + 1:]
+    rest = argv[sub + 1:argv.index("--")] if separated else argv[sub + 1:]
     revs = [arg for arg in rest if not arg.startswith("-")]
+    if not separated:
+        return len(revs) == 2 and all(_OBJECT_ID.fullmatch(rev) for rev in revs)
     return len(revs) == 2 or (len(revs) == 1 and ".." in revs[0])
 
 
@@ -67,28 +77,33 @@ def _run_git(repo: Path, args: tuple[str, ...] | list[str], *, input: bytes | No
     diffs so no child diff runs in a submodule. Unless the subcommand never touches working-tree
     files, every filter driver with a key in local, worktree or command scope is emptied so
     clean/smudge/process never run; drivers defined only in operator global or system config (LFS)
-    keep working. diff, show and log get `--no-ext-diff --no-textconv`, and replace refs and lazy
-    fetches from a promisor remote are off, so reading a missing object fails instead of fetching.
+    keep working. The same lookup empties git-lfs program settings in those scopes
+    (`lfs.extension.*.clean/smudge`, `lfs.customtransfer.*.path`, `lfs.standalonetransferagent`),
+    so an operator lfs filter cannot run a builder's program; git-lfs may then fail, which fails
+    closed. This git-lfs part is unverified: git-lfs was not installed where it was written (#134).
+    diff, show and log get `--no-ext-diff --no-textconv`, and replace refs and lazy fetches from a
+    promisor remote are off, so reading a missing object fails instead of fetching.
     `status` gets `--ignore-submodules=dirty` (a flag, because `.gitmodules` overrides config), so
-    it never runs a submodule's own filters; the trade-off is that dirty content inside a submodule
-    is not reported, though a moved gitlink still is. Operator-owned global and system config still
-    apply, so credential helpers keep working for push and fetch.
+    it never runs a submodule's own filters; `status_entries` instead reports every populated
+    gitlink as modified (#134). Operator-owned global and system config still apply, so
+    credential helpers keep working for push and fetch.
     Raises OSError or SubprocessError like `subprocess.run`.
     """
     deadline = None if timeout is None else time.monotonic() + timeout
     env = _config_env(dict(_env(), GIT_NO_REPLACE_OBJECTS="1", GIT_NO_LAZY_FETCH="1"), list(_NO_PROGRAMS))
     argv = list(args)
     sub = next((i for i, arg in enumerate(argv) if not arg.startswith("-")), None)
-    drivers: set[str] = set()
+    keys: set[str] = set()
     if (sub is None or (argv[sub] not in _FILTER_FREE and not _tree_to_tree_diff(argv, sub))
             or any(arg.startswith(("--filters", "--textconv")) for arg in argv)):
-        listed = subprocess.run(["git", "config", "--show-scope", "-z", "--name-only", "--get-regexp", r"^filter\."],
+        listed = subprocess.run(["git", "config", "--show-scope", "-z", "--name-only", "--get-regexp", _PROGRAM_KEYS],
                                 cwd=repo, capture_output=True, timeout=timeout, env=env)
         fields = listed.stdout.split(b"\0")
-        drivers = {key.decode("utf-8", "surrogateescape")[7:].rpartition(".")[0]
-                   for scope, key in zip(fields[::2], fields[1::2]) if scope in _BUILDER_SCOPES}
+        keys = {key.decode("utf-8", "surrogateescape") for scope, key in zip(fields[::2], fields[1::2]) if scope in _BUILDER_SCOPES}
+    drivers = {key[7:].rpartition(".")[0] for key in keys if key.startswith("filter.")}
     pairs = [*_NO_PROGRAMS, *((f"filter.{name}.{key}", value) for name in sorted(drivers)
-              for key, value in (("clean", ""), ("smudge", ""), ("process", ""), ("required", "false")))]
+              for key, value in (("clean", ""), ("smudge", ""), ("process", ""), ("required", "false"))),
+             *((key, "") for key in sorted(keys) if key.startswith("lfs."))]
     if sub is not None and argv[sub] in _NO_EXTERNAL_DIFF:
         argv[sub + 1:sub + 1] = ["--no-ext-diff", "--no-textconv"]
     if sub is not None and argv[sub] == "status":
@@ -156,7 +171,21 @@ def _nul_fields(payload: bytes) -> list[str]:
     return [field.decode("utf-8", "surrogateescape") for field in payload.split(b"\0") if field]
 
 
+def _populated_gitlinks(repo: Path) -> list[str]:
+    """Gitlink paths that hold a `.git`; the factory never populates submodules, so a builder did (#134)."""
+    code, payload = _git_bytes(repo, "ls-files", "-s", "-z")
+    if code != 0:
+        raise UsageError(f"git ls-files failed: {payload.decode('utf-8', 'replace').strip()}")
+    paths = {field.partition("\t")[2] for field in _nul_fields(payload) if field.startswith("160000 ")}
+    return sorted(path for path in paths if os.path.lexists(repo / path / ".git"))
+
+
 def status_entries(repo: Path) -> tuple[tuple[str, str, str | None], ...]:
+    """`git status` entries plus, as ` M`, each populated gitlink that status did not already list.
+
+    Status ignores dirty submodule content so that no filter of a nested repository runs, and git
+    never runs inside one here, so a nested repository counts as dirty whether or not it is.
+    """
     code, payload = _git_bytes(repo, "status", "--porcelain", "-z", "--untracked-files=all")
     if code != 0:
         raise UsageError(f"git status failed: {payload.decode('utf-8', 'replace').strip()}")
@@ -173,6 +202,8 @@ def status_entries(repo: Path) -> tuple[tuple[str, str, str | None], ...]:
         else:
             entries.append((status, entry[3:], None))
             index += 1
+    listed = {path for _, path, _ in entries}
+    entries.extend((" M", path, None) for path in _populated_gitlinks(repo) if path not in listed)
     return tuple(entries)
 
 
