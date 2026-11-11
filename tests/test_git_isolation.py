@@ -353,8 +353,7 @@ class DeliverIgnoresPlantedConfigTest(unittest.TestCase):
             self.assertIn("nest", " ".join(payload["blockers"]), payload["blockers"])
 
 
-# qualification.py is left out for now: #123 is rewriting it and its git calls move with that change.
-SCAN_EXEMPT = {"gitio.py", "qualification.py"}
+SCAN_EXEMPT = {"gitio.py"}
 
 
 class GitCallsGoThroughGitioTest(unittest.TestCase):

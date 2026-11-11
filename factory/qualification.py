@@ -710,6 +710,7 @@ def _get_list(url: str, token: str, ledger: QualificationLedger | None = None, a
             data = json.loads(resp.read().decode("utf-8", "replace"))
     except urllib.error.HTTPError as exc:
         code, msg = exc.code, str(exc)
+        exc.close()
     except Exception as exc:
         msg = str(exc)
     if ledger:
@@ -800,17 +801,21 @@ def create_qualification_candidate_commit(
 
 
 def _hosted_git(args: list[str], repo_slug: str, token: str, cwd: Path | None = None) -> None:
-    """Run git against github.com with the token passed only through the environment, never argv or .git/config."""
+    """Run hardened git against github.com with the token passed only through the environment, never argv or .git/config."""
     basic = base64.b64encode(f"x-access-token:{token}".encode()).decode()
-    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_TRACE") and k != "GIT_CURL_VERBOSE"}
-    n = int(env.get("GIT_CONFIG_COUNT", "0") or 0)  # keep caller GIT_CONFIG_* entries, append ours
-    env.update({"GIT_TERMINAL_PROMPT": "0", "GIT_CONFIG_COUNT": str(n + 1),
-                f"GIT_CONFIG_KEY_{n}": "http.https://github.com/.extraheader",
-                f"GIT_CONFIG_VALUE_{n}": f"AUTHORIZATION: basic {basic}"})
-    p = subprocess.run(["git", *args], cwd=cwd, env=env, capture_output=True, text=True, check=False)
-    if p.returncode != 0:
-        err = str(redact_qualification_tokens((p.stderr or "").strip(), [token, basic]))[-500:]
-        raise RuntimeError(f"git {args[0]} failed for {repo_slug} (exit {p.returncode}): {err}")
+    n = int(os.environ.get("GIT_CONFIG_COUNT", "0") or 0)  # keep caller GIT_CONFIG_* entries ahead of ours
+    caller = [(os.environ.get(f"GIT_CONFIG_KEY_{i}", ""), os.environ.get(f"GIT_CONFIG_VALUE_{i}", "")) for i in range(n)]
+    header = ("http.https://github.com/.extraheader", f"AUTHORIZATION: basic {basic}")
+    p = gitio.git_result(cwd, tuple(args), timeout=None, extra_config=[*caller, header])
+    if not p.ok:
+        err = str(redact_qualification_tokens(p.output, [token, basic]))[-500:]
+        raise RuntimeError(f"git {args[0]} failed for {repo_slug} (exit {p.exit}): {err}")
+
+
+def _checkout(repo: Path, *args: str) -> None:
+    result = gitio.git(repo, "checkout", "-q", *args)
+    if not result.ok:
+        raise RuntimeError(f"git checkout failed: {result.output[-500:]}")
 
 
 def clone_remote_repo(dest: Path, repo_slug: str, token: str) -> None:
@@ -1165,8 +1170,8 @@ def prepare_qualification_candidate(
                 shutil.rmtree(pdir, ignore_errors=True)  # never reuse a leftover checkout
                 clone_remote_repo(pdir, repo_slug, integrator_token)
                 fetch_remote_repo(pdir, repo_slug, integrator_token)
-                subprocess.run(["git", "checkout", "-q", "--detach", pr_head_sha], cwd=pdir, check=True, capture_output=True)
-            except (RuntimeError, subprocess.CalledProcessError, UsageError) as exc:
+                _checkout(pdir, "--detach", pr_head_sha)
+            except (RuntimeError, UsageError) as exc:
                 prep_blockers.append(f"candidate-checkout-failed: {exc}")
                 pdir = None
         ok_qa, qa_rec, qa_blockers = _qa_on_candidate(pdir, pr_head_sha, qa_cases)
@@ -1791,7 +1796,7 @@ def hosted_scenario_context(
     repo, home = ws_root / "live_repo", safe_dir(ws_root / "home", create=True)
     clone_remote_repo(repo, repo_slug, token)
     fetch_remote_repo(repo, repo_slug, token)
-    subprocess.run(["git", "checkout", "-q", "-B", branch, f"origin/{branch}"], cwd=repo, check=True, capture_output=True)
+    _checkout(repo, "-B", branch, f"origin/{branch}")
     policy = json.loads((repo / ".factory" / "policy.json").read_text(encoding="utf-8"))
     contract = repo / ".factory" / "child-contract.json"
     if not contract.is_file():

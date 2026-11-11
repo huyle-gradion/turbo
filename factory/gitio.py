@@ -7,6 +7,7 @@ import re
 import subprocess
 import time
 from dataclasses import dataclass
+from collections.abc import Sequence
 from pathlib import Path
 
 from factory.errors import UsageError
@@ -69,9 +70,9 @@ def _tree_to_tree_diff(argv: list[str], sub: int) -> bool:
     return len(revs) == 2 or (len(revs) == 1 and bool(_RANGE.fullmatch(revs[0])))
 
 
-def _run_git(repo: Path, args: tuple[str, ...] | list[str], *, input: bytes | None = None,
-             timeout: float | None = GIT_TIMEOUT, text: bool = False,
-             trust_submodules: bool = False) -> subprocess.CompletedProcess:
+def _run_git(repo: Path | None, args: tuple[str, ...] | list[str], *, input: bytes | None = None,
+             timeout: float | None = GIT_TIMEOUT, text: bool = False, trust_submodules: bool = False,
+             extra_config: Sequence[tuple[str, str]] = ()) -> subprocess.CompletedProcess:
     """Run host git in `repo` so that repository config cannot make it run a program (#125).
 
     A builder controls its working copy's `.git/config` (and anything it includes), `.git/hooks`,
@@ -92,21 +93,28 @@ def _run_git(repo: Path, args: tuple[str, ...] | list[str], *, input: bytes | No
     operator's own; by default `status_entries` reports populated gitlinks instead (#134).
     Operator-owned global and system config still apply, so credential helpers keep working for
     push and fetch.
+    `repo=None` runs with no working directory and no repository to look up, for `clone` (#131).
+    `extra_config` entries go into GIT_CONFIG_* ahead of the hardening entries, so a hardening entry
+    wins any single-valued key they share. They may carry a credential, so GIT_TRACE* and
+    GIT_CURL_VERBOSE are dropped from the environment when they are given.
     Raises OSError or SubprocessError like `subprocess.run`.
     """
     deadline = None if timeout is None else time.monotonic() + timeout
-    env = _config_env(dict(_env(), GIT_NO_REPLACE_OBJECTS="1", GIT_NO_LAZY_FETCH="1"), list(_NO_PROGRAMS))
+    base = dict(_env(), GIT_NO_REPLACE_OBJECTS="1", GIT_NO_LAZY_FETCH="1")
+    if extra_config:
+        base = {k: v for k, v in base.items() if not k.startswith("GIT_TRACE") and k != "GIT_CURL_VERBOSE"}
+    env = _config_env(base, list(_NO_PROGRAMS))
     argv = list(args)
     sub = next((i for i, arg in enumerate(argv) if not arg.startswith("-")), None)
     keys: set[str] = set()
-    if (sub is None or (argv[sub] not in _FILTER_FREE and not _tree_to_tree_diff(argv, sub))
+    if repo is not None and (sub is None or (argv[sub] not in _FILTER_FREE and not _tree_to_tree_diff(argv, sub))
             or any(arg.startswith(("--filters", "--textconv")) for arg in argv)):
         listed = subprocess.run(["git", "config", "--show-scope", "-z", "--name-only", "--get-regexp", _PROGRAM_KEYS],
                                 cwd=repo, capture_output=True, timeout=timeout, env=env)
         fields = listed.stdout.split(b"\0")
         keys = {key.decode("utf-8", "surrogateescape") for scope, key in zip(fields[::2], fields[1::2]) if scope in _BUILDER_SCOPES}
     drivers = {key[7:].rpartition(".")[0] for key in keys if key.startswith("filter.")}
-    pairs = [*_NO_PROGRAMS, *((f"filter.{name}.{key}", value) for name in sorted(drivers)
+    pairs = [*extra_config, *_NO_PROGRAMS, *((f"filter.{name}.{key}", value) for name in sorted(drivers)
               for key, value in (("clean", ""), ("smudge", ""), ("process", ""), ("required", "false"))),
              *((key, "") for key in sorted(keys) if key.startswith("lfs."))]
     if sub is not None and argv[sub] in _NO_EXTERNAL_DIFF:
@@ -118,9 +126,10 @@ def _run_git(repo: Path, args: tuple[str, ...] | list[str], *, input: bytes | No
                           timeout=remaining, env=_config_env(env, pairs))
 
 
-def git_result(repo: Path, args: tuple[str, ...], *, timeout: float | None = GIT_TIMEOUT) -> GitResult:
+def git_result(repo: Path | None, args: tuple[str, ...], *, timeout: float | None = GIT_TIMEOUT,
+               extra_config: Sequence[tuple[str, str]] = ()) -> GitResult:
     """Like `git`, but raises OSError or SubprocessError (for example TimeoutExpired) instead of returning 127."""
-    completed = _run_git(repo, args, timeout=timeout, text=True)
+    completed = _run_git(repo, args, timeout=timeout, text=True, extra_config=extra_config)
     return GitResult(("git", *args), completed.returncode, (completed.stdout + completed.stderr).strip())
 
 
