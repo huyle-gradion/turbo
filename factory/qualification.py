@@ -995,12 +995,14 @@ def prepare_qualification_candidate(
     approve: bool = True,
     expected_logins: dict[str, str] | None = None,
     builder: str = "integrator",
+    preflight_blockers: list[str] | None = None,
 ) -> dict[str, Any]:
     """Prepare genuine qualification candidate, PR, and prerequisite evidence.
 
     With `scenario_ctx` (#108), CI and QA come from the delivery chain's own entry points for the exact head. The
     `builder` role's token builds `head_branch` from `file_changes` (or reuses its open PR) and the other role approves;
-    `approve=False` stops before the operator-account approval.
+    `approve=False` stops before the operator-account approval. `preflight_blockers` observed by the caller block
+    preparation before any provider request.
     """
     evidence_dir = Path(evidence_dir)
     evidence_dir.mkdir(parents=True, exist_ok=True)
@@ -1042,6 +1044,8 @@ def prepare_qualification_candidate(
     )
     if not auth_ok:
         return _make_prep_record("blocked", "unavailable", [auth_msg])
+    if preflight_blockers:
+        return _make_prep_record("blocked", "unavailable", list(preflight_blockers))
 
     if not integrator_token or not competitor_token:
         return _make_prep_record("blocked", "unavailable", ["missing-credentials: both TURBO_QUAL_INTEGRATOR_TOKEN and TURBO_QUAL_COMPETITOR_TOKEN are required"])
@@ -1602,7 +1606,7 @@ def run_scenario_3_competing_base_rejection(
     new_base_b_prime = adv_merge.get("sha") if adv_merge.get("merged") else None
     code_c, pr_c, _ = _api("GET", base_url, repo_slug, f"pulls/{cand_pr_num}", integrator_token, ledger=sc_ledger)
     cand_unmerged = (pr_c.get("state") == "open" and pr_c.get("merged") is not True) if code_c == 200 else None
-    rejection_observed = res_cand.status in ("rejected-competing-base", "stale-base-revision") and bool(new_base_b_prime)
+    rejection_observed = res_cand.status == "rejected-competing-base" and bool(new_base_b_prime)
     main_sha_after = _read_remote_main(base_url, repo_slug, integrator_token, sc_ledger)
     main_preserved = _main_preserved(main_sha_before, main_sha_after)
     passed = (rejection_observed and cand_unmerged is True and main_preserved is True)
@@ -1932,6 +1936,7 @@ def run_hosted_qualification(
             scenario_ctx=ctx,
             file_changes=_calc_changes(f"{CANDIDATE_BRANCH_PREFIX}{run_id}-sc1"),
             expected_logins=expected_logins,
+            preflight_blockers=all_preflight_blockers,
         )
         if n := (prep_record.get("pr") or {}).get("number"): opened.append(n)
 
