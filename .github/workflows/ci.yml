@@ -130,7 +130,14 @@ jobs:
           TESTS: ${{ join(matrix.job.tests, ' ') }}
         run: |
           set -f
-          PYTHONPATH=tests:. PYTHONDONTWRITEBYTECODE=1 python3 -m unittest $TESTS -v
+          # Import as discover -s tests would (tests/pkg/test_x.py -> pkg.test_x).
+          MODULES=
+          for path in $TESTS; do
+            module=${path#tests/}
+            module=${module%.py}
+            MODULES="$MODULES ${module//\//.}"
+          done
+          PYTHONPATH=tests:. PYTHONDONTWRITEBYTECODE=1 python3 -m unittest $MODULES -v
 
   smoke:
     name: Smoke scripts
