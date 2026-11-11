@@ -44,8 +44,8 @@ jobs:
           : > "$WORK/deleted"
           PLANNER=scripts/ci_plan.py
           if [ "$EVENT" = pull_request ]; then
-            git diff --name-only "$BASE_SHA"...HEAD > "$WORK/changed"
-            git diff --diff-filter=D --name-only "$BASE_SHA"...HEAD > "$WORK/deleted"
+            git diff --no-renames --name-only "$BASE_SHA"...HEAD > "$WORK/changed"
+            git diff --no-renames --diff-filter=D --name-only "$BASE_SHA"...HEAD > "$WORK/deleted"
             mkdir "$WORK/trusted"
             git archive "$BASE_SHA" | tar -x -C "$WORK/trusted"
             if [ -f "$WORK/trusted/scripts/ci_plan.py" ]; then

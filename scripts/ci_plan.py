@@ -37,6 +37,7 @@ FULL_SUITE_TRIGGERS = (
 # directory; otherwise "*" stays within one path segment. () means docs only.
 # Test files are matched against the same table to build each area's tests.
 AREA_MAP = (
+    ("docs/security-review/", ("review",)),
     ("docs/", ()),
     ("pilot/", ()),
     ("*.md", ()),
@@ -68,6 +69,10 @@ AREA_MAP = (
     ("tests/test_*.py", ("core",)),
 )
 AREA_ORDER = ("skills", "core", "delivery", "review", "qualification")
+# Delivery code and tests import the review packages and their test helpers,
+# so a code or test change there also runs the delivery tests.
+REVIEW_PACKAGES = tuple(f"{root}/{pkg}/" for root in ("factory", "tests")
+                        for pkg in ("independent_review", "security_review", "automated_qa"))
 SMOKE_PREFIXES = ("factory/", "bin/", "scripts/", "skills/")
 
 
@@ -122,6 +127,8 @@ def plan(repo: Path, changed: list[str], deleted: list[str], event: str, shards:
         if areas is None:
             return full_plan(repo, shards, f"unmapped path: {path}")
         touched.update(areas)
+        if path.startswith(REVIEW_PACKAGES):
+            touched.add("delivery")
     smoke = any(p.startswith(SMOKE_PREFIXES) for p in changed)
     if not touched:
         return {"mode": "docs-only", "reason": "documentation and examples only", "smoke": smoke, "jobs": []}
