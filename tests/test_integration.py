@@ -113,16 +113,44 @@ class IntegrationBehaviorTest(unittest.TestCase):
                 self.assertEqual({r.status for r in results if r is not None}, {"confirmed", "rejected-competing-base"})
 
     def test_controlled_competing_base_update_at_boundary(self) -> None:
+        """A 405 is classified by the re-read base, not the message (#111)."""
+        approvals = "At least 1 approving review is required by reviewers with write access."
+        checks = 'Required status check "ci" is expected.'
+        unknown = "Synthetic unexplained 405 reason."
         with tempfile.TemporaryDirectory() as tmp_str:
             with setup_disposable_delivery_context(Path(tmp_str)) as ctx:
                 gate, b_branch = self._setup_ctx(ctx)
                 def advance_competing_base() -> None:
                     new_b = git(ctx.bare, "-c", "user.name=CI", "-c", "user.email=ci@test", "commit-tree", f"{ctx.base_sha}^{{tree}}", "-p", ctx.base_sha, "-m", "Competing SWE push")
                     git(ctx.bare, "update-ref", f"refs/heads/{b_branch}", new_b, ctx.base_sha)
-                res = self._call(ctx, gate, b_branch, on_before_merge=advance_competing_base)
-                self.assertEqual((res.status, res.outcome), ("rejected-competing-base", "rejected"))
-                self.assertFalse(ctx.gh.pulls[1]["merged"])
-                self.assertIn("base branch was modified", " ".join(res.blockers).lower())
+                # (case, forced 405 message or None for a real strict-check race, base moves, expected status)
+                cases = (
+                    ("AC1 approvals", approvals, False, "denied-protection"),
+                    ("AC1 checks", checks, False, "denied-protection"),
+                    ("AC3 unknown", unknown, False, "rejected-provider-error"),
+                    ("AC2 moved base, misleading message", approvals, True, "rejected-competing-base"),
+                    ("AC2 real race", None, True, "rejected-competing-base"),
+                )
+                for name, msg, moves, expected in cases:
+                    with self.subTest(name):
+                        git(ctx.bare, "update-ref", f"refs/heads/{b_branch}", ctx.base_sha)
+                        ctx.gh.merge_status, ctx.gh.merge_override = (405, {"message": msg}) if msg else (200, None)
+                        n_put = sum(r["method"] == "PUT" for r in ctx.gh.requests)
+                        res = self._call(ctx, gate, b_branch, on_before_merge=advance_competing_base if moves else None)
+                        self.assertEqual((res.status, res.outcome, res.landed_sha), (expected, "rejected", None))
+                        self.assertFalse(ctx.gh.pulls[1]["merged"])
+                        self.assertEqual(sum(r["method"] == "PUT" for r in ctx.gh.requests) - n_put, 1)
+                        rec = json.loads((ctx.child_dir / "integration-record.json").read_text(encoding="utf-8"))
+                        self.assertEqual(rec["status"], expected)
+                        self.assertIn(rec["mutation_outcome"], ("rejected", "denied"))  # qualification._denial_source == "provider"
+                        text = " ".join(rec["blockers"]).lower()
+                        if moves:
+                            self.assertIn("base branch was modified", text)
+                        else:
+                            self.assertTrue(any(msg in b for b in rec["blockers"]) and any(msg in b for b in res.blockers))
+                            self.assertNotIn("base branch was modified", text)
+                            self.assertNotIn("competing", text)
+                ctx.gh.merge_status, ctx.gh.merge_override = 200, None
 
     def test_changed_head_and_changed_base(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_str:
