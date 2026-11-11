@@ -402,17 +402,18 @@ class HostedScenarioRunTest(unittest.TestCase):
 
     def test_reader_with_wrong_login_or_write_access_blocks_preflight(self) -> None:
         """The reader behind scenario 2's 403 is pinned: a token of another login, or one with push or admin rights,
-        is a preflight blocker, so no scenario runs, nothing integrates and the permission-denial probe never fires."""
+        is a preflight blocker, so the run makes no provider mutation, runs no scenario and never fires the probe."""
         root = self.tmp
         for case, patch, blocker in (("wrong login", mock.patch.dict(TOKENS, {"read-tok": "qual-other"}), "wrong-identity: reader"),
                                      ("write access", mock.patch(f"{__name__}.ADMINS", ADMINS + ("qual-read",)), "excess-permissions: reader")):
             self.tmp = Path(tempfile.mkdtemp(dir=root))
-            with self.subTest(case), self._provider() as (gh, origin, agy), patch, \
-                    mock.patch("factory.qualification.poll_ci_check", return_value=(False, {}, ["ci-not-polled"])):  # blocked: no 180 s wait
+            with self.subTest(case), self._provider() as (gh, origin, agy), patch:
+                refs, n_req = dict(gh.refs), len(gh.requests)
                 r = self._run(gh, origin, agy)
+                writes = [(q["method"], unquote(q["path"])) for q in gh.requests[n_req:] if q["method"] != "GET"]
+                self.assertEqual((r.created, writes, gh.refs), ([], [], refs), "a blocked preflight mutated the provider")
                 self.assertTrue(any(b.startswith(blocker) for b in r.res["preflight"]["blockers"]), r.res["preflight"]["blockers"])
                 self.assertEqual((r.probes, r.calls, r.res.get("scenarios") or {}, r.res["qualified"]), ([], [], {}, False))
-                self.assertEqual([gh.pulls[n]["merged"] for n in r.created], [False] * len(r.created))
 
 
 if __name__ == "__main__":
