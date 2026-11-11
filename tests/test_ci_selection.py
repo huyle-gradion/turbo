@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 import re
+import subprocess
 import sys
+import textwrap
 import tempfile
 import unittest
 
@@ -215,6 +218,36 @@ class CiSelectionTest(unittest.TestCase):
         self.assertIn("feature/**", wf_text.split("\njobs:\n", 1)[0].split("pull_request:", 1)[1])
         self.assertNotIn('git checkout "$BASE_SHA"', wf_text)
         self.assertIn('git archive "$BASE_SHA"', jobs["plan"])
+        diffs = re.findall(r"git diff [^\n]*", jobs["plan"])
+        self.assertTrue(len(diffs) >= 2 and all("--no-renames" in d for d in diffs), "a rename counts as a delete")
+        self.assertTrue(any("--diff-filter=D" in d and '"$WORK/deleted"' in d for d in diffs))
+        on_error = re.search(r'if ! python3 -I "\$PLANNER".*?; then(.*?)\n\s*fi\n', jobs["plan"], re.S)
+        self.assertIn("--event push", on_error.group(1), "a planner error forces the full suite")
+        validator = textwrap.dedent(jobs["plan"].split("<<'PY'\n", 1)[1].split("\n          PY\n", 1)[0])
+        full = [t.relative_to(ROOT).as_posix() for t in (ROOT / "tests").rglob("test_*.py")]
+        for event, mode, tests, ok in (("push", "full", full, True), ("push", "full", full[1:], False),
+                                       ("push", "docs-only", [], False), ("pull_request", "docs-only", [], True)):
+            with tempfile.TemporaryDirectory() as tmp, self.subTest(validator=(event, mode, len(tests))):
+                plan_file = Path(tmp) / "plan.json"
+                jobs_out = [{"name": "shard:1", "tests": tests}] if tests else []
+                plan_file.write_text(json.dumps({"mode": mode, "jobs": jobs_out, "smoke": True}), encoding="utf-8")
+                ran = subprocess.run([sys.executable, "-I", "-", str(plan_file), event], input=validator,
+                                     cwd=ROOT, capture_output=True, text=True)
+                self.assertEqual(ran.returncode == 0, ok, ran.stderr)
+        needs = re.search(r"(?m)^    needs: \[(.*)\]$", jobs["ci"]).group(1)
+        self.assertEqual(set(needs.split(", ")), {"plan", "guards", "tests", "smoke"})
+        reads = dict(re.findall(r"(?m)^          (\w+): \$\{\{ needs\.(\w+)\.result \}\}$", jobs["ci"]))
+        self.assertEqual(set(reads.values()), {"plan", "guards", "tests", "smoke"})
+        gate = jobs["ci"].split("run: |\n", 1)[1]
+        ok_runs = ({}, {"tests": "skipped", "smoke": "skipped"})
+        bad_runs = ({"plan": "failure"}, {"plan": "skipped"}, {"guards": "failure"}, {"tests": "failure"},
+                    {"tests": "cancelled"}, {"smoke": "failure"}, {"smoke": "cancelled"})
+        for results, ok in [(r, True) for r in ok_runs] + [(r, False) for r in bad_runs]:
+            with self.subTest(aggregate=results):
+                env = {var: results.get(job, "success") for var, job in reads.items()}
+                ran = subprocess.run(["bash", "-c", gate], env={**env, "MODE": "areas", "PATH": "/usr/bin:/bin"},
+                                     capture_output=True, text=True)
+                self.assertEqual(ran.returncode == 0, ok, ran.stdout)
         fallback = re.search(r'if \[ -f "\$WORK/trusted/scripts/ci_plan\.py" \]; then\s*PLANNER="\$WORK/trusted/(.*?)"\s*else(.*?)\n\s*fi\n', jobs["plan"], re.S)
         self.assertIsNotNone(fallback, "the plan job must prefer the planner from the trusted base tree")
         self.assertEqual(fallback.group(1), "scripts/ci_plan.py")

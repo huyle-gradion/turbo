@@ -6,16 +6,17 @@ Area map pinned here (coarse; the planner owns the exact file lists):
 |-----------------------------------------------------------|-------------------------|
 | docs/**, pilot/**, root *.md, LICENSE,                    | docs-only, no tests     |
 | examples/*.example.json                                   |                         |
+| docs/security-review/** (read by test_security_review.py) | area:review             |
 | skills/**                                                 | area:skills             |
 | factory/deliver.py, integration.py, lifecycle.py,         | area:delivery           |
 | tests/test_deliver*.py, test_delivery_*.py,               |                         |
 | test_integration.py                                       |                         |
-| factory/{independent_review,security_review,               | area:review             |
-| automated_qa}/** and the matching tests/ packages         |                         |
+| factory/{independent_review,security_review,               | area:review and         |
+| automated_qa}/** and the matching tests/ packages         | area:delivery (imports) |
 | factory/qualification.py, examples/qualification/**,      | area:qualification      |
 | tests/test_qualification*.py                              |                         |
 | any other factory/*.py and its tests                      | area:core               |
-| push event, no paths, unmapped path, deleted test,        | full, N shards          |
+| push event, no paths, unmapped path, deleted tests/**.py, | full, N shards          |
 | CI or verification-chain path (.github, scripts, bin,     |                         |
 | tests/support.py, factory/ci_selection.py, factory/cli.py)|                         |
 
@@ -77,10 +78,22 @@ class CiPlanTest(unittest.TestCase):
              [], "pull_request", "docs-only", set(), False, set(), ()),
             ("docs mixed with delivery", ["docs/delivery/README.md", "factory/integration.py"], [], "pull_request",
              "areas", {"delivery"}, True, {"tests/test_integration.py"}, REVIEW_TESTS + QUAL_TESTS),
-            ("two areas", ["factory/qualification.py", "factory/independent_review/approval.py"], [], "pull_request",
-             "areas", {"qualification", "review"}, True,
-             {"tests/test_qualification_prereqs.py", "tests/independent_review/test_approval_gate.py",
-              "tests/security_review/test_security_review.py", "tests/automated_qa/test_automated_qa.py"}, ()),
+            ("two areas", ["factory/qualification.py", "factory/integration.py"], [], "pull_request",
+             "areas", {"qualification", "delivery"}, True,
+             {"tests/test_qualification_prereqs.py", "tests/test_integration.py"}, REVIEW_TESTS),
+            # Delivery code and tests import the review packages and their test helpers.
+            *((f"review path {p}", [p], [], "pull_request", "areas", {"review", "delivery"}, p.startswith("factory/"),
+               {"tests/test_deliver.py", "tests/independent_review/test_approval_gate.py",
+                "tests/security_review/test_security_review.py", "tests/automated_qa/test_automated_qa.py"}, QUAL_TESTS)
+              for p in ("factory/independent_review/approval.py", "factory/security_review/delivery.py",
+                        "factory/automated_qa/delivery.py", "factory/automated_qa/__init__.py",
+                        "tests/security_review/test_reviewer.py", "tests/independent_review/test_independent_review.py",
+                        "tests/automated_qa/test_automated_qa_eval.py")),
+            ("test read by two areas", ["skills/run-issue/SKILL.md", "factory/security_review/delivery.py"], [],
+             "pull_request", "areas", {"skills", "review", "delivery"}, True,
+             {"tests/test_bundle.py", "tests/security_review/test_security_review.py"}, ()),
+            ("docs read by a test", ["docs/security-review/README.md"], [], "pull_request", "areas", {"review"}, False,
+             {"tests/security_review/test_security_review.py"}, ()),
             ("qualification seed example", ["examples/qualification/seed/factory/child-contract.json"], [],
              "pull_request", "areas", {"qualification"}, False,
              {"tests/test_qualification.py", "tests/test_qualification_prereqs.py"}, REVIEW_TESTS),
@@ -93,7 +106,8 @@ class CiPlanTest(unittest.TestCase):
             ("push to main", [DELIVERY], [], "push", "full", None, True, set(), ()),
             ("no changed paths", [], [], "pull_request", "full", None, True, set(), ()),
             ("unmapped path", ["newdir/unknown.txt"], [], "pull_request", "full", None, True, set(), ()),
-            ("deleted test", [DELIVERY], ["tests/test_flow.py"], "pull_request", "full", None, True, set(), ()),
+            *((f"deleted {p}", [DELIVERY], [p], "pull_request", "full", None, True, set(), ())
+              for p in ("tests/test_flow.py", "tests/automated_qa/test_automated_qa_eval.py", "tests/support_deliver.py")),
             *((f"chain file {p}", [p], [], "pull_request", "full", None, True, set(), ())
               for p in (".github/workflows/ci.yml", "factory/ci_selection.py", "tests/support.py",
                         "bin/factory", "factory/cli.py", "scripts/ci_plan.py")),
@@ -114,6 +128,9 @@ class CiPlanTest(unittest.TestCase):
                 self.assertTrue(all((ROOT / t).is_file() for t in planned), planned)
                 self.assertTrue(all(j["tests"] for j in out["jobs"]), "no empty area job")
                 self.assertLessEqual(must, set(planned))
+                jobs = {j["name"]: j["tests"] for j in out["jobs"]}
+                if "area:delivery" in jobs:
+                    self.assertIn("tests/test_deliver.py", jobs["area:delivery"])
                 self.assertEqual([t for t in planned if t.startswith(must_not)] if must_not else [], [])
 
     def test_full_plan_shards_the_candidate_checkout_not_the_planner_checkout(self):
