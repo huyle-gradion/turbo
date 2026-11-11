@@ -80,11 +80,12 @@ class QualificationRealPrerequisiteTest(unittest.TestCase):
                     p.stop()
             return rec, list(gh.requests), cand_sha
 
-    def test_qualification_has_no_test_imports(self) -> None:
-        """AC1: factory/qualification.py imports no tests/support code, adds no tests/ path, and keeps only the hosted path."""
-        path = ROOT / "factory" / "qualification.py"
+    def test_factory_has_no_test_imports(self) -> None:
+        """#97/#102 AC1: no .py under factory/ imports tests/support code or adds tests/ to sys.path; qualification keeps only the hosted path."""
         offences: list[str] = []
-        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"), filename=str(path))):
+        sources = sorted((ROOT / "factory").rglob("*.py"))
+        self.assertGreater(len(sources), 10)
+        for rel, node in [(p.relative_to(ROOT), n) for p in sources for n in ast.walk(ast.parse(p.read_text(encoding="utf-8"), filename=str(p)))]:
             names: list[str] = []
             if isinstance(node, ast.Import):
                 names = [a.name for a in node.names]
@@ -93,11 +94,11 @@ class QualificationRealPrerequisiteTest(unittest.TestCase):
             elif isinstance(node, ast.Call):
                 call = ast.unparse(node)
                 if re.match(r"sys\.path\.(insert|append|extend)\(", call) and "tests" in call:
-                    offences.append(f"{node.lineno}: {call}")
+                    offences.append(f"{rel}:{node.lineno}: {call}")
                 if re.match(r"(importlib\.)?(import_module|__import__)\(", call) and re.search(r"['\"](tests|support)", call):
-                    offences.append(f"{node.lineno}: {call}")
-            offences += [f"{node.lineno}: import {n}" for n in names if n.split(".")[0] in ("tests", "support", "support_deliver")]
-        self.assertEqual(offences, [], "factory/qualification.py must not depend on test code")
+                    offences.append(f"{rel}:{node.lineno}: {call}")
+            offences += [f"{rel}:{node.lineno}: import {n}" for n in names if n.split(".")[0] in ("tests", "support", "support_deliver")]
+        self.assertEqual(offences, [], "factory/ must not depend on test code")
         self.assertFalse(hasattr(qualification, "run_offline_qualification"), "offline simulation belongs in tests/")
 
     def test_reviewer_presence_is_not_review(self) -> None:
