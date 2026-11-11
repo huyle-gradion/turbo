@@ -6,6 +6,7 @@ import ast
 import os
 from pathlib import Path
 import subprocess
+import shutil
 import tempfile
 import time
 import unittest
@@ -132,7 +133,8 @@ CASES = (
     ("core.hooksPath", CHECKOUTS),
     (".git/hooks", CHECKOUTS[:1]),
     # `diff REV PATH` without `--` compares against the working tree, so it is not tree-to-tree.
-    ("filter.clean", (STATUS, WT_DIFF, ("diff", "HEAD~1", "f.txt"))),
+    # `HEAD^{/fi..t}` is one revision (HEAD~1, by message) that contains `..` but is not a range.
+    ("filter.clean", (STATUS, WT_DIFF, ("diff", "HEAD~1", "f.txt"), ("diff", "HEAD^{/fi..t}", "--"))),
     ("filter.smudge", CHECKOUTS),
     ("filter.process", (STATUS, WT_DIFF, *CHECKOUTS)),
     ("config.worktree", (STATUS, WT_DIFF, *CHECKOUTS)),
@@ -167,8 +169,8 @@ class HostGitIgnoresPlantedConfigTest(unittest.TestCase):
                         self.assertFalse(marker.exists(), f"host git ran {marker.read_text().split() if marker.exists() else ''}")
 
     def test_dirt_inside_a_nested_repository_is_reported_without_running_its_filters(self) -> None:
-        # The factory never populates submodules, so a nested repository in a builder copy is the builder's (fail closed).
-        for declared in (True, False):  # in .gitmodules, or a bare gitlink
+        # Status is safe by default: the factory never populates submodules, so a nested repository is a builder's (fail closed).
+        for declared in (True, False, None):  # in .gitmodules, a bare gitlink, or a bare gitlink whose .git is gone
             for dirt in ("owt\n", None):  # a same-size edit, or an untracked file
                 with self.subTest(gitmodules=declared, dirt=dirt), tempfile.TemporaryDirectory(prefix="iso ") as tmp:
                     root = Path(tmp)
@@ -186,25 +188,27 @@ class HostGitIgnoresPlantedConfigTest(unittest.TestCase):
                     git(sub, "config", "filter.evil.clean", f"'{prog}' clean")
                     (Path(git(sub, "rev-parse", "--absolute-git-dir")) / "info").mkdir(exist_ok=True)
                     (Path(git(sub, "rev-parse", "--absolute-git-dir")) / "info" / "attributes").write_text("* filter=evil\n", encoding="utf-8")
+                    if declared is None:
+                        shutil.rmtree(sub / ".git")
                     (sub / ("f.txt" if dirt else "new.txt")).write_text(dirt or "new\n", encoding="utf-8")
                     future = time.time() + 100
                     os.utime(sub / "f.txt", (future, future))
-                    self.assertIn("sub", [line.split()[-1] for line in gitio.status_porcelain(repo, builder_copy=True).splitlines()])
+                    self.assertIn("sub", [line.split()[-1] for line in gitio.status_porcelain(repo).splitlines()])
                     self.assertFalse(marker.exists(), f"host git ran {marker.read_text().split() if marker.exists() else ''}")
 
     def test_an_operator_repository_reports_submodule_dirt_as_before(self) -> None:
-        # Outside builder copies a populated submodule is the operator's own: clean reads clean, dirt is reported.
+        # The operator's own repository opts in to plain status: a clean submodule reads clean, dirt is reported.
         with tempfile.TemporaryDirectory(prefix="iso ") as tmp:
             root = Path(tmp)
             repo = _repo(root)
             (root / "other").mkdir()
             git(repo, "-c", "protocol.file.allow=always", "submodule", "add", "-q", str(_repo(root / "other")), "sub")
             git(repo, "commit", "-q", "-m", "add sub")
-            self.assertEqual(gitio.status_porcelain(repo), "")
+            self.assertEqual(gitio.status_porcelain(repo, operator_repo=True), "")
             for dirt in ("f.txt", "new.txt"):  # a tracked edit, then an untracked file
                 with self.subTest(dirt=dirt):
                     (repo / "sub" / dirt).write_text("dirt\n", encoding="utf-8")
-                    self.assertIn("sub", [line.split()[-1] for line in gitio.status_porcelain(repo).splitlines()])
+                    self.assertIn("sub", [line.split()[-1] for line in gitio.status_porcelain(repo, operator_repo=True).splitlines()])
                     git(repo / "sub", "-c", "user.name=T", "-c", "user.email=t@example.test", "stash", "-q", "--include-untracked")
 
     def test_operator_global_filters_still_apply_and_local_ones_do_not(self) -> None:
@@ -327,16 +331,24 @@ class DeliverIgnoresPlantedConfigTest(unittest.TestCase):
     def test_dirt_inside_a_committed_nested_repository_stops_delivery(self) -> None:
         with tempfile.TemporaryDirectory(prefix="iso ") as tmp:
             root = Path(tmp)
+            prog, _, marker = _hostile(root)
             repo, home, bare = _make_disposable_product_workspace(root)
-            plant = (  # after its good commit, the builder commits a nested repository as a gitlink and leaves dirt inside it
-                "subprocess.run(['git', 'init', '-q', 'nest'], check=True)\n"
-                "subprocess.run(['git', '-C', 'nest', '-c', 'user.name=B', '-c', 'user.email=b@example.test', '-c', 'commit.gpgsign=false',\n"
-                "                'commit', '-q', '--allow-empty', '-m', 'nest'], check=True)\n"
+            clean = f"'{prog}' clean"
+            plant = (  # the builder commits a nested repository as a gitlink, plants a filter in it, and leaves dirt inside it
+                "import os, time\nsubprocess.run(['git', 'init', '-q', 'nest'], check=True)\n"
+                "pathlib.Path('nest/n.txt').write_text('n\\n', encoding='utf-8')\n"
+                "nest = ['git', '-C', 'nest', '-c', 'user.name=B', '-c', 'user.email=b@example.test', '-c', 'commit.gpgsign=false']\n"
+                "subprocess.run(nest + ['add', 'n.txt'], check=True)\nsubprocess.run(nest + ['commit', '-q', '-m', 'nest'], check=True)\n"
+                f"subprocess.run(nest + ['config', 'filter.evil.clean', {clean!r}], check=True)\n"
+                "pathlib.Path('nest/.git/info').mkdir(exist_ok=True)\n"
+                "pathlib.Path('nest/.git/info/attributes').write_text('* filter=evil\\n', encoding='utf-8')\n"
                 "subprocess.run(['git', 'add', 'nest'], check=True)\n"
                 "subprocess.run(['git', 'commit', '-q', '-m', 'nest'], check=True)\n"
                 "pathlib.Path('nest/hidden.txt').write_text('hidden\\n', encoding='utf-8')\n"
+                "os.utime('nest/n.txt', (time.time() + 100, time.time() + 100))\n"
             )
             res, payload = _deliver(root, repo, home, bare, plant)
+            self.assertFalse(marker.exists(), f"host git ran {marker.read_text().split() if marker.exists() else ''}")
             self.assertEqual(payload.get("status"), "uncommitted-changes", res.stdout + res.stderr)
             self.assertIn("nest", " ".join(payload["blockers"]), payload["blockers"])
 
