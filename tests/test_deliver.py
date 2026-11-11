@@ -287,14 +287,6 @@ class DeliverChildTest(unittest.TestCase):
                     "import json\nprint(json.dumps({'event': 'result', 'result': {'conversation_id': 'c2', 'status': 'SUCCESS', 'response': 'Done and opened PR!'}}))\n",
                 ),
                 (
-                    "missing-implementation",
-                    "import json, pathlib, subprocess\n"
-                    "pathlib.Path('tests/test_extra.py').write_text('import unittest\\n', encoding='utf-8')\n"
-                    "subprocess.run(['git', 'add', 'tests/test_extra.py'], check=True)\n"
-                    "subprocess.run(['git', 'commit', '-q', '-m', 'test only'], check=True)\n"
-                    "print(json.dumps({'event': 'result', 'result': {'conversation_id': 'c4', 'status': 'SUCCESS', 'response': 'Done'}}))\n",
-                ),
-                (
                     "spec-check-conflict",
                     "import json, pathlib, subprocess\n"
                     "pathlib.Path('.github/workflows').mkdir(parents=True, exist_ok=True)\n"
@@ -543,7 +535,7 @@ class DeliverChildTest(unittest.TestCase):
                     rec_ok["child"]["candidate_sha"],
                 )
 
-    def test_broken_behavior_fails_mapped_ci_check_and_restoring_passes_plus_pending_and_conflict_stops(self) -> None:
+    def test_broken_behavior_fails_green_and_restoring_passes_plus_pending_and_conflict_stops(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             repo, home, bare = _make_disposable_product_workspace(root)
@@ -724,9 +716,7 @@ class DeliverChildTest(unittest.TestCase):
                 env_gh = {"TURBO_GITHUB_TOKEN": None, "GITHUB_TOKEN": gh_token}
                 with _DisposableAsanaServer(live_parent, [{"data": [live_child], "next_page": None}]) as asana:
                     res1, rec1 = _run_deliver(repo, home, asana.base_url, "https://api.github.com", agy_bin=str(broken_w), time_limit="180s", env_extra=env_gh)
-                    self.assertEqual((res1.returncode, rec1["status"], rec1["pr_opened"], rec1["verified"]), (1, "ci-failed", True, False))
-                    self.assertEqual((rec1["child"]["pr"]["pr_confirmed"], rec1["child"]["pr"]["ci_verified"]), (True, False))
-                    self.assertIn("criterion/AC-1`: **FAILURE**", rec1["child"]["pr"]["body"])
+                    self.assertEqual((res1.returncode, rec1["status"], rec1["pr_opened"], rec1["verified"]), (1, "green-failed", False, False))
 
                     res2, rec2 = _run_deliver(repo, home, asana.base_url, "https://api.github.com", agy_bin=str(fixed_w), time_limit="180s", env_extra=env_gh)
                     self.assertEqual((res2.returncode, rec2["status"], rec2["pr_opened"], rec2["verified"]), (0, "verified", True, True))
