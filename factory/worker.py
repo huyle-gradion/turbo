@@ -139,15 +139,13 @@ def _git_checkout_step(cwd: Path, deadline: float | None, *args: str) -> str:
     timeout_s = None if deadline is None else max(0.0, deadline - time.monotonic())
     if timeout_s is not None and timeout_s <= 0:
         raise TimeoutError("isolated git checkout timed out")
-    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_SYSTEM": "/dev/null"}
     try:
-        proc = subprocess.run(["git", "-C", str(cwd), *args], capture_output=True, text=True, check=False, shell=False, env=env, timeout=timeout_s)
+        result = gitio.git_result(cwd, args, timeout=timeout_s)
     except subprocess.TimeoutExpired as exc:
         raise TimeoutError("isolated git checkout timed out") from exc
-    out = (proc.stdout + proc.stderr).strip()
-    if proc.returncode != 0:
-        raise UsageError(f"cannot prepare isolated git checkout ({' '.join(args)}): {out}")
-    return out
+    if not result.ok:
+        raise UsageError(f"cannot prepare isolated git checkout ({' '.join(args)}): {result.output}")
+    return result.output
 
 
 def prepare_isolated_git_checkout(source_repo: Path, worktree_dir: Path, base_ref: str = "HEAD", *, deadline: float | None = None) -> str:

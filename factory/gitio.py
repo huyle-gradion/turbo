@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -27,22 +28,61 @@ def _env() -> dict[str, str]:
     return dict(os.environ, GIT_TERMINAL_PROMPT="0", PYTHONDONTWRITEBYTECODE="1")
 
 
+_NO_EXTERNAL_DIFF = frozenset({"diff", "show", "log"})
+_NO_PROGRAMS = (("core.fsmonitor", "false"), ("core.hooksPath", os.devnull))
+
+
+def _config_env(base: dict[str, str], pairs: list[tuple[str, str]]) -> dict[str, str]:
+    env = dict(base, GIT_CONFIG_COUNT=str(len(pairs)))
+    for index, (key, value) in enumerate(pairs):
+        env[f"GIT_CONFIG_KEY_{index}"], env[f"GIT_CONFIG_VALUE_{index}"] = key, value
+    return env
+
+
+def _run_git(repo: Path, args: tuple[str, ...] | list[str], *, input: bytes | None = None,
+             timeout: float | None = GIT_TIMEOUT, text: bool = False) -> subprocess.CompletedProcess:
+    """Run host git in `repo` so that repository config cannot make it run a program (#125).
+
+    A builder controls its working copy's `.git/config` (and anything it includes), `.git/hooks`
+    and `.git/info/attributes`, and the host then runs git there. GIT_CONFIG_COUNT overrides have
+    command-line scope, beat repository config and reach child git processes: no fsmonitor, no
+    hooks, and every configured filter driver emptied so clean/smudge/process never run. diff, show
+    and log get `--no-ext-diff --no-textconv`, and replace refs are ignored. Operator-owned global
+    and system config still apply, so credential helpers keep working for push and fetch.
+    Raises OSError or SubprocessError like `subprocess.run`.
+    """
+    deadline = None if timeout is None else time.monotonic() + timeout
+    env = _config_env(dict(_env(), GIT_NO_REPLACE_OBJECTS="1"), list(_NO_PROGRAMS))
+    listed = subprocess.run(["git", "config", "-z", "--name-only", "--get-regexp", r"^filter\."],
+                            cwd=repo, capture_output=True, timeout=timeout, env=env)
+    drivers = sorted({key.decode("utf-8", "surrogateescape")[7:].rpartition(".")[0] for key in listed.stdout.split(b"\0") if key})
+    pairs = [*_NO_PROGRAMS, *((f"filter.{name}.{key}", value) for name in drivers
+              for key, value in (("clean", ""), ("smudge", ""), ("process", ""), ("required", "false")))]
+    argv = list(args)
+    sub = next((i for i, arg in enumerate(argv) if not arg.startswith("-")), None)
+    if sub is not None and argv[sub] in _NO_EXTERNAL_DIFF:
+        argv[sub + 1:sub + 1] = ["--no-ext-diff", "--no-textconv"]
+    remaining = None if deadline is None else max(0.001, deadline - time.monotonic())
+    return subprocess.run(["git", *argv], cwd=repo, input=input, capture_output=True, text=text,
+                          timeout=remaining, env=_config_env(env, pairs))
+
+
+def git_result(repo: Path, args: tuple[str, ...], *, timeout: float | None = GIT_TIMEOUT) -> GitResult:
+    """Like `git`, but raises OSError or SubprocessError (for example TimeoutExpired) instead of returning 127."""
+    completed = _run_git(repo, args, timeout=timeout, text=True)
+    return GitResult(("git", *args), completed.returncode, (completed.stdout + completed.stderr).strip())
+
+
 def git(repo: Path, *args: str) -> GitResult:
-    argv = ("git", *args)
     try:
-        completed = subprocess.run(
-            list(argv), cwd=repo, capture_output=True, text=True, timeout=GIT_TIMEOUT, env=_env()
-        )
+        return git_result(repo, args)
     except (OSError, subprocess.SubprocessError) as exc:
-        return GitResult(argv, 127, str(exc))
-    return GitResult(argv, completed.returncode, (completed.stdout + completed.stderr).strip())
+        return GitResult(("git", *args), 127, str(exc))
 
 
-def _git_bytes(repo: Path, *args: str) -> tuple[int, bytes]:
+def _git_bytes(repo: Path, *args: str, input: bytes | None = None, timeout: float | None = GIT_TIMEOUT) -> tuple[int, bytes]:
     try:
-        completed = subprocess.run(
-            ["git", *args], cwd=repo, capture_output=True, timeout=GIT_TIMEOUT, env=_env()
-        )
+        completed = _run_git(repo, args, input=input, timeout=timeout)
     except (OSError, subprocess.SubprocessError) as exc:
         raise UsageError(f"git {' '.join(args)} failed: {exc}") from exc
     return completed.returncode, completed.stdout
@@ -130,16 +170,10 @@ def is_ancestor(repo: Path, ancestor: str, descendant: str) -> bool:
 
 
 def file_at_head(repo: Path, relative: str) -> bytes:
-    result = subprocess.run(
-        ["git", "show", f"HEAD:{relative}"],
-        cwd=repo,
-        capture_output=True,
-        timeout=GIT_TIMEOUT,
-        env=_env(),
-    )
-    if result.returncode != 0:
+    code, payload = _git_bytes(repo, "show", f"HEAD:{relative}")
+    if code != 0:
         raise UsageError(f"{relative} is not committed at HEAD")
-    return result.stdout
+    return payload
 
 
 def branch_exists(repo: Path, name: str) -> bool:

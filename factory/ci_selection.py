@@ -10,7 +10,7 @@ import sys
 import tempfile
 from typing import Any
 
-from factory import config as config_module
+from factory import config as config_module, gitio
 from factory.deliver_checks import (
     _matches_path_rule,
     _verification_argv,
@@ -362,28 +362,18 @@ def detect_spec_check_conflicts(
 
 
 def run_trusted_base_selection(repo: Path, base_sha: str, head_ref: str = "HEAD") -> dict[str, Any]:
-    changed_out = subprocess.run(
-        ["git", "-C", str(repo), "diff", "--name-only", f"{base_sha}...{head_ref}"],
-        capture_output=True,
-        text=True,
-        check=True,
-    ).stdout
-    deleted_out = subprocess.run(
-        ["git", "-C", str(repo), "diff", "--diff-filter=D", "--name-only", f"{base_sha}...{head_ref}"],
-        capture_output=True,
-        text=True,
-        check=True,
-    ).stdout
+    def read(*args: str) -> str:
+        done = gitio._run_git(repo, args, timeout=None, text=True)
+        done.check_returncode()
+        return done.stdout
+
+    changed_out = read("diff", "--name-only", f"{base_sha}...{head_ref}")
+    deleted_out = read("diff", "--diff-filter=D", "--name-only", f"{base_sha}...{head_ref}")
     with tempfile.TemporaryDirectory() as trusted_tmp:
-        archive = subprocess.Popen(
-            ["git", "-C", str(repo), "archive", base_sha],
-            stdout=subprocess.PIPE,
-        )
-        subprocess.run(["tar", "-x", "-C", trusted_tmp], stdin=archive.stdout, check=True)
-        if archive.stdout is not None:
-            archive.stdout.close()
-        if archive.wait() != 0:
+        archive = gitio._run_git(repo, ("archive", base_sha), timeout=None)
+        if archive.returncode != 0:
             raise RuntimeError(f"git archive failed for {base_sha}")
+        subprocess.run(["tar", "-x", "-C", trusted_tmp], input=archive.stdout, check=True)
         selector_file = Path(trusted_tmp) / "factory" / "ci_selection.py"
         if not selector_file.is_file():
             return select_ci_test_plan(
