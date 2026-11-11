@@ -29,6 +29,12 @@ def _env() -> dict[str, str]:
 
 
 _NO_EXTERNAL_DIFF = frozenset({"diff", "show", "log"})
+# Subcommands that never read or write working-tree files, so no clean/smudge filter can run.
+# Every other subcommand pays one `git config` lookup to empty the configured filter drivers.
+_FILTER_FREE = frozenset({
+    "branch", "cat-file", "config", "fetch", "for-each-ref", "log", "ls-remote", "ls-tree", "merge-base",
+    "push", "remote", "rev-list", "rev-parse", "show", "show-ref", "symbolic-ref", "update-ref",
+})
 _NO_PROGRAMS = (("core.fsmonitor", "false"), ("core.hooksPath", os.devnull))
 
 
@@ -46,20 +52,23 @@ def _run_git(repo: Path, args: tuple[str, ...] | list[str], *, input: bytes | No
     A builder controls its working copy's `.git/config` (and anything it includes), `.git/hooks`
     and `.git/info/attributes`, and the host then runs git there. GIT_CONFIG_COUNT overrides have
     command-line scope, beat repository config and reach child git processes: no fsmonitor, no
-    hooks, and every configured filter driver emptied so clean/smudge/process never run. diff, show
-    and log get `--no-ext-diff --no-textconv`, and replace refs are ignored. Operator-owned global
+    hooks, and (unless the subcommand never touches working-tree files) every configured filter
+    driver emptied so clean/smudge/process never run. diff, show and log get `--no-ext-diff
+    --no-textconv`, and replace refs are ignored. Operator-owned global
     and system config still apply, so credential helpers keep working for push and fetch.
     Raises OSError or SubprocessError like `subprocess.run`.
     """
     deadline = None if timeout is None else time.monotonic() + timeout
     env = _config_env(dict(_env(), GIT_NO_REPLACE_OBJECTS="1"), list(_NO_PROGRAMS))
-    listed = subprocess.run(["git", "config", "-z", "--name-only", "--get-regexp", r"^filter\."],
-                            cwd=repo, capture_output=True, timeout=timeout, env=env)
-    drivers = sorted({key.decode("utf-8", "surrogateescape")[7:].rpartition(".")[0] for key in listed.stdout.split(b"\0") if key})
-    pairs = [*_NO_PROGRAMS, *((f"filter.{name}.{key}", value) for name in drivers
-              for key, value in (("clean", ""), ("smudge", ""), ("process", ""), ("required", "false")))]
     argv = list(args)
     sub = next((i for i, arg in enumerate(argv) if not arg.startswith("-")), None)
+    drivers: list[str] = []
+    if sub is None or argv[sub] not in _FILTER_FREE or any(arg.startswith(("--filters", "--textconv")) for arg in argv):
+        listed = subprocess.run(["git", "config", "-z", "--name-only", "--get-regexp", r"^filter\."],
+                                cwd=repo, capture_output=True, timeout=timeout, env=env)
+        drivers = sorted({key.decode("utf-8", "surrogateescape")[7:].rpartition(".")[0] for key in listed.stdout.split(b"\0") if key})
+    pairs = [*_NO_PROGRAMS, *((f"filter.{name}.{key}", value) for name in drivers
+              for key, value in (("clean", ""), ("smudge", ""), ("process", ""), ("required", "false")))]
     if sub is not None and argv[sub] in _NO_EXTERNAL_DIFF:
         argv[sub + 1:sub + 1] = ["--no-ext-diff", "--no-textconv"]
     remaining = None if deadline is None else max(0.001, deadline - time.monotonic())
