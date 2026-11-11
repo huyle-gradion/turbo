@@ -1,4 +1,4 @@
-"""CLI entry point for python3 -m factory.independent_review --demo."""
+"""CLI entry point for python3 -m factory.independent_review (the disposable demo is scripts/demo-independent-review.sh)."""
 
 from __future__ import annotations
 

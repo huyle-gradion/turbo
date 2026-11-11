@@ -783,23 +783,12 @@ def review_candidate_independently(*, repo: Path, home: Path, child_dir: Path, c
     finally:
         shutil.rmtree(worktree, ignore_errors=True)
 
-def run_disposable_demo(tmp: Path) -> dict[str, Any]:
-    from tests.independent_review.test_independent_review import run_disposable_demo as _run_demo
-    return _run_demo(tmp)
-
 def main(argv: list[str] | None = None) -> int:
-    import argparse, tempfile
-    p = argparse.ArgumentParser(prog="python3 -m factory.independent_review", description="Standalone independent reviewer role demo (#52).")
-    p.add_argument("--demo", action="store_true", help="Run disposable independent-review demonstration.")
-    p.add_argument("--evidence-dir", type=Path, default=None, help="Optional directory to retain demo evidence.")
-    args = p.parse_args(argv)
-    if not args.demo: p.error("standalone independent-review slice (#52) supports --demo; delivery approval gate is #53")
-    if args.evidence_dir is not None:
-        args.evidence_dir.mkdir(parents=True, exist_ok=True); summary = run_disposable_demo(args.evidence_dir)
-    else:
-        with tempfile.TemporaryDirectory() as tmp: summary = run_disposable_demo(Path(tmp))
-    print(json.dumps(summary, indent=2, sort_keys=True)); print("DEMO_INDEPENDENT_REVIEW_OK")
-    return 0
+    import argparse
+    p = argparse.ArgumentParser(prog="python3 -m factory.independent_review", description="Standalone independent reviewer role (#52). The disposable demo is scripts/demo-independent-review.sh.")
+    p.parse_args(argv)
+    p.error("no standalone command; run the disposable demo with scripts/demo-independent-review.sh (#102)")
+    return 2
 
 
 from factory.independent_review.approval import (  # noqa: E402

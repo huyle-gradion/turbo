@@ -21,6 +21,10 @@ All notable changes to this project are documented here. The format follows [Kee
 - The manifest now keeps both budget positions honest. `budget_admission` is the position at `prepare` even when declared spend rises during gates, replay, green, or verify, and `budget_current` records the position at sealing.
 - `manifest` now refuses to seal or revalidate when the repository moved after green. The working tree must be clean, the branch and HEAD must match the recorded green commit, and the red test blob at HEAD must be unchanged.
 
+### Removed
+
+- `python3 -m factory.independent_review --demo` and its `--evidence-dir` option. The disposable independent-review demo now runs through `scripts/demo-independent-review.sh`, so no code under `factory/` imports the test suite (#102).
+
 ### Notes
 
 - The predecessor line is `0.1.0`, private historical code that was never tagged or published. It has no release date in this changelog.
