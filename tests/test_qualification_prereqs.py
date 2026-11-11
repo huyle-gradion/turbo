@@ -164,6 +164,7 @@ class QualificationRealPrerequisiteTest(unittest.TestCase):
         gates: list[tuple[dict, dict]] = []
         target: list[str] = []
         ctx_dirs: list[Path] = []  # the scenario context's child folder, as opened
+        head = [HEAD_BRANCH]  # the candidate branch preparation looked up
         calls: list[tuple[str, dict]] = []  # wrapped entry-point calls and review submissions, in order
         agy = _dispatching_agy(case, *reviewers) if reviewers else None
 
@@ -195,8 +196,10 @@ class QualificationRealPrerequisiteTest(unittest.TestCase):
                 gh.ci_spec = {"checks": checks}
                 yield ctx
 
-        def _pulls(*_a: object, **_kw: object) -> list[dict]:  # preparation creates the candidate after the clone
-            git(bare, "update-ref", f"refs/heads/{HEAD_BRANCH}", cand)
+        def _pulls(_url: str, _slug: str, head_branch: str, *_a: object, **_kw: object) -> list[dict]:
+            # preparation creates the candidate after the clone, on the per-run branch it names (#98)
+            head[0] = pr["head"]["ref"] = gh.pulls[1]["head"]["ref"] = head_branch
+            git(bare, "update-ref", f"refs/heads/{head_branch}", cand)
             return [copy.deepcopy(pr)]
 
         sig = inspect.signature(qualification.submit_qualification_pr_review)
@@ -206,10 +209,10 @@ class QualificationRealPrerequisiteTest(unittest.TestCase):
             return 200, {"id": 77}, ""
 
         def _advance(_pr: dict) -> None:  # the head branch moves while CI evidence is being recorded
-            if git(bare, "rev-parse", f"refs/heads/{HEAD_BRANCH}") == cand:
+            if git(bare, "rev-parse", f"refs/heads/{head[0]}") == cand:
                 moved = git(bare, "-c", "user.name=t", "-c", "user.email=t@example.test", "commit-tree",
                             f"{cand}^{{tree}}", "-p", cand, "-m", "moved")
-                git(bare, "update-ref", f"refs/heads/{HEAD_BRANCH}", moved)
+                git(bare, "update-ref", f"refs/heads/{head[0]}", moved)
 
         real_gate = qualification.deliver_module.enforce_delivery_approval
 

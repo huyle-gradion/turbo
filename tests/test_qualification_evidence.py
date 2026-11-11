@@ -250,8 +250,8 @@ class ProviderObservationTest(unittest.TestCase):
     def test_main_preserved_compares_provider_main_before_and_after(self) -> None:
         """AC3: a provider whose `main` moves during the scenario yields main_preserved false."""
         real_http = qualification._http_req
-        for label, provider in (("prereq_missing_and_denied", "moves"), ("competing_base_rejection", "moves"),
-                                ("prereq_missing_and_denied", "read-fails")):
+        # Scenario 3's main before/after now runs inside a full hosted run (#98, test_qualification_scenarios).
+        for label, provider in (("prereq_missing_and_denied", "moves"), ("prereq_missing_and_denied", "read-fails")):
             reads: list[str] = []
 
             def moving_main(method, url, *a, provider=provider, reads=reads, **k):
@@ -268,10 +268,7 @@ class ProviderObservationTest(unittest.TestCase):
             ev = self._tmp / f"ev-ac3-{label}-{provider}"
             with self.subTest(label, provider=provider), mock.patch("factory.qualification._http_req", moving_main):
                 args = (self.ctx.gh.base_url, SLUG, ev, self.ctx, "disp-tok", "comp-tok")
-                if label == "prereq_missing_and_denied":
-                    sc = qualification.run_scenario_2_prereq_missing_and_denied(*args, allow_test_origin=True)
-                else:
-                    sc = qualification.run_scenario_3_competing_base_rejection(*args, allow_test_origin=True)[0]
+                sc = qualification.run_scenario_2_prereq_missing_and_denied(*args, allow_test_origin=True)
                 self.assertGreaterEqual(len(reads), 2, "remote main was not read from the provider before and after")
                 self.assertIs(sc["main_preserved"], None if provider == "read-fails" else False)
                 self.assertEqual(sc["outcome"], "failed")

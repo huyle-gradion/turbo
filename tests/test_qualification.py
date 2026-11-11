@@ -20,10 +20,11 @@ from factory.qualification import (
     prepare_qualification_candidate, reduce_evidence_index,
     resolve_agy_bin,
     run_hosted_qualification,
-    run_scenario_1_confirmed_landing, run_scenario_2_prereq_missing_and_denied,
-    run_scenario_3_competing_base_rejection, run_scenario_4_renewed_verification_after_base_change,
     submit_qualification_pr_review, verify_qualification_pr_review,
 )
+
+# #98: expected identities are configuration, not runner literals.
+LIVE_SETUP_LOGINS = {"integrator": "huyhuyhuy8s", "competitor": "cone-orgs"}
 
 
 class _HostedQualificationFakeServer:
@@ -46,7 +47,7 @@ class _HostedQualificationFakeServer:
         }
         self.repo_perms = repo_perms if repo_perms is not None else {
             "valid-int-tok": {"admin": True, "push": True, "pull": True},
-            "valid-comp-tok": {"admin": False, "push": True, "pull": True},
+            "valid-comp-tok": {"admin": True, "push": True, "pull": True},  # #98: the competitor is admin
         }
         self.protection_status = protection_status
         def_prot = {
@@ -320,7 +321,7 @@ class QualificationSafetyAndCapabilityTest(unittest.TestCase):
                 res = run_hosted_qualification(
                     "turbo-factory/turbo-qual-67", ev_dir, live_enabled=True,
                     integrator_token="int-tok", competitor_token="comp-tok",
-                    base_url=gh.base_url, allow_test_origin=True,
+                    base_url=gh.base_url, allow_test_origin=True, expected_logins=LIVE_SETUP_LOGINS,
                 )
                 self.assertFalse(res["qualified"])
                 self.assertEqual(res["status"], "blocked")
@@ -333,7 +334,7 @@ class QualificationSafetyAndCapabilityTest(unittest.TestCase):
                 res = run_hosted_qualification(
                     "turbo-factory/turbo-qual-67", ev_dir, live_enabled=True,
                     integrator_token="int-tok", competitor_token="comp-tok",
-                    base_url=gh.base_url, allow_test_origin=True,
+                    base_url=gh.base_url, allow_test_origin=True, expected_logins=LIVE_SETUP_LOGINS,
                 )
                 self.assertFalse(res["qualified"])
                 self.assertTrue(any("wrong-identity" in b for b in res["blockers"]))
@@ -445,7 +446,7 @@ class QualificationSafetyAndCapabilityTest(unittest.TestCase):
         secret_int = "ghp_SECRET_INTEGRATOR_ABC_123"
         secret_comp = "ghp_SECRET_COMPETITOR_XYZ_789"
         custom_users = {secret_int: {"login": "huyhuyhuy8s"}, secret_comp: {"login": "cone-orgs"}}
-        custom_perms = {secret_int: {"admin": True, "push": True, "pull": True}, secret_comp: {"admin": False, "push": True, "pull": True}}
+        custom_perms = {secret_int: {"admin": True, "push": True, "pull": True}, secret_comp: {"admin": True, "push": True, "pull": True}}
 
         with _HostedQualificationFakeServer(users=custom_users, repo_perms=custom_perms) as gh:
             with tempfile.TemporaryDirectory() as tmp:
@@ -669,66 +670,7 @@ class QualificationCandidatePreparationTest(unittest.TestCase):
                         self.assertEqual(rec["prerequisites"]["security"]["status"], "unavailable")
                         self.assertEqual(rec["prerequisites"]["independent_review"]["status"], "unavailable")
                     self.assertEqual(rec["builder"]["kind"], "deterministic-qualification-process")
-                    self.assertEqual(rec["builder"]["actor"], "cone-orgs")
                     self.assertTrue((ev_dir / "candidate-preparation.json").exists())
-
-
-class HostedScenariosExecutionTest(unittest.TestCase):
-    def test_hosted_scenarios_simulated_execution(self) -> None:
-        """Verify scenario runners 1-4, boundary coordination, and renewal flows."""
-        from support_deliver import setup_disposable_delivery_context
-
-        with _HostedQualificationFakeServer() as gh:
-            with tempfile.TemporaryDirectory() as tmp:
-                ev_dir = Path(tmp) / "ev"
-                ws = ev_dir / "ws"
-                ws.mkdir(parents=True)
-                with setup_disposable_delivery_context(ws) as ctx:
-                    from support import git
-                    git(ctx.bare, "update-ref", "refs/heads/feature/demo", ctx.base_sha)
-                    gh.branch_heads = {
-                        "feat/qual-candidate-101": ctx.cand_sha,
-                        "feat/qual-unapp-sc2-r2": ctx.cand_sha,
-                        "feat/qual-cand-sc3-r2": ctx.cand_sha,
-                        "feat/qual-adv-sc3-r2": ctx.cand_sha,
-                        "feat/qual-cand-sc3-r3": ctx.cand_sha,
-                        "feat/qual-adv-sc3-r3": ctx.cand_sha,
-                        "feature/demo": ctx.base_sha,
-                    }
-                    # Scenario 1: Confirmed landing
-                    s1 = run_scenario_1_confirmed_landing(
-                        gh.base_url, "turbo-factory/turbo-qual-67", ev_dir, ctx,
-                        "valid-int-tok", "valid-comp-tok", allow_test_origin=True,
-                    )
-                    self.assertEqual(s1["scenario"], "confirmed_landing")
-                    self.assertEqual(s1["head_branch"], "feat/qual-candidate-101")
-
-                    # Scenario 2: Prereq missing and denied
-                    s2 = run_scenario_2_prereq_missing_and_denied(
-                        gh.base_url, "turbo-factory/turbo-qual-67", ev_dir, ctx,
-                        "valid-int-tok", "valid-comp-tok", allow_test_origin=True,
-                    )
-                    self.assertEqual(s2["scenario"], "prereq_missing_and_denied")
-                    self.assertTrue(s2["missing_prereq_rejected"])
-                    self.assertTrue(s2["stale_prereq_rejected"])
-                    self.assertTrue(s2["main_preserved"])
-
-                    # Scenario 3: Competing base rejection
-                    s3, cand_br3, base_prime, cand_pr3 = run_scenario_3_competing_base_rejection(
-                        gh.base_url, "turbo-factory/turbo-qual-67", ev_dir, ctx,
-                        "valid-int-tok", "valid-comp-tok", allow_test_origin=True,
-                    )
-                    self.assertEqual(s3["scenario"], "competing_base_rejection")
-                    self.assertTrue(s3["main_preserved"])
-
-                    # Scenario 4: Renewed verification after base change
-                    s4 = run_scenario_4_renewed_verification_after_base_change(
-                        gh.base_url, "turbo-factory/turbo-qual-67", ev_dir, ctx,
-                        "valid-int-tok", "valid-comp-tok", cand_br3, base_prime, cand_pr3,
-                        allow_test_origin=True,
-                    )
-                    self.assertEqual(s4["scenario"], "renewed_verification_after_base_change")
-                    self.assertTrue(s4["old_evidence_rejected"])
 
 
 if __name__ == "__main__":
