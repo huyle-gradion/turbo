@@ -167,7 +167,7 @@ class HostGitIgnoresPlantedConfigTest(unittest.TestCase):
                         self.assertFalse(marker.exists(), f"host git ran {marker.read_text().split() if marker.exists() else ''}")
 
     def test_dirt_inside_a_nested_repository_is_reported_without_running_its_filters(self) -> None:
-        # The factory never populates submodules, so a nested repository in a builder copy is the builder's.
+        # The factory never populates submodules, so a nested repository in a builder copy is the builder's (fail closed).
         for declared in (True, False):  # in .gitmodules, or a bare gitlink
             for dirt in ("owt\n", None):  # a same-size edit, or an untracked file
                 with self.subTest(gitmodules=declared, dirt=dirt), tempfile.TemporaryDirectory(prefix="iso ") as tmp:
@@ -189,8 +189,23 @@ class HostGitIgnoresPlantedConfigTest(unittest.TestCase):
                     (sub / ("f.txt" if dirt else "new.txt")).write_text(dirt or "new\n", encoding="utf-8")
                     future = time.time() + 100
                     os.utime(sub / "f.txt", (future, future))
-                    self.assertIn("sub", [line.split()[-1] for line in gitio.status_porcelain(repo).splitlines()])
+                    self.assertIn("sub", [line.split()[-1] for line in gitio.status_porcelain(repo, builder_copy=True).splitlines()])
                     self.assertFalse(marker.exists(), f"host git ran {marker.read_text().split() if marker.exists() else ''}")
+
+    def test_an_operator_repository_reports_submodule_dirt_as_before(self) -> None:
+        # Outside builder copies a populated submodule is the operator's own: clean reads clean, dirt is reported.
+        with tempfile.TemporaryDirectory(prefix="iso ") as tmp:
+            root = Path(tmp)
+            repo = _repo(root)
+            (root / "other").mkdir()
+            git(repo, "-c", "protocol.file.allow=always", "submodule", "add", "-q", str(_repo(root / "other")), "sub")
+            git(repo, "commit", "-q", "-m", "add sub")
+            self.assertEqual(gitio.status_porcelain(repo), "")
+            for dirt in ("f.txt", "new.txt"):  # a tracked edit, then an untracked file
+                with self.subTest(dirt=dirt):
+                    (repo / "sub" / dirt).write_text("dirt\n", encoding="utf-8")
+                    self.assertIn("sub", [line.split()[-1] for line in gitio.status_porcelain(repo).splitlines()])
+                    git(repo / "sub", "-c", "user.name=T", "-c", "user.email=t@example.test", "stash", "-q", "--include-untracked")
 
     def test_operator_global_filters_still_apply_and_local_ones_do_not(self) -> None:
         for local, attribute, expected in ((None, "op", "ONE"), ("filter.op.smudge", "op", "one"), ("filter.evil.smudge", "evil", "one")):
