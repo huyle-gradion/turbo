@@ -21,7 +21,7 @@ from factory.automated_qa import (
 from factory.automated_qa.delivery import _merge_measurements
 from factory.errors import UsageError
 from automated_qa.test_automated_qa_eval import WHITESPACE_QA_CASE
-from test_deliver import PARENT_TASK, READY_CHILD, _make_disposable_product_workspace, _make_fake_agy
+from test_deliver import PARENT_TASK, READY_CHILD, TEST_AUTHOR_SCRIPT, _make_disposable_product_workspace, _make_fake_agy
 from test_deliver_checks import _DisposableGitHubServer
 from test_intake import _DisposableAsanaServer
 
@@ -94,10 +94,10 @@ DEMO_REPAIR_BUILDER_SCRIPT = _repair_script(
 
 def _run_qa_with_servers(
     root: Path, script: str, cases: tuple[QAEvaluationCase, ...] = (WHITESPACE_QA_CASE,),
-    max_attempts: int = 2, rates: worker_module.RateCard | None = None,
+    max_attempts: int = 2, rates: worker_module.RateCard | None = None, test_author_script: str | None = None,
 ) -> QADeliveryResult:
     repo, home, bare = _make_disposable_product_workspace(root)
-    wrapper = _make_fake_agy(root, "fake-qa-agy", script)
+    wrapper = _make_fake_agy(root, "fake-qa-agy", script, test_author_script)
     with _DisposableAsanaServer(PARENT_TASK, [{"data": [READY_CHILD], "next_page": None}]) as asana, _SyncGitHubServer(bare_repo=bare) as gh:
         keys = ("TURBO_ASANA_API_URL", "ASANA_ACCESS_TOKEN", "TURBO_GITHUB_API_URL", "TURBO_GITHUB_TOKEN")
         old_env = {k: os.environ.get(k) for k in keys}
@@ -153,11 +153,11 @@ class AutomatedQADeliveryTest(unittest.TestCase):
             "subprocess.run(['git', 'rm', '-q', 'tests/test_extra_round1.py'], check=True)\n"
             "subprocess.run(['git', 'add', 'src/chat_bridge/auth.py'], check=True)\n"
             "subprocess.run(['git', 'commit', '-q', '-m', 'fix(auth): drop test'], check=True)",
-            initial_extra=(
-                "pathlib.Path('tests/test_extra_round1.py').write_text('import unittest\\n', encoding='utf-8')\n"
-                "subprocess.run(['git', 'add', 'tests/test_extra_round1.py'], check=True)\n"
-                "subprocess.run(['git', 'commit', '--amend', '-q', '-m', 'feat(auth): initial with extra test'], check=True)\n"
-            ),
+        )
+        extra_test_author = TEST_AUTHOR_SCRIPT.replace(  # the test author, not the implementer, owns the round-1 test
+            "subprocess.run(['git', 'add', 'tests/test_auth.py'], check=True)\n",
+            "pathlib.Path('tests/test_extra_round1.py').write_text('import unittest\\n', encoding='utf-8')\n"
+            "subprocess.run(['git', 'add', 'tests/test_auth.py', 'tests/test_extra_round1.py'], check=True)\n",
         )
         test_only_repair_script = _repair_script(
             "p = pathlib.Path('tests/test_auth.py')\n"
@@ -169,21 +169,20 @@ class AutomatedQADeliveryTest(unittest.TestCase):
             "import json, pathlib, subprocess\n"
             "m = '# rev-' + subprocess.run(['git', 'rev-list', '--count', 'HEAD'], capture_output=True, text=True, check=True).stdout.strip()\n"
             + SEEDED_INITIAL_COMMIT
-            + "for fn in ('src/chat_bridge/auth.py', 'tests/test_auth.py'):\n"
-            "    p = pathlib.Path(fn)\n"
-            "    p.write_text(p.read_text(encoding='utf-8') + m + '\\n', encoding='utf-8')\n"
-            "subprocess.run(['git', 'add', 'src/chat_bridge/auth.py', 'tests/test_auth.py'], check=True)\n"
+            + "p = pathlib.Path('src/chat_bridge/auth.py')\n"
+            "p.write_text(p.read_text(encoding='utf-8') + m + '\\n', encoding='utf-8')\n"
+            "subprocess.run(['git', 'add', 'src/chat_bridge/auth.py'], check=True)\n"
             "subprocess.run(['git', 'commit', '--amend', '-q', '-m', f'fix(auth): adjustment {m}'], check=True)\n" + RESULT_EMIT
         )
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            for sub, script, expected_st in (
-                ("scope", scope_violating_script, "scope-violation"),
-                ("deltest", delete_round1_test_script, "spec-check-conflict"),
-                ("testonly", test_only_repair_script, "missing-implementation"),
+            for sub, script, expected_st, author in (
+                ("scope", scope_violating_script, "scope-violation", None),
+                ("deltest", delete_round1_test_script, "spec-check-conflict", extra_test_author),
+                ("testonly", test_only_repair_script, "missing-implementation", None),
             ):
                 (root / sub).mkdir()
-                res = _run_qa_with_servers(root / sub, script)
+                res = _run_qa_with_servers(root / sub, script, test_author_script=author)
                 self.assertEqual((res.status, res.ci_verified, res.qa_verified, res.child["verified"]), (expected_st, False, False, False))
 
             (root / "stale").mkdir()

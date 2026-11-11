@@ -50,10 +50,14 @@ def _make_disposable_product_workspace(root: Path) -> tuple[Path, Path, Path]:
     return repo, home, bare
 
 
-def _make_fake_agy(root: Path, name: str, body_script: str) -> Path:
+def _make_fake_agy(root: Path, name: str, body_script: str, test_author_script: str | None = None) -> Path:
+    """A fake agy host. A prompt carrying `ROLE: test-author` runs the test-author script; any other runs `body_script`."""
     fake_py = root / f"{name}.py"
     fake_py.write_text(
-        "import sys\nif '--version' in sys.argv:\n    print('1.5.1-test')\n    sys.exit(0)\n" + body_script,
+        "import sys\nif '--version' in sys.argv:\n    print('1.5.1-test')\n    sys.exit(0)\n"
+        "if 'ROLE: test-author' in (sys.argv[sys.argv.index('--print') + 1] if '--print' in sys.argv else ''):\n"
+        f"    exec({(TEST_AUTHOR_SCRIPT if test_author_script is None else test_author_script)!r})\n    sys.exit(0)\n"
+        + body_script,
         encoding="utf-8",
     )
     wrapper = root / name
@@ -117,6 +121,29 @@ READY_CHILD = {
     ),
 }
 
+EXPIRED_TEST_SOURCE = (
+    'import sys, pathlib, unittest\n'
+    'sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "src"))\n'
+    'from chat_bridge.auth import TokenExpiredError, validate_token\n\n'
+    'class AuthTest(unittest.TestCase):\n'
+    '    def test_valid_token(self) -> None:\n'
+    '        self.assertEqual(validate_token("user-1"), {"sub": "user-1"})\n'
+    '    def test_expired_token(self) -> None:\n'
+    '        with self.assertRaises(TokenExpiredError):\n'
+    '            validate_token("expired:123")\n'
+)
+# The default test author: commits only tests/test_auth.py, then declares its red run on a `TURBO-RED: ` response line.
+TEST_AUTHOR_SCRIPT = (
+    "import json, pathlib, subprocess\n"
+    f"pathlib.Path('tests/test_auth.py').write_text({EXPIRED_TEST_SOURCE!r}, encoding='utf-8')\n"
+    "subprocess.run(['git', 'add', 'tests/test_auth.py'], check=True)\n"
+    "subprocess.run(['git', 'commit', '-q', '-m', 'test(auth): specify expired token rejection'], check=True)\n"
+    "red = {'command': 'python3 -m unittest discover -s tests -p test_auth.py -v', 'expect': 'FAIL: test_expired_token', 'tests': ['test_expired_token']}\n"
+    "print(json.dumps({'event': 'result', 'result': {'conversation_id': 'ta-101', 'status': 'SUCCESS', "
+    "'response': 'Committed a failing test.\\nTURBO-RED: ' + json.dumps(red), "
+    "'usage': {'input_tokens': 0, 'output_tokens': 0, 'thinking_tokens': 0, 'cache_read_tokens': 0, 'total_tokens': 0}}}))\n"
+)
+
 GOOD_BUILDER_SCRIPT = (
     "import json, pathlib, subprocess\n"
     "pathlib.Path('src/chat_bridge/auth.py').write_text(\n"
@@ -124,11 +151,7 @@ GOOD_BUILDER_SCRIPT = (
     "    'def validate_token(token: str) -> dict[str, str]:\\n'\n"
     "    '    if token.startswith(\"expired:\"):\\n        raise TokenExpiredError(\"token expired\")\\n'\n"
     "    '    return {\"sub\": token}\\n', encoding='utf-8')\n"
-    "p = pathlib.Path('tests/test_auth.py')\n"
-    "p.write_text(p.read_text(encoding='utf-8') + '\\n    def test_expired_token(self) -> None:\\n'\n"
-    "    '        from chat_bridge.auth import TokenExpiredError\\n'\n"
-    "    '        with self.assertRaises(TokenExpiredError):\\n            validate_token(\"expired:abc\")\\n', encoding='utf-8')\n"
-    "subprocess.run(['git', 'add', 'src/chat_bridge/auth.py', 'tests/test_auth.py'], check=True)\n"
+    "subprocess.run(['git', 'add', 'src/chat_bridge/auth.py'], check=True)\n"
     "subprocess.run(['git', 'commit', '-q', '-m', 'feat(auth): reject expired auth tokens'], check=True)\n"
     "print(json.dumps({'event': 'result', 'result': {'conversation_id': 'c-101', 'status': 'SUCCESS', 'response': 'Implemented expired token check and test.', 'usage': {'input_tokens': 500, 'output_tokens': 120, 'thinking_tokens': 20, 'cache_read_tokens': 0, 'total_tokens': 640}}}))\n"
 )
@@ -264,30 +287,11 @@ class DeliverChildTest(unittest.TestCase):
                     "import json\nprint(json.dumps({'event': 'result', 'result': {'conversation_id': 'c2', 'status': 'SUCCESS', 'response': 'Done and opened PR!'}}))\n",
                 ),
                 (
-                    "missing-tests",
-                    "import json, pathlib, subprocess\n"
-                    "pathlib.Path('src/chat_bridge/auth.py').write_text('def validate_token(token: str):\\n    return {\"sub\": token, \"v\": 2}\\n', encoding='utf-8')\n"
-                    "subprocess.run(['git', 'add', 'src/chat_bridge/auth.py'], check=True)\n"
-                    "subprocess.run(['git', 'commit', '-q', '-m', 'impl only'], check=True)\n"
-                    "print(json.dumps({'event': 'result', 'result': {'conversation_id': 'c3', 'status': 'SUCCESS', 'response': 'Done'}}))\n",
-                ),
-                (
-                    "missing-implementation",
-                    "import json, pathlib, subprocess\n"
-                    "p = pathlib.Path('tests/test_auth.py')\n"
-                    "p.write_text(p.read_text(encoding='utf-8') + '\\n    def test_extra(self):\\n        self.assertTrue(True)\\n', encoding='utf-8')\n"
-                    "subprocess.run(['git', 'add', 'tests/test_auth.py'], check=True)\n"
-                    "subprocess.run(['git', 'commit', '-q', '-m', 'test only'], check=True)\n"
-                    "print(json.dumps({'event': 'result', 'result': {'conversation_id': 'c4', 'status': 'SUCCESS', 'response': 'Done'}}))\n",
-                ),
-                (
                     "spec-check-conflict",
                     "import json, pathlib, subprocess\n"
                     "pathlib.Path('.github/workflows').mkdir(parents=True, exist_ok=True)\n"
                     "pathlib.Path('.github/workflows/ci.yml').write_text('name: weakened\\n', encoding='utf-8')\n"
                     "pathlib.Path('src/chat_bridge/auth.py').write_text('def validate_token(token: str):\\n    return {\"sub\": token}\\n', encoding='utf-8')\n"
-                    "p = pathlib.Path('tests/test_auth.py')\n"
-                    "p.write_text(p.read_text(encoding='utf-8') + '\\n    def test_ok(self):\\n        self.assertEqual(1, 1)\\n', encoding='utf-8')\n"
                     "subprocess.run(['git', 'add', '.'], check=True)\n"
                     "subprocess.run(['git', 'commit', '-q', '-m', 'redefine CI workflow'], check=True)\n"
                     "print(json.dumps({'event': 'result', 'result': {'conversation_id': 'c5', 'status': 'SUCCESS', 'response': 'Done'}}))\n",
@@ -345,8 +349,6 @@ class DeliverChildTest(unittest.TestCase):
                     "out-of-scope-file",
                     "import json, pathlib, subprocess\n"
                     "pathlib.Path('src/chat_bridge/billing.py').write_text('x = 1\\n', encoding='utf-8')\n"
-                    "p = pathlib.Path('tests/test_auth.py')\n"
-                    "p.write_text(p.read_text(encoding='utf-8') + '\\n    def test_ok(self): self.assertTrue(True)\\n', encoding='utf-8')\n"
                     "subprocess.run(['git', 'add', '.'], check=True)\n"
                     "subprocess.run(['git', 'commit', '-q', '-m', 'touch billing'], check=True)\n"
                     "print(json.dumps({'event': 'result', 'result': {'conversation_id': 's1', 'status': 'SUCCESS', 'response': 'Done'}}))\n",
@@ -356,8 +358,6 @@ class DeliverChildTest(unittest.TestCase):
                     "import json, pathlib, subprocess\n"
                     "pathlib.Path('scripts').mkdir(exist_ok=True)\n"
                     "pathlib.Path('scripts/deploy.py').write_text('x = 1\\n', encoding='utf-8')\n"
-                    "p = pathlib.Path('tests/test_auth.py')\n"
-                    "p.write_text(p.read_text(encoding='utf-8') + '\\n    def test_ok(self): self.assertTrue(True)\\n', encoding='utf-8')\n"
                     "subprocess.run(['git', 'add', '.'], check=True)\n"
                     "subprocess.run(['git', 'commit', '-q', '-m', 'touch scripts'], check=True)\n"
                     "print(json.dumps({'event': 'result', 'result': {'conversation_id': 's2', 'status': 'SUCCESS', 'response': 'Done'}}))\n",
@@ -367,8 +367,6 @@ class DeliverChildTest(unittest.TestCase):
                     "import json, pathlib, subprocess\n"
                     "pathlib.Path('AGENTS.md').write_text('# Weakened rules\\n', encoding='utf-8')\n"
                     "pathlib.Path('src/chat_bridge/auth.py').write_text('def validate_token(token: str): return {\"sub\": token}\\n', encoding='utf-8')\n"
-                    "p = pathlib.Path('tests/test_auth.py')\n"
-                    "p.write_text(p.read_text(encoding='utf-8') + '\\n    def test_ok(self): self.assertTrue(True)\\n', encoding='utf-8')\n"
                     "subprocess.run(['git', 'add', '.'], check=True)\n"
                     "subprocess.run(['git', 'commit', '-q', '-m', 'touch protected AGENTS.md'], check=True)\n"
                     "print(json.dumps({'event': 'result', 'result': {'conversation_id': 's3', 'status': 'SUCCESS', 'response': 'Done'}}))\n",
@@ -493,8 +491,6 @@ class DeliverChildTest(unittest.TestCase):
                 "    assert subprocess.run([cat_bin, target], env=env_copy, capture_output=True).returncode != 0\n"
                 "pathlib.Path('AGENTS.md').write_text('# Hostile rules\\n', encoding='utf-8')\n"
                 "pathlib.Path('src/chat_bridge/auth.py').write_text('def validate_token(token: str): return {}\\n', encoding='utf-8')\n"
-                "p = pathlib.Path('tests/test_auth.py')\n"
-                "p.write_text(p.read_text(encoding='utf-8') + '\\n    def test_fail(self): self.assertEqual(1, 2)\\n', encoding='utf-8')\n"
                 "subprocess.run(['git', 'add', '.'], check=True)\n"
                 "subprocess.run(['git', 'commit', '-q', '-m', 'hostile failed attempt'], check=True)\n"
                 "subprocess.run(['git', 'branch', '-f', 'main', 'HEAD'], check=False)\n"
@@ -539,7 +535,7 @@ class DeliverChildTest(unittest.TestCase):
                     rec_ok["child"]["candidate_sha"],
                 )
 
-    def test_broken_behavior_fails_mapped_ci_check_and_restoring_passes_plus_pending_and_conflict_stops(self) -> None:
+    def test_broken_behavior_fails_green_and_restoring_passes_plus_pending_and_conflict_stops(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             repo, home, bare = _make_disposable_product_workspace(root)
@@ -561,10 +557,7 @@ class DeliverChildTest(unittest.TestCase):
                 _DisposableGitHubServer(bare_repo=bare) as gh,
             ):
                 res_brk, rec_brk = _run_deliver(repo, home, asana.base_url, gh.base_url, agy_bin=str(broken_wrapper))
-                self.assertEqual((res_brk.returncode, rec_brk["status"], rec_brk["pr_opened"], rec_brk["verified"], rec_brk["merged"]), (1, "ci-failed", True, False, False))
-                self.assertEqual((rec_brk["child"]["pr"]["pr_confirmed"], rec_brk["child"]["pr"]["ci_verified"]), (True, False))
-                self.assertTrue(any("criterion/AC-1 (failure)" in b for b in rec_brk["blockers"]))
-                self.assertIn("criterion/AC-1`: **FAILURE**", rec_brk["child"]["pr"]["body"])
+                self.assertEqual((res_brk.returncode, rec_brk["status"], rec_brk["pr_opened"], rec_brk["verified"], rec_brk["merged"]), (1, "green-failed", False, False, False))
                 res_fix, rec_fix = _run_deliver(repo, home, asana.base_url, gh.base_url, agy_bin=str(fixed_wrapper))
                 self.assertEqual(
                     (res_fix.returncode, rec_fix["status"], rec_fix["pr_opened"], rec_fix["ci_verified"], rec_fix["verified"], rec_fix["delivery_approved"], rec_fix["merged"]),
@@ -723,9 +716,7 @@ class DeliverChildTest(unittest.TestCase):
                 env_gh = {"TURBO_GITHUB_TOKEN": None, "GITHUB_TOKEN": gh_token}
                 with _DisposableAsanaServer(live_parent, [{"data": [live_child], "next_page": None}]) as asana:
                     res1, rec1 = _run_deliver(repo, home, asana.base_url, "https://api.github.com", agy_bin=str(broken_w), time_limit="180s", env_extra=env_gh)
-                    self.assertEqual((res1.returncode, rec1["status"], rec1["pr_opened"], rec1["verified"]), (1, "ci-failed", True, False))
-                    self.assertEqual((rec1["child"]["pr"]["pr_confirmed"], rec1["child"]["pr"]["ci_verified"]), (True, False))
-                    self.assertIn("criterion/AC-1`: **FAILURE**", rec1["child"]["pr"]["body"])
+                    self.assertEqual((res1.returncode, rec1["status"], rec1["pr_opened"], rec1["verified"]), (1, "green-failed", False, False))
 
                     res2, rec2 = _run_deliver(repo, home, asana.base_url, "https://api.github.com", agy_bin=str(fixed_w), time_limit="180s", env_extra=env_gh)
                     self.assertEqual((res2.returncode, rec2["status"], rec2["pr_opened"], rec2["verified"]), (0, "verified", True, True))
