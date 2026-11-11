@@ -34,8 +34,6 @@ def _make_builder_script(mode: str) -> str:
         "    af.write_text('class TokenExpiredError(Exception): pass\\nBACKDOOR_SECRET = \"seed-bypass-token\"\\n"
         "def validate_token(token: str) -> dict[str, str]:\\n    if token == BACKDOOR_SECRET: return {\"sub\":\"admin\",\"bypass\":\"true\"}\\n"
         "    if token.startswith(\"expired:\"): raise TokenExpiredError(\"expired\")\\n    return {\"sub\": token}\\n', encoding='utf-8')\n"
-        "    tf.write_text(tf.read_text(encoding='utf-8') + '\\n    def test_expired(self):\\n"
-        "        from chat_bridge.auth import TokenExpiredError\\n        with self.assertRaises(TokenExpiredError): validate_token(\"expired:x\")\\n', encoding='utf-8')\n"
         "    subprocess.run(['git', 'add', '.'], check=True); subprocess.run(['git', 'commit', '-q', '-m', 'vuln'], check=True)\n"
         "    res = {'conversation_id': 'builder-round-0', 'status': 'SUCCESS', 'response': 'ok', 'usage': {'input_tokens': 100, 'output_tokens': 50, 'thinking_tokens': 10, 'cache_read_tokens': 5, 'total_tokens': 165}}\n"
     )
