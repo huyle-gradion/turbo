@@ -31,6 +31,11 @@ FULL_SUITE_TRIGGERS = (
     "factory/errors.py", "factory/gitio.py", "factory/integrity.py", "factory/jsonshape.py",
     "factory/limits.py", "factory/model.py", "factory/paths.py", "factory/store.py",
     "factory/worker.py",
+    # Test modules other areas import as shared fixtures or helpers.
+    "tests/support_deliver.py", "tests/test_deliver.py", "tests/test_deliver_checks.py",
+    "tests/test_intake.py", "tests/test_intake_eval.py",
+    "tests/automated_qa/test_automated_qa_eval.py", "tests/independent_review/test_approval_gate.py",
+    "tests/independent_review/test_independent_review.py", "tests/security_review/test_reviewer.py",
 )
 
 # Path pattern -> areas, first match wins. A trailing "/" matches the whole
