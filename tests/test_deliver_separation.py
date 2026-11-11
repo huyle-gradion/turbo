@@ -273,7 +273,7 @@ class MaterializeTreeTest(unittest.TestCase):
         self.listing = git(self.repo, "ls-tree", "HEAD") + "\n"
 
     def _git_in(self, data: str, *args: str) -> str:
-        return subprocess.run(["git", *args], cwd=self.repo, input=data, capture_output=True, text=True, check=True).stdout.strip()
+        return subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@example.test", *args], cwd=self.repo, input=data, capture_output=True, text=True, check=True).stdout.strip()
 
     def _commit(self, *extra: tuple[str, str, str]) -> str:
         """HEAD's tree plus `(mode, name, blob text | tree listing)` entries, built with `git mktree`."""
