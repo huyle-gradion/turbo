@@ -50,10 +50,19 @@ def _repo(root: Path) -> Path:
     return repo
 
 
-def _plant(repo: Path, prog: Path, hooks: Path, vector: str) -> None:
+def _plant(repo: Path, prog: Path, hooks: Path, vector: str) -> Path:
+    """Plant `vector` and return the working copy to run git in (a linked worktree for "config.worktree linked")."""
     cmd = lambda tag: f"'{prog}' {tag}"  # noqa: E731
     attrs = repo / ".git" / "info" / "attributes"
-    if vector in ("filter.clean", "filter.smudge", "filter.process", "diff.textconv", "diff.driver.command"):
+    here = repo.parent / "linked copy" if vector == "config.worktree linked" else repo
+    if vector.startswith("config.worktree"):  # extensions.worktreeConfig puts these keys in worktree scope
+        if here != repo:
+            git(repo, "worktree", "add", "-q", "--detach", str(here))
+        for pair in (("core.repositoryformatversion", "1"), ("extensions.worktreeConfig", "true")):
+            git(repo, "config", *pair)
+        for key, tag in (("filter.evil.clean", "clean"), ("filter.evil.smudge", "smudge"), ("filter.evil.process", "process")):
+            git(here, "config", "--worktree", key, cmd(tag))
+    if vector in ("filter.clean", "filter.smudge", "filter.process", "diff.textconv", "diff.driver.command") or vector.startswith("config.worktree"):
         attrs.parent.mkdir(exist_ok=True)
         attrs.write_text("* filter=evil diff=evil\n", encoding="utf-8")
     if vector.startswith("include"):
@@ -105,7 +114,8 @@ def _plant(repo: Path, prog: Path, hooks: Path, vector: str) -> None:
     for pair in (entries[vector],) if vector in entries else pairs.get(vector, ()):
         git(repo, "config", *pair)
     future = time.time() + 100  # a stat mismatch forces git to re-read (and clean-filter) f.txt
-    os.utime(repo / "f.txt", (future, future))
+    os.utime(here / "f.txt", (future, future))
+    return here
 
 
 MISSING = "3" * 40
@@ -121,9 +131,12 @@ CASES = (
     ("includeIf.gitdir", (STATUS,)),
     ("core.hooksPath", CHECKOUTS),
     (".git/hooks", CHECKOUTS[:1]),
-    ("filter.clean", (STATUS, WT_DIFF)),
+    # `diff REV PATH` without `--` compares against the working tree, so it is not tree-to-tree.
+    ("filter.clean", (STATUS, WT_DIFF, ("diff", "HEAD~1", "f.txt"))),
     ("filter.smudge", CHECKOUTS),
     ("filter.process", (STATUS, WT_DIFF, *CHECKOUTS)),
+    ("config.worktree", (STATUS, WT_DIFF, *CHECKOUTS)),
+    ("config.worktree linked", (STATUS, WT_DIFF, *CHECKOUTS)),
     ("diff.external", PATCHES[:2]),
     ("diff.textconv", PATCHES),
     ("diff.driver.command", PATCHES[:2]),
@@ -147,11 +160,37 @@ class HostGitIgnoresPlantedConfigTest(unittest.TestCase):
                         root = Path(tmp)
                         prog, hooks, marker = _hostile(root)
                         repo = _repo(root)
-                        _plant(repo, prog, hooks, vector)
+                        repo = _plant(repo, prog, hooks, vector)
                         exit_code = call(repo, *argv)
                         if vector not in MAY_FAIL:
                             self.assertEqual(exit_code, 0)
                         self.assertFalse(marker.exists(), f"host git ran {marker.read_text().split() if marker.exists() else ''}")
+
+    def test_dirt_inside_a_nested_repository_is_reported_without_running_its_filters(self) -> None:
+        # The factory never populates submodules, so a nested repository in a builder copy is the builder's.
+        for declared in (True, False):  # in .gitmodules, or a bare gitlink
+            for dirt in ("owt\n", None):  # a same-size edit, or an untracked file
+                with self.subTest(gitmodules=declared, dirt=dirt), tempfile.TemporaryDirectory(prefix="iso ") as tmp:
+                    root = Path(tmp)
+                    prog, _, marker = _hostile(root)
+                    repo = _repo(root)
+                    (root / "other").mkdir()
+                    other = _repo(root / "other")
+                    if declared:
+                        git(repo, "-c", "protocol.file.allow=always", "submodule", "add", "-q", str(other), "sub")
+                    else:
+                        git(repo, "clone", "-q", str(other), "sub")
+                        git(repo, "add", "sub")
+                    git(repo, "commit", "-q", "-m", "add sub")
+                    sub = repo / "sub"
+                    git(sub, "config", "filter.evil.clean", f"'{prog}' clean")
+                    (Path(git(sub, "rev-parse", "--absolute-git-dir")) / "info").mkdir(exist_ok=True)
+                    (Path(git(sub, "rev-parse", "--absolute-git-dir")) / "info" / "attributes").write_text("* filter=evil\n", encoding="utf-8")
+                    (sub / ("f.txt" if dirt else "new.txt")).write_text(dirt or "new\n", encoding="utf-8")
+                    future = time.time() + 100
+                    os.utime(sub / "f.txt", (future, future))
+                    self.assertIn("sub", [line.split()[-1] for line in gitio.status_porcelain(repo).splitlines()])
+                    self.assertFalse(marker.exists(), f"host git ran {marker.read_text().split() if marker.exists() else ''}")
 
     def test_operator_global_filters_still_apply_and_local_ones_do_not(self) -> None:
         for local, attribute, expected in ((None, "op", "ONE"), ("filter.op.smudge", "op", "one"), ("filter.evil.smudge", "evil", "one")):
@@ -168,6 +207,27 @@ class HostGitIgnoresPlantedConfigTest(unittest.TestCase):
                     self.assertEqual(gitio.git(repo, "checkout", "-q", "--detach", "HEAD~1").exit, 0)
                 self.assertEqual((repo / "f.txt").read_text(encoding="utf-8").strip(), expected)
                 self.assertFalse(marker.exists(), f"host git ran {marker.read_text().split() if marker.exists() else ''}")
+
+    @unittest.skipIf(subprocess.run(["git", "lfs", "version"], capture_output=True, timeout=30).returncode, "git-lfs is not installed")
+    def test_operator_lfs_filter_ignores_repository_local_lfs_programs(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="iso ") as tmp:
+            root = Path(tmp)
+            prog, _, marker = _hostile(root)
+            repo = _repo(root)
+            (root / "global.cfg").write_text('[filter "lfs"]\n\tclean = git-lfs clean -- %f\n\tsmudge = git-lfs smudge -- %f\n'
+                                             '\tprocess = git-lfs filter-process\n\trequired = true\n', encoding="utf-8")
+            (repo / ".git" / "info").mkdir(exist_ok=True)
+            (repo / ".git" / "info" / "attributes").write_text("* filter=lfs\n", encoding="utf-8")
+            for key, value in (("lfs.extension.evil.clean", f"'{prog}' clean"), ("lfs.extension.evil.smudge", f"'{prog}' smudge"),
+                               ("lfs.extension.evil.priority", "0"), ("lfs.customtransfer.evil.path", str(prog)),
+                               ("lfs.standalonetransferagent", "evil")):
+                git(repo, "config", key, value)
+            future = time.time() + 100
+            os.utime(repo / "f.txt", (future, future))
+            with mock.patch.dict(os.environ, GIT_CONFIG_GLOBAL=str(root / "global.cfg")):
+                for argv in (STATUS, *CHECKOUTS):
+                    gitio.git(repo, *argv)
+            self.assertFalse(marker.exists(), f"host git ran {marker.read_text().split() if marker.exists() else ''}")
 
     def test_replace_refs_do_not_change_what_the_factory_reads(self) -> None:
         with tempfile.TemporaryDirectory(prefix="iso ") as tmp:
@@ -247,6 +307,23 @@ class DeliverIgnoresPlantedConfigTest(unittest.TestCase):
             child = payload["child"]
             self.assertEqual(git(bare, "rev-parse", f"refs/heads/{child['head_branch']}"), child["candidate_sha"])
             self.assertIn("expired:", git(bare, "show", f"{child['candidate_sha']}:src/chat_bridge/auth.py"))
+
+
+    def test_dirt_inside_a_committed_nested_repository_stops_delivery(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="iso ") as tmp:
+            root = Path(tmp)
+            repo, home, bare = _make_disposable_product_workspace(root)
+            plant = (  # after its good commit, the builder commits a nested repository as a gitlink and leaves dirt inside it
+                "subprocess.run(['git', 'init', '-q', 'nest'], check=True)\n"
+                "subprocess.run(['git', '-C', 'nest', '-c', 'user.name=B', '-c', 'user.email=b@example.test', '-c', 'commit.gpgsign=false',\n"
+                "                'commit', '-q', '--allow-empty', '-m', 'nest'], check=True)\n"
+                "subprocess.run(['git', 'add', 'nest'], check=True)\n"
+                "subprocess.run(['git', 'commit', '-q', '-m', 'nest'], check=True)\n"
+                "pathlib.Path('nest/hidden.txt').write_text('hidden\\n', encoding='utf-8')\n"
+            )
+            res, payload = _deliver(root, repo, home, bare, plant)
+            self.assertEqual(payload.get("status"), "uncommitted-changes", res.stdout + res.stderr)
+            self.assertIn("nest", " ".join(payload["blockers"]), payload["blockers"])
 
 
 # qualification.py is left out for now: #123 is rewriting it and its git calls move with that change.
