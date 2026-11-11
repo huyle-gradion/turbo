@@ -1,7 +1,7 @@
-"""Hosted scenarios 1-4 are repeatable per run through the factory integration boundary (#98)."""
+"""Hosted scenarios 1-6 are repeatable per run through the factory integration boundary (#98, #67 slice 5)."""
 from __future__ import annotations
 
-import ast, base64, contextlib, json, os, re, subprocess, tempfile, threading, unittest
+import ast, base64, contextlib, inspect, json, os, re, subprocess, tempfile, threading, time, unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -196,7 +196,8 @@ class _ProviderGitHub(_DisposableGitHubServer):
                 self._record_or_redirect(body)
                 who = TOKENS.get((self.headers.get("Authorization") or "").removeprefix("Bearer "))
                 try:
-                    code, out = outer.route(self.command, p, {k: v[0] for k, v in parse_qs(u.query).items()}, body, who)
+                    with outer.lock:  # one provider mutation at a time, as GitHub serializes merges into a base
+                        code, out = outer.route(self.command, p, {k: v[0] for k, v in parse_qs(u.query).items()}, body, who)
                 except subprocess.CalledProcessError as exc:
                     code, out = 409, {"message": f"git: {exc.stderr}"}
                 outer.observe()
@@ -268,8 +269,10 @@ class HostedScenarioRunTest(unittest.TestCase):
                     hook()
                     seen["hook_requests"] = gh.requests[start:]
                 kw["on_before_merge"] = hooked
+            t0, start = time.monotonic(), len(gh.requests)
             res = real(**kw)
-            calls.append({"kw": kw, "res": res, **seen, "pr_after": json.loads(json.dumps(gh.pulls.get(kw["pr_number"], {})))})
+            calls.append({"kw": kw, "res": res, **seen, "pr_after": json.loads(json.dumps(gh.pulls.get(kw["pr_number"], {}))),
+                          "t0": t0, "t1": time.monotonic(), "reqs": gh.requests[start:]})
             return res
 
         before, n_req, q = set(gh.pulls), len(gh.requests), "factory.qualification."
@@ -288,7 +291,8 @@ class HostedScenarioRunTest(unittest.TestCase):
         return SimpleNamespace(res=res, calls=calls, created=sorted(set(gh.pulls) - before), probes=probes,
                                s2=sc.get("prereq_missing_and_denied") or {},
                                s1=sc.get("confirmed_landing") or {}, s3=sc.get("competing_base_rejection") or {},
-                               s4=sc.get("renewed_verification_after_base_change") or {})
+                               s4=sc.get("renewed_verification_after_base_change") or {},
+                               s5=sc.get("concurrency_and_uncertain_reconciliation") or {}, s6=sc.get("wrong_target_rejected") or {})
 
     def _attempt(self, r: SimpleNamespace, pr: object, **match: object) -> dict:
         hits = [c for c in r.calls if c["kw"]["pr_number"] == pr and all(c["kw"].get(k) == v for k, v in match.items())]
@@ -306,6 +310,61 @@ class HostedScenarioRunTest(unittest.TestCase):
         landed = sc["landed_sha"]
         self.assertEqual(git(gh.bare_repo, "rev-list", "--parents", "-n1", landed).split()[1:], [base, cand])
         self.assertEqual(git(gh.bare_repo, "rev-parse", f"{landed}^{{tree}}"), git(gh.bare_repo, "rev-parse", f"{att['res'].tested_sha}^{{tree}}"))
+
+    def _assert_scenario_5(self, gh: _ProviderGitHub, r: SimpleNamespace) -> None:
+        """AC6: concurrent attempts, a changed head and an uncertain merge, each through integrate_approved_child, retained."""
+        s5 = r.s5
+        self.assertEqual((s5.get("outcome"), s5.get("simulated")), ("verified", False), s5)
+        merge_puts = lambda pr: [q for q in gh.requests if q["method"] == "PUT" and unquote(q["path"]) == f"{SLUG}/pulls/{pr}/merge"]
+        with self.subTest(check="scenario 5: two concurrent attempts, exactly one lands, the other is retained"):
+            ca = s5["concurrent_attempts"]
+            atts = [c for c in r.calls if c["kw"]["pr_number"] == ca["pr_number"]]
+            self.assertIn(ca["pr_number"], r.created)
+            self.assertEqual(len(atts), 2, [c["res"].status for c in atts])
+            a, b = atts
+            self.assertTrue(a["t0"] < b["t1"] and b["t0"] < a["t1"], "the two attempts did not overlap")
+            self.assertEqual(a["kw"]["candidate_sha"], b["kw"]["candidate_sha"])
+            statuses = sorted(c["res"].status for c in atts)
+            self.assertEqual(statuses.count("confirmed"), 1, statuses)
+            self.assertEqual(sorted(x["status"] for x in ca["results"]), statuses, "both results are retained in the evidence")
+            self.assertEqual([n for n, _ in gh.merges].count(ca["pr_number"]), 1)
+        with self.subTest(check="scenario 5: a head changed after approval is refused before the merge"):
+            ch = s5["changed_head"]
+            att = self._attempt(r, ch["pr_number"], candidate_sha=ch["approved_sha"])
+            self.assertEqual((att["res"].status, att["res"].mutation_outcome, ch["status"]),
+                             ("stale-candidate-revision", "not-attempted", "stale-candidate-revision"))
+            self.assertEqual(att["pr_after"]["head"]["sha"], ch["new_head_sha"])
+            self.assertNotEqual(ch["new_head_sha"], ch["approved_sha"])
+            self.assertTrue(any(rv["pull_number"] == ch["pr_number"] and rv["state"] == "APPROVED" and rv["commit_id"] == ch["approved_sha"]
+                                for rv in gh.reviews.values()), "the old head was never approved")
+            self.assertEqual((merge_puts(ch["pr_number"]), gh.pulls[ch["pr_number"]]["merged"]), ([], False))
+        with self.subTest(check="scenario 5: a dropped merge response is uncertain, then reconciled from the provider"):
+            un = s5["uncertain"]
+            atts = [c for c in r.calls if c["kw"]["pr_number"] == un["pr_number"]]
+            self.assertEqual([c["kw"].get("drop_merge_response", False) for c in atts], [True, False])
+            first, second = (c["res"] for c in atts)
+            self.assertEqual((first.status, first.outcome, first.landed_sha), ("uncertain", "uncertain", None))
+            self.assertEqual((second.status, second.reconciled, second.landed_sha), ("confirmed", True, gh.pulls[un["pr_number"]]["merge_commit_sha"]))
+            self.assertEqual((len(merge_puts(un["pr_number"])), gh.pulls[un["pr_number"]]["merged"]), (1, True), "the PUT was sent once and landed")
+            self.assertEqual((un["fault_injected"], un["first"]["status"], un["reconciled"]["status"], un["reconciled"]["reconciled"]),
+                             (True, "uncertain", "confirmed", True))
+            self.assertEqual([c["kw"]["pr_number"] for c in r.calls if c["kw"].get("drop_merge_response")], [un["pr_number"]],
+                             "the response is dropped only in the uncertain sub-check")
+
+    def _assert_scenario_6(self, gh: _ProviderGitHub, r: SimpleNamespace, main_sha: str) -> None:
+        """AC2/AC6: `main` and a non-intended feature branch are refused before any provider mutation; main is unchanged."""
+        s6 = r.s6
+        self.assertEqual((s6.get("outcome"), s6.get("simulated")), ("verified", False), s6)
+        wrong = [c for c in r.calls if c["kw"]["base_branch"] != "feature/demo"]
+        got = {c["kw"]["base_branch"]: (c["res"].status, c["res"].mutation_outcome) for c in wrong}
+        self.assertEqual(got.pop("main", None), ("unintended-target", "not-attempted"), got)
+        self.assertTrue(got, "no attempt into a feature branch other than the intended one")
+        self.assertEqual(set(got.values()), {("branch-ref-mismatch", "not-attempted")}, got)
+        self.assertEqual([(q["method"], q["path"]) for c in wrong for q in c["reqs"] if q["method"] != "GET"], [])
+        self.assertTrue(all(c["kw"]["pr_number"] in r.created for c in wrong), "wrong-target attempts use this run's PRs")
+        self.assertEqual(sorted((x["base_branch"], x["status"]) for x in s6["attempts"]),
+                         sorted((c["kw"]["base_branch"], c["res"].status) for c in wrong))
+        self.assertEqual((s6["main_sha_before"], s6["main_sha_after"], s6["main_preserved"]), (main_sha, main_sha, True))
 
     def test_hosted_runner_has_no_literal_live_state(self) -> None:
         """AC1: factory/qualification.py (whole module, hosted runner and its helpers) holds no literal 40-hex or
@@ -326,7 +385,9 @@ class HostedScenarioRunTest(unittest.TestCase):
     def test_each_run_lands_rejects_and_renews_its_own_prs(self) -> None:
         """AC2-AC4 and repeatability: two runs against one origin each create, verify and land their own uniquely named
         candidates through integrate_approved_child, reject a same-run competitor advance at the pre-merge boundary,
-        renew against the advanced base without force push, close what they leave open, and never touch `main`."""
+        renew against the advanced base without force push, close what they leave open, and never touch `main`. Slice 5:
+        each run also races, changes the head of, and drops the merge response of its own candidates (scenario 5), refuses
+        wrong targets (scenario 6), and, with every AC hosted-verified and nothing blocking, qualifies (#67, Q1=a)."""
         with self._provider() as (gh, origin, agy):
             main_before = gh.sha("main", True)
             runs = [self._run(gh, origin, agy) for _ in range(2)]
@@ -389,6 +450,19 @@ class HostedScenarioRunTest(unittest.TestCase):
                     self.assertEqual((gh.pulls[n]["state"], gh.pulls[n]["base"]["ref"]), ("closed", "feature/demo"), f"PR {n}")
                     self.assertTrue(gh.pulls[n]["head"]["ref"].startswith(CANDIDATE_BRANCH_PREFIX), gh.pulls[n]["head"]["ref"])
                 self.assertEqual((s3.get("main_sha_before"), s3.get("main_sha_after")), (main_before, main_before))
+            with self.subTest(run=i, check="AC6 scenario 5"):
+                self._assert_scenario_5(gh, r)
+            with self.subTest(run=i, check="AC2/AC6 scenario 6 wrong target"):
+                self._assert_scenario_6(gh, r, main_before)
+            with self.subTest(run=i, check="final run: all six ACs hosted-verified, so the run qualifies"):
+                idx = r.res.get("parent_evidence_index") or {}
+                self.assertEqual({ac: (e["mode"], e["outcome"], e["hosted_proof_status"]) for ac, e in idx.items()},
+                                 {f"AC{n}": ("hosted", "hosted-verified", "VERIFIED") for n in range(1, 7)})
+                self.assertIn("wrong_target_rejected", idx["AC2"]["scenarios"])
+                self.assertIn("concurrency_and_uncertain_reconciliation", idx["AC6"]["scenarios"])
+                self.assertEqual((r.res["qualified"], r.res["blockers"], r.res["simulated"]), (True, [], False))
+        with self.subTest("the response-dropping seam is opt-in"):
+            self.assertIs(inspect.signature(qualification.integrate_approved_child).parameters["drop_merge_response"].default, False)
         with self.subTest("runs are independent"):
             self.assertEqual(main_after, main_before)
             heads = [{gh.pulls[n]["head"]["ref"] for n in r.created} for r in runs]
