@@ -12,11 +12,18 @@ Pinned interface (the implementation follows it):
   is `test-author-failed`.
 - Red rules, checked at the test-author commit before the implementer starts, each `red-refused`:
   the command is not one of the child's criterion verification commands; `expect` contains none of the
-  declared test names; the commit changes non-test (implementation) paths; the commit adds no line to
-  any test file; a declared test name does not appear in the commit's added lines; the command exits 0
+  declared test names; the commit changes non-test (implementation) paths; a declared test name does not
+  appear in the commit's added lines (this implies the commit adds a test line, so no separate rule); the command exits 0
   (even when its output holds `expect`); the failing output lacks `expect`.
 - Red and green run in a fresh checkout of the exact SHA (the test-author commit, then the candidate),
   never in the session worktree, so index flags (skip-worktree) and untracked files cannot change what runs.
+  Malformed trees (Issue #129). `test_author._materialize` validates the whole `ls-tree` listing before
+  writing anything and raises `ValueError` naming the path and one reason: `duplicate tree entry` (two
+  entries with one path), `symlinked parent directory` (a path under a symlink entry), or `symlink into
+  a test path` (a relative symlink whose target, resolved in the checkout, is a `deliver_checks.is_test_path`
+  path). An absolute symlink is written as that link; a gitlink is skipped; no write ever leaves the
+  checkout. `run_check` turns the refusal into `exit: null` without running the command, with the reason
+  in its output file, so red is `red-refused` and green is `green-failed`, and no PR opens.
   Byte identity reads blobs with replace objects disabled (`git --no-replace-objects`).
 - After the implementer: `test-files-modified` when the implementer adds, modifies, deletes or renames
   any test path (`deliver_checks.is_test_path`) between the test-author commit and the candidate,
@@ -32,6 +39,7 @@ Pinned interface (the implementation follows it):
     "test_author": {"conversation_id", "commit_sha", "tests"},
     "implementer": {"conversation_id"},
     "identity_note": str containing "host conversation ID",
+    "limits_note": str stating that implementation code the tests import can still change how the tests run,
     "red": {"command", "argv", "expect", "exit", "output_sha256", "output_path", "head_sha", "provenance"},
     "green": {"command", "exit", "output_path", "head_sha"},
     "byte_identity": {"result": "identical" | "modified", "files": [{"path", "sha256"}], "modified": [path, ...]}}`.
@@ -44,10 +52,14 @@ import hashlib
 import json
 from pathlib import Path
 import shlex
+import shutil
+import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
+from factory import test_author
 from support import git
 from test_intake_eval import _child_notes
 from test_deliver import (
@@ -134,6 +146,7 @@ class DeliverTestSeparationTest(unittest.TestCase):
         ids = (sep["test_author"]["conversation_id"], sep["implementer"]["conversation_id"])
         self.assertEqual(ids, ("ta-101", "c-101"))
         self.assertIn("host conversation ID", sep["identity_note"])
+        self.assertIn("implementation code the tests import can still change how the tests run", sep["limits_note"])
 
         ta_sha, cand = sep["test_author"]["commit_sha"], child["candidate_sha"]
         self.assertEqual(sep["test_author"]["tests"], ["test_expired_token"])
@@ -240,6 +253,84 @@ class DeliverTestSeparationTest(unittest.TestCase):
         self.assertEqual((sep["red"]["command"], sep["green"]["exit"]), (commands["AC-1"], 0))
         self.assertIn("criterion/AC-2`: **FAILURE**", rec["child"]["pr"]["body"])
         self.assertIn("criterion/AC-1`: **SUCCESS**", rec["child"]["pr"]["body"])
+
+
+class MaterializeTreeTest(unittest.TestCase):
+    """The fresh checkout refuses trees that git itself would reject (Issue #129)."""
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.repo = self.root / "repo"
+        (self.repo / "tests").mkdir(parents=True)
+        (self.repo / "src").mkdir()
+        (self.repo / "tests/test_auth.py").write_text("ORIGINAL\n")
+        (self.repo / "src/feat.py").write_text("x\n")
+        git(self.repo, "init", "-q")
+        git(self.repo, "add", "-A")
+        git(self.repo, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "base")
+        self.listing = git(self.repo, "ls-tree", "HEAD") + "\n"
+
+    def _git_in(self, data: str, *args: str) -> str:
+        return subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@example.test", *args], cwd=self.repo, input=data, capture_output=True, text=True, check=True).stdout.strip()
+
+    def _commit(self, *extra: tuple[str, str, str]) -> str:
+        """HEAD's tree plus `(mode, name, blob text | tree listing)` entries, built with `git mktree`."""
+        lines = self.listing
+        for mode, name, body in extra:
+            kind, oid = ("tree", self._git_in(body, "mktree")) if mode == "040000" else ("blob", self._git_in(body, "hash-object", "-w", "--stdin"))
+            lines += f"{mode} {kind} {oid}\t{name}\n"
+        return self._git_in("", "commit-tree", self._git_in(lines, "mktree"), "-m", "candidate")
+
+    def _materialize(self, sha: str) -> Path:
+        dest = self.root / "out" / "checkout"
+        shutil.rmtree(dest.parent, ignore_errors=True)
+        dest.mkdir(parents=True)
+        test_author._materialize(self.repo, sha, dest)
+        return dest
+
+    def test_malformed_tree_is_refused_with_a_named_reason(self) -> None:
+        pwned = "100644 blob {}\ttest_auth.py\n".format(self._git_in("PWNED\n", "hash-object", "-w", "--stdin"))
+        cases = (
+            ("duplicate tree entry", (("120000", "zz", "tests/test_auth.py"), ("100644", "zz", "PWNED\n"))),
+            ("symlink into a test path", (("120000", "zz", "tests/test_auth.py"),)),
+            ("symlinked parent directory", (("120000", "zz", "src"), ("040000", "zz", pwned.replace("test_auth", "feat")))),
+        )
+        for reason, extra in cases:
+            with self.subTest(reason):
+                sha = self._commit(*extra)
+                with self.assertRaisesRegex(ValueError, f"{reason}.*zz|zz.*{reason}"):
+                    self._materialize(sha)
+                for path in ("out/checkout/tests/test_auth.py", "out/checkout/src/feat.py"):
+                    self.assertFalse((self.root / path).exists() and "PWNED" in (self.root / path).read_text(), path)
+
+    def test_checkout_never_writes_outside_its_directory(self) -> None:
+        sha = self._commit(("120000", "x", ".."), ("040000", "x", self.listing.replace("tests", "escaped")))
+        with self.assertRaises(ValueError):
+            self._materialize(sha)
+        self.assertFalse((self.root / "out" / "escaped").exists())
+
+    def test_absolute_symlink_is_kept_and_gitlink_is_skipped(self) -> None:
+        head = git(self.repo, "rev-parse", "HEAD")
+        sha = self._commit(("120000", "abs", "/etc/hostname"))
+        sha = self._git_in("", "commit-tree", self._git_in(git(self.repo, "ls-tree", sha) + f"\n160000 commit {head}\tmod\n", "mktree"), "-m", "c")
+        dest = self._materialize(sha)
+        self.assertEqual(str((dest / "abs").readlink()), "/etc/hostname")
+        self.assertFalse((dest / "mod").exists())
+        self.assertEqual((dest / "tests/test_auth.py").read_text(), "ORIGINAL\n")
+
+    def test_refused_tree_never_runs_the_command(self) -> None:
+        sha = self._commit(("120000", "zz", "tests/test_auth.py"), ("100644", "zz", "PWNED\n"))
+        home = self.root / "home"
+        child_dir = home / "child"
+        child_dir.mkdir(parents=True)
+        argv = (sys.executable, "-c", "print('RAN')")
+        res = test_author.run_check(self.repo, sha, child_dir, home, "green", "cmd", argv, (), time.monotonic() + 120, 120)
+        out = Path(res["output_path"]).read_text(encoding="utf-8")
+        self.assertEqual(res["exit"], None, out)
+        self.assertIn("duplicate tree entry", out)
+        self.assertNotIn("RAN", out)
 
 
 if __name__ == "__main__":

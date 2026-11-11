@@ -9,8 +9,8 @@ command must pass there.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-import hashlib, json, math, os, shutil, subprocess
-from pathlib import Path
+import hashlib, json, math, os, posixpath, shutil, subprocess
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from factory import gitio, runner, worker as worker_module
@@ -23,6 +23,10 @@ RED_PREFIX = "TURBO-RED:"
 IDENTITY_NOTE = (
     "Session identities are host conversation IDs: they show two separate host invocations, "
     "not separate models or separate people."
+)
+LIMITS_NOTE = (
+    "Byte identity covers test paths only: implementation code the tests import can still change how the tests run "
+    "(for example a root tests.py or a conftest.py)."
 )
 
 
@@ -99,6 +103,21 @@ def _blob_sha(worktree: Path, rev: str, path: str) -> str | None:
     return hashlib.sha256(data).hexdigest() if code == 0 else None
 
 
+def _validate_tree(paths: list[str], links: dict[str, str]) -> None:
+    """Refuse a tree that git itself would reject, or that reaches a test path through a symlink, before any write."""
+    seen: set[str] = set()
+    for path in paths:
+        if path in seen:
+            raise ValueError(f"duplicate tree entry: {path!r}")
+        seen.add(path)
+    for path in paths:
+        if any(str(parent) in links for parent in PurePosixPath(path).parents):
+            raise ValueError(f"symlinked parent directory: {path!r}")
+    for path, target in links.items():
+        if not target.startswith("/") and is_test_path(posixpath.normpath(posixpath.join(posixpath.dirname(path), target))):
+            raise ValueError(f"symlink into a test path: {path!r} -> {target!r}")
+
+
 def _materialize(repo: Path, sha: str, dest: Path) -> None:
     """Write the committed tree of `sha` into `dest` from raw objects: no index, hooks, filters or replace objects."""
     def run(*args: str, data: bytes | None = None) -> bytes:
@@ -107,12 +126,15 @@ def _materialize(repo: Path, sha: str, dest: Path) -> None:
         return done.stdout
 
     entries = [e.split(b"\t", 1) for e in run("ls-tree", "-r", "-z", "--full-tree", sha).split(b"\0") if e]
-    blobs = [(meta.split(), path.decode()) for meta, path in entries if meta.split()[1] == b"blob"]
-    data, pos = run("cat-file", "--batch", data=b"".join(m[2] + b"\n" for m, _ in blobs)), 0
-    for (mode, _, _), path in blobs:
+    blobs = [(meta.split()[0], meta.split()[2], path.decode()) for meta, path in entries if meta.split()[1] == b"blob"]
+    data, pos, bodies = run("cat-file", "--batch", data=b"".join(oid + b"\n" for _, oid, _ in blobs)), 0, []
+    for mode, _, path in blobs:
         end = data.index(b"\n", pos)
         size = int(data[pos:end].split()[2])
-        body, pos = data[end + 1:end + 1 + size], end + 2 + size
+        bodies.append((mode, path, data[end + 1:end + 1 + size]))
+        pos = end + 2 + size
+    _validate_tree([p.decode() for _, p in entries], {p: b.decode() for m, p, b in bodies if m == b"120000"})
+    for mode, path, body in bodies:
         target = dest / path
         if not target.resolve().is_relative_to(dest.resolve()):
             raise ValueError(f"tree path escapes the checkout: {path!r}")
@@ -176,7 +198,7 @@ def run_test_author(
     record: dict[str, Any] = {
         "schema": 1,
         "test_author": {"conversation_id": str((final or {}).get("conversation_id") or "") or None, "commit_sha": None, "tests": []},
-        "implementer": {"conversation_id": None}, "identity_note": IDENTITY_NOTE,
+        "implementer": {"conversation_id": None}, "identity_note": IDENTITY_NOTE, "limits_note": LIMITS_NOTE,
         "red": None, "green": None, "byte_identity": None,
     }
 
@@ -205,8 +227,6 @@ def run_test_author(
         ln[1:] for ln in _git(worktree, "diff", "--no-renames", "--unified=0", base_sha, ta_sha).splitlines()
         if ln.startswith("+") and not ln.startswith("+++")
     )
-    if not added.strip():
-        return _out("red-refused", "test-author commit adds no line to any test file")
     if missing := [t for t in tests if t not in added]:
         return _out("red-refused", f"declared tests {missing} do not appear in the test-author commit's added lines")
     argv = _verification_argv(command)
@@ -218,7 +238,8 @@ def run_test_author(
     if red["exit"] == 0:
         return _out("red-refused", f"red command {command!r} passed (exit 0) at the test-author commit {ta_sha}")
     if red["exit"] is None or expect not in output:
-        return _out("red-refused", f"red command failed without the expected marker {expect!r} (exit {red['exit']})")
+        why = f": {output.strip()}" if red["exit"] is None else ""
+        return _out("red-refused", f"red command failed without the expected marker {expect!r} (exit {red['exit']}){why}")
     names = _git(worktree, "diff", "--no-renames", "--diff-filter=AMT", "--name-only", base_sha, ta_sha).splitlines()
     files = [{"path": p, "sha256": _blob_sha(worktree, ta_sha, p) or ""} for p in sorted(n for n in names if n)]
     return _out("ok", "", argv, files)

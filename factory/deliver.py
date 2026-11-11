@@ -864,11 +864,12 @@ def _execute_delivery(paths: RuntimePaths, spec: DeliverSpec, *, require_final_a
             green = test_author.run_check(
                 worktree_dir, candidate_sha, child_dir, paths.home, "green", sep["red"]["command"], authored.argv, secrets, deadline, limit_s,
             )
-            green.pop("output")
+            green_out = green.pop("output")
             sep["green"] = green
             if green["exit"] != 0:
+                why = f": {green_out.strip()}" if green["exit"] is None else ""
                 builder_status, blockers = "green-failed", [
-                    f"red command {sep['red']['command']!r} still fails at candidate {candidate_sha} (exit {green['exit']})"
+                    f"red command {sep['red']['command']!r} still fails at candidate {candidate_sha} (exit {green['exit']}){why}"
                 ]
         if sep is not None:
             atomic_json(sep_path, redact_value(sep, secrets), paths.home)
