@@ -30,6 +30,8 @@ class _ProviderGitHub(_DisposableGitHubServer):
         super().__init__(bare_repo=bare, owner=REPO.split("/")[0], repo=REPO.split("/")[1])
         self.lock, self.reviews, self.activity, self.refs, self.merges = threading.RLock(), {}, [], {}, []
         self.inject_force_push, self.root = False, self.sha("feature/demo", True)
+        self.fail_first_poll, self.fail_path = False, None  # one failing read of the PR polled after update-branch
+        self.fail_activity: int | None = None  # one failing ref-activity read: its status, or 0 for no response at all
         self.observe()
 
     def g(self, *args: str, who: str | None = None, inp: str | None = None, env: dict | None = None) -> str:
@@ -110,6 +112,11 @@ class _ProviderGitHub(_DisposableGitHubServer):
             old = self.sha(key, True)
             if method == "GET":
                 return (200, {"object": {"sha": old, "type": "commit"}}) if old else nf
+            if method == "DELETE":
+                if protected(key) or not old:
+                    return 422, {"message": "Reference cannot be deleted"}
+                self.g("update-ref", "-d", f"refs/heads/{key}", old)
+                return 204, {}
             if protected(key) or not old or not (b.get("force") or self.anc(old, b["sha"])):
                 return 422, {"message": "Protected branch update failed" if protected(key) else "Update is not a fast forward"}
             self.g("update-ref", f"refs/heads/{key}", b["sha"], old)
@@ -139,6 +146,7 @@ class _ProviderGitHub(_DisposableGitHubServer):
             return (405, {"message": "Pull Request is not mergeable"}) if method == "PUT" else nf
         head, base_sha = pr["head"]["sha"], self.sha(pr["base"]["ref"], True)
         if sub == "update-branch":  # merge the current base into the head branch; never a force push
+            self.fail_path = p.removesuffix("/update-branch") if self.fail_first_poll else None
             if b.get("expected_head_sha") not in (None, head):
                 return 422, {"message": "expected_head_sha does not match"}
             if not self.anc(base_sha, head):
@@ -176,6 +184,12 @@ class _ProviderGitHub(_DisposableGitHubServer):
                 body = json.loads(self.rfile.read(n) or b"{}") if n else {}
                 u = urlparse(self.path)
                 p = unquote(u.path)
+                if self.command == "GET" and p == outer.fail_path:
+                    outer.fail_path = None
+                    return self._send_json(503, {"message": "Service Unavailable"})
+                if self.command == "GET" and p == f"{SLUG}/activity" and (code := outer.fail_activity) is not None:
+                    outer.fail_activity, self.close_connection = None, True
+                    return self._send_json(code, {"message": "Service Unavailable"}) if code else None
                 if self.command == "GET" and (p.endswith(("/check-runs", "/protection")) or "/actions/" in p and "permissions" not in p
                                               or re.fullmatch(rf"{SLUG}/pulls/\d+", p)):
                     return super().do_GET()  # CI runs, artifacts, protection and PR reads stay the delivery fake's
@@ -188,7 +202,7 @@ class _ProviderGitHub(_DisposableGitHubServer):
                 outer.observe()
                 self._send_json(code, out)
 
-            do_GET = do_POST = do_PATCH = do_PUT = _serve
+            do_GET = do_POST = do_PATCH = do_PUT = do_DELETE = _serve
 
         return Handler
 
@@ -386,9 +400,31 @@ class HostedScenarioRunTest(unittest.TestCase):
         """AC4: head_merged_without_force_push is read from the provider's ref history: a force push recorded there for
         the renewed head fails scenario 4, and the run still closes every PR it left unmerged. The run also has no reader
         token: the permission-denial subcheck is unavailable (never probed with another token) and the run cannot qualify."""
+        def s4_reads(r: SimpleNamespace) -> list[tuple]:  # the ledgered reads from scenario 4's update-branch to its ref-activity read
+            texts = [f.read_text(encoding="utf-8") for f in sorted((self.tmp / "ev").rglob("operation-ledger.jsonl"))]
+            self.assertFalse([t for t in TOKENS if any(t in x for x in texts)], "a token reached the ledger")
+            put = ("PUT", f"{SLUG}/pulls/{r.s4.get('pr_number')}/update-branch", 202)
+            rows = next((rs for x in texts if put in (rs := [(e["method"], urlparse(e["url"]).path, e["status_code"])
+                                                             for e in map(json.loads, x.splitlines())])), [])
+            self.assertIn(put, rows, "scenario 4's update-branch is not in any ledger")
+            after = rows[rows.index(put) + 1:]
+            return after[:next((i for i, row in enumerate(after) if row[1] == f"{SLUG}/activity"), len(after)) + 1]
+
+        root = self.tmp
+        for code in (503, 0):  # #128: a failed ref-activity read is ledgered with its status (0: no response) and decides nothing
+            self.tmp = Path(tempfile.mkdtemp(dir=root))
+            with self.subTest(activity=code), self._provider() as (gh, origin, agy):
+                gh.fail_activity = code
+                r = self._run(gh, origin, agy)
+                self.assertEqual(s4_reads(r)[-1], ("GET", f"{SLUG}/activity", code))
+                self.assertIsNone(r.s4.get("head_merged_without_force_push"), r.s4)
+        self.tmp = Path(tempfile.mkdtemp(dir=root))
         with self._provider() as (gh, origin, agy):
-            gh.inject_force_push = True
+            gh.inject_force_push = gh.fail_first_poll = True
             r = self._run(gh, origin, agy, reader=None)
+        with self.subTest("#128: the ledger records scenario 4's polling and ref-activity reads, the failed one with its status"):
+            pr = f"{SLUG}/pulls/{r.s4.get('pr_number')}"
+            self.assertEqual(s4_reads(r), [("GET", pr, 503), ("GET", pr, 200), ("GET", f"{SLUG}/activity", 200)])
         pd = r.s2.get("permission_denial") or {}
         self.assertEqual((r.probes, pd.get("observed"), pd.get("status")), ([], None, "unavailable"), pd)
         self.assertNotEqual(r.s2.get("outcome"), "verified")
@@ -399,6 +435,23 @@ class HostedScenarioRunTest(unittest.TestCase):
         self.assertTrue(r.created)
         for n in r.created:
             self.assertEqual(gh.pulls[n]["state"], "closed", f"PR {n} left open")
+
+    def test_no_scenario_context_leaves_no_run_branch_or_open_pr(self) -> None:
+        """#128 N2: preflight is clean but the hosted repository has no .factory/child-contract.json, so no scenario
+        context opens and no scenario runs; the run leaves no branch of its own and no open PR behind."""
+        with self._provider() as (gh, origin, agy):
+            with tempfile.TemporaryDirectory() as d:
+                env = {"GIT_INDEX_FILE": str(Path(d) / "index"), "GIT_WORK_TREE": d}
+                gh.g("read-tree", "feature/demo", env=env)
+                gh.g("update-index", "--force-remove", ".factory/child-contract.json", env=env)
+                tree = gh.g("write-tree", env=env)
+            gh.g("update-ref", "refs/heads/feature/demo", gh.g("commit-tree", tree, "-p", "feature/demo", "-m", "no contract"))
+            r = self._run(gh, origin, agy)
+            heads = gh.g("for-each-ref", "refs/heads", "--format=%(refname:short)").split()
+        self.assertEqual((r.res["preflight"]["status"], r.res.get("scenarios")), ("verified", {}), r.res["preflight"]["blockers"])
+        self.assertTrue(any(b.startswith("scenario-context-unavailable") for b in r.res["blockers"]), r.res["blockers"])
+        self.assertEqual([h for h in heads if h.startswith(f"{CANDIDATE_BRANCH_PREFIX}{r.res['run_id']}")], [], "per-run branch left behind")
+        self.assertEqual([n for n, pr in gh.pulls.items() if pr["state"] == "open"], [], "PR left open")
 
     def test_reader_with_wrong_login_or_write_access_blocks_preflight(self) -> None:
         """The reader behind scenario 2's 403 is pinned: a token of another login, or one with push or admin rights,
