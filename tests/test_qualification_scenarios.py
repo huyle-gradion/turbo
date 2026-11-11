@@ -31,6 +31,7 @@ class _ProviderGitHub(_DisposableGitHubServer):
         self.lock, self.reviews, self.activity, self.refs, self.merges = threading.RLock(), {}, [], {}, []
         self.inject_force_push, self.root = False, self.sha("feature/demo", True)
         self.fail_first_poll, self.fail_path = False, None  # one failing read of the PR polled after update-branch
+        self.fail_activity: int | None = None  # one failing ref-activity read: its status, or 0 for no response at all
         self.observe()
 
     def g(self, *args: str, who: str | None = None, inp: str | None = None, env: dict | None = None) -> str:
@@ -186,6 +187,9 @@ class _ProviderGitHub(_DisposableGitHubServer):
                 if self.command == "GET" and p == outer.fail_path:
                     outer.fail_path = None
                     return self._send_json(503, {"message": "Service Unavailable"})
+                if self.command == "GET" and p == f"{SLUG}/activity" and (code := outer.fail_activity) is not None:
+                    outer.fail_activity, self.close_connection = None, True
+                    return self._send_json(code, {"message": "Service Unavailable"}) if code else None
                 if self.command == "GET" and (p.endswith(("/check-runs", "/protection")) or "/actions/" in p and "permissions" not in p
                                               or re.fullmatch(rf"{SLUG}/pulls/\d+", p)):
                     return super().do_GET()  # CI runs, artifacts, protection and PR reads stay the delivery fake's
@@ -396,20 +400,31 @@ class HostedScenarioRunTest(unittest.TestCase):
         """AC4: head_merged_without_force_push is read from the provider's ref history: a force push recorded there for
         the renewed head fails scenario 4, and the run still closes every PR it left unmerged. The run also has no reader
         token: the permission-denial subcheck is unavailable (never probed with another token) and the run cannot qualify."""
-        with self._provider() as (gh, origin, agy):
-            gh.inject_force_push = gh.fail_first_poll = True
-            r = self._run(gh, origin, agy, reader=None)
-        with self.subTest("#128: the ledger records scenario 4's polling and ref-activity reads, the failed one with its status"):
+        def s4_reads(r: SimpleNamespace) -> list[tuple]:  # the ledgered reads from scenario 4's update-branch to its ref-activity read
             texts = [f.read_text(encoding="utf-8") for f in sorted((self.tmp / "ev").rglob("operation-ledger.jsonl"))]
             self.assertFalse([t for t in TOKENS if any(t in x for x in texts)], "a token reached the ledger")
-            pr = f"{SLUG}/pulls/{r.s4.get('pr_number')}"
-            put = ("PUT", f"{pr}/update-branch", 202)
+            put = ("PUT", f"{SLUG}/pulls/{r.s4.get('pr_number')}/update-branch", 202)
             rows = next((rs for x in texts if put in (rs := [(e["method"], urlparse(e["url"]).path, e["status_code"])
                                                              for e in map(json.loads, x.splitlines())])), [])
             self.assertIn(put, rows, "scenario 4's update-branch is not in any ledger")
             after = rows[rows.index(put) + 1:]
-            reads = after[:next((i for i, row in enumerate(after) if row[1] == f"{SLUG}/activity"), len(after)) + 1]
-            self.assertEqual(reads, [("GET", pr, 503), ("GET", pr, 200), ("GET", f"{SLUG}/activity", 200)])
+            return after[:next((i for i, row in enumerate(after) if row[1] == f"{SLUG}/activity"), len(after)) + 1]
+
+        root = self.tmp
+        for code in (503, 0):  # #128: a failed ref-activity read is ledgered with its status (0: no response) and decides nothing
+            self.tmp = Path(tempfile.mkdtemp(dir=root))
+            with self.subTest(activity=code), self._provider() as (gh, origin, agy):
+                gh.fail_activity = code
+                r = self._run(gh, origin, agy)
+                self.assertEqual(s4_reads(r)[-1], ("GET", f"{SLUG}/activity", code))
+                self.assertIsNone(r.s4.get("head_merged_without_force_push"), r.s4)
+        self.tmp = Path(tempfile.mkdtemp(dir=root))
+        with self._provider() as (gh, origin, agy):
+            gh.inject_force_push = gh.fail_first_poll = True
+            r = self._run(gh, origin, agy, reader=None)
+        with self.subTest("#128: the ledger records scenario 4's polling and ref-activity reads, the failed one with its status"):
+            pr = f"{SLUG}/pulls/{r.s4.get('pr_number')}"
+            self.assertEqual(s4_reads(r), [("GET", pr, 503), ("GET", pr, 200), ("GET", f"{SLUG}/activity", 200)])
         pd = r.s2.get("permission_denial") or {}
         self.assertEqual((r.probes, pd.get("observed"), pd.get("status")), ([], None, "unavailable"), pd)
         self.assertNotEqual(r.s2.get("outcome"), "verified")
