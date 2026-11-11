@@ -6,10 +6,10 @@ from dataclasses import dataclass, field
 import hashlib
 import json
 from pathlib import Path
-import subprocess
 from typing import Any
 import urllib.request
 
+from factory import gitio
 from factory.ci_gate import SHA40_RE
 from factory.errors import UsageError
 from factory.improvement import (
@@ -253,21 +253,18 @@ def resolve_approved_version(
         return _fail("unmerged-revision", f"invalid merge_commit_sha on PR #{pr_num}: {merge_sha!r}")
 
     # 3. Git commit object & ancestry verification in repository
-    cat_res = subprocess.run(["git", "-C", str(repo), "cat-file", "-t", merge_sha], capture_output=True, text=True)
-    if cat_res.returncode != 0 or cat_res.stdout.strip() != "commit":
+    cat_res = gitio.git(repo, "cat-file", "-t", merge_sha)
+    if not cat_res.ok or cat_res.output != "commit":
         return _fail("unmerged-revision", f"merge commit {merge_sha} not found in repository")
 
-    anc_main = subprocess.run(["git", "-C", str(repo), "merge-base", "--is-ancestor", merge_sha, "main"], capture_output=True, text=True)
-    anc_head = subprocess.run(["git", "-C", str(repo), "merge-base", "--is-ancestor", merge_sha, "HEAD"], capture_output=True, text=True)
-    if anc_main.returncode != 0 and anc_head.returncode != 0:
+    if not gitio.is_ancestor(repo, merge_sha, "main") and not gitio.is_ancestor(repo, merge_sha, "HEAD"):
         return _fail("unmerged-revision", f"merge commit {merge_sha} is not an ancestor of main or current HEAD")
 
     # 4. Extract exact approved content directly from git commit (never local workspace files)
-    show_res = subprocess.run(["git", "-C", str(repo), "show", f"{merge_sha}:{target_path}"], capture_output=True)
-    if show_res.returncode != 0:
+    show_code, content_bytes = gitio._git_bytes(repo, "show", f"{merge_sha}:{target_path}")
+    if show_code != 0:
         return _fail("missing-approved-content", f"target file {target_path} not found in merge commit {merge_sha}")
 
-    content_bytes = show_res.stdout
     actual_sha = hashlib.sha256(content_bytes).hexdigest()
     if actual_sha != report.get("candidate_content_digest"):
         return _fail(

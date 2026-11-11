@@ -101,10 +101,11 @@ def _blob_sha(worktree: Path, rev: str, path: str) -> str | None:
 
 def _materialize(repo: Path, sha: str, dest: Path) -> None:
     """Write the committed tree of `sha` into `dest` from raw objects: no index, hooks, filters or replace objects."""
-    run = lambda *a, data=None: subprocess.run(  # noqa: E731
-        ["git", "--no-replace-objects", *a], cwd=repo, input=data, capture_output=True, check=True, timeout=120,
-        env={**os.environ, "GIT_NO_REPLACE_OBJECTS": "1"},
-    ).stdout
+    def run(*args: str, data: bytes | None = None) -> bytes:
+        done = gitio._run_git(repo, ("--no-replace-objects", *args), input=data, timeout=120)
+        done.check_returncode()
+        return done.stdout
+
     entries = [e.split(b"\t", 1) for e in run("ls-tree", "-r", "-z", "--full-tree", sha).split(b"\0") if e]
     blobs = [(meta.split(), path.decode()) for meta, path in entries if meta.split()[1] == b"blob"]
     data, pos = run("cat-file", "--batch", data=b"".join(m[2] + b"\n" for m, _ in blobs)), 0

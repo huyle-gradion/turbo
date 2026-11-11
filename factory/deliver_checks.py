@@ -48,14 +48,10 @@ def remaining_seconds(deadline: float, phase: str, limit_s: int) -> float:
 
 def git_timed(repo: Path, deadline: float, limit_s: int, phase: str, *args: str) -> gitio.GitResult:
     rem = remaining_seconds(deadline, phase, limit_s)
-    cmd = ("git", "-C", str(repo), *args)
     try:
-        completed = subprocess.run(
-            list(cmd), text=True, capture_output=True, check=False, shell=False, env={**os.environ, "GIT_TERMINAL_PROMPT": "0"}, timeout=rem
-        )
+        return gitio.git_result(repo, args, timeout=rem)
     except subprocess.TimeoutExpired as exc:
         raise AttemptTimeoutError(f"attempt timed out during {phase} after {limit_s}s") from exc
-    return gitio.GitResult(cmd, completed.returncode, (completed.stdout + completed.stderr).strip())
 
 def collect_redaction_secrets() -> tuple[str, ...]:
     keys = ("ASANA_ACCESS_TOKEN", "ASANA_PAT", "ASANA_TOKEN", "GITHUB_TOKEN", "GH_TOKEN", "TURBO_GITHUB_TOKEN")
