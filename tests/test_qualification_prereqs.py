@@ -1,13 +1,17 @@
 """Hosted qualification records only real prerequisite evidence (#97)."""
 from __future__ import annotations
 
-import ast, contextlib, json, os, re, shutil, stat, tempfile, unittest
+import ast, contextlib, copy, json, os, re, shutil, stat, sys, tempfile, unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
-from factory import qualification
-from factory.qualification import SEED_ASSETS_DIR, prepare_qualification_candidate
+from factory import automated_qa, ci_gate, qualification
+from factory.ci_selection import build_required_ci_checks
+from factory.independent_review import approval
+from factory.qualification import CALC_CANDIDATE_SRC, CALC_CANDIDATE_TEST, SEED_ASSETS_DIR, prepare_qualification_candidate
 from support import ROOT, commit, git, make_repo
+from test_deliver_checks import _DisposableGitHubServer
 from test_qualification import _HostedQualificationFakeServer
 
 REPO = "turbo-factory/turbo-qual-67"
@@ -47,6 +51,31 @@ def _hosted_origin(case: Path, *, with_contract: bool) -> tuple[Path, str, str]:
     return origin, cand, base
 
 
+def _seeded_origin(case: Path, src: str) -> tuple[Path, Path, str, str]:
+    """A local bare origin with the whole reproducible seed on feature/demo (factory/ -> .factory/, as documented)
+    and a candidate commit on HEAD_BRANCH; returns (origin root for the URL template, bare, cand, base)."""
+    repo = make_repo(case)
+    for f in sorted(p for p in SEED_ASSETS_DIR.rglob("*") if p.is_file()):
+        rel = f.relative_to(SEED_ASSETS_DIR).as_posix()
+        dst = repo / (".factory/" + rel[len("factory/"):] if rel.startswith("factory/") else rel)
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.write_bytes(f.read_bytes())
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "seed")
+    base = git(repo, "rev-parse", "HEAD")
+    git(repo, "branch", "feature/demo", base)
+    git(repo, "checkout", "-q", "-b", HEAD_BRANCH)
+    commit(repo, "tests/test_calc.py", CALC_CANDIDATE_TEST, "candidate tests")
+    cand = commit(repo, "src/calc.py", src, "candidate")
+    bare = case / "origin" / f"{REPO}.git"
+    git(case, "clone", "-q", "--bare", str(repo), str(bare))
+    return case / "origin", bare, cand, base
+
+
+_OK = [sys.executable, "-c", "print('ok')"]
+_REVIEWER_BLOCKERS = ("unsupported-reviewer-capability", "reviewer-not-run")
+
+
 def _fake_reviewer(tmp: Path) -> str:
     """An executable that exists but is not a reviewer: it runs nothing and produces no review record."""
     exe = tmp / "bin" / "agy"
@@ -61,7 +90,8 @@ class QualificationRealPrerequisiteTest(unittest.TestCase):
         tmp = tempfile.mkdtemp(prefix="turbo-qual-97-")
         self.addCleanup(shutil.rmtree, tmp, True)
         self.tmp = Path(tmp)
-        env = mock.patch.dict(os.environ, {"TURBO_LIVE_QUALIFICATION": "0"})
+        # GIT_ALLOW_PROTOCOL=file: a broken clone-origin seam fails offline instead of reaching github.com (#104).
+        env = mock.patch.dict(os.environ, {"TURBO_LIVE_QUALIFICATION": "0", "GIT_ALLOW_PROTOCOL": "file"})
         env.start()
         self.addCleanup(env.stop)
         os.environ.pop("AGY_BIN", None)
@@ -96,6 +126,190 @@ class QualificationRealPrerequisiteTest(unittest.TestCase):
                 for p in reversed(patches):
                     p.stop()
             return rec, list(gh.requests), cand_sha
+
+    def _gated_prepare(self, *, src: str = CALC_CANDIDATE_SRC, ci: str = "pass", move_head: bool = False,
+                       raise_in: str | None = None) -> SimpleNamespace:
+        """#108 in the hosted order: run_hosted_qualification opens the scenario context while the candidate branch does
+        not exist on the origin yet; preparation's PR lookup is when it appears. CI comes from the delivery fake GitHub
+        server (`ci`: pass | fail | missing). Scenario 1's delivery gate is captured, and its child folder is read back
+        through the gate's own CI and QA checks; scenarios 2-4 only record the candidate SHA they were given."""
+        case = Path(tempfile.mkdtemp(dir=self.tmp))
+        origin, bare, cand, base = _seeded_origin(case, src)
+        git(bare, "update-ref", "-d", f"refs/heads/{HEAD_BRANCH}")  # fresh run: no candidate when the context clones
+        owner, name = REPO.split("/")
+        pr = {"number": 1, "state": "open", "merged": False, "title": "q", "body": "",
+              "html_url": f"https://github.com/{REPO}/pull/1",
+              "head": {"ref": HEAD_BRANCH, "sha": cand, "repo": {"full_name": REPO}},
+              "base": {"ref": "feature/demo", "sha": base, "repo": {"full_name": REPO}}}
+        captured: dict[str, object] = {}
+        scenario_shas: dict[str, str] = {}
+        gates: list[tuple[dict, dict]] = []
+        target: list[str] = []
+
+        def _entry(mod: object, fn: str) -> mock._patch:
+            real = getattr(mod, fn)
+            def call(*a: object, **kw: object) -> object:
+                if raise_in == fn:
+                    raise RuntimeError(f"{fn} unavailable")
+                out = real(*a, **kw)
+                captured[fn] = json.loads(json.dumps(out))
+                return out
+            return mock.patch.object(mod, fn, side_effect=call)
+
+        real_ctx = qualification.hosted_scenario_context
+
+        @contextlib.contextmanager
+        def _ctx(*a: object, **kw: object) -> object:
+            with real_ctx(*a, **kw) as ctx:
+                checks = [(r["name"], r["kind"], _OK)
+                          for r in build_required_ci_checks({**ctx.child_contract, "head_branch": HEAD_BRANCH}, ctx.conf)]
+                target.append(checks[-1][0])
+                if ci == "fail":
+                    checks[-1] = (target[0], checks[-1][1], [sys.executable, "-c", "raise SystemExit(1)"])
+                elif ci == "missing":
+                    checks = checks[:-1] + [("lint/unrelated", "guard", _OK)]
+                gh.ci_spec = {"checks": checks}
+                yield ctx
+
+        def _pulls(*_a: object, **_kw: object) -> list[dict]:  # preparation creates the candidate after the clone
+            git(bare, "update-ref", f"refs/heads/{HEAD_BRANCH}", cand)
+            return [copy.deepcopy(pr)]
+
+        def _advance(_pr: dict) -> None:  # the head branch moves while CI evidence is being recorded
+            if git(bare, "rev-parse", f"refs/heads/{HEAD_BRANCH}") == cand:
+                moved = git(bare, "-c", "user.name=t", "-c", "user.email=t@example.test", "commit-tree",
+                            f"{cand}^{{tree}}", "-p", cand, "-m", "moved")
+                git(bare, "update-ref", f"refs/heads/{HEAD_BRANCH}", moved)
+
+        real_gate = qualification.deliver_module.enforce_delivery_approval
+
+        def _gate(**kw: object) -> dict:
+            out = real_gate(**kw)
+            gates.append((kw, out))
+            return out
+
+        def _scenario(label: str, result: object) -> object:
+            def run(_url: str, _slug: str, _ev: Path, ctx: SimpleNamespace, *_a: object, **_kw: object) -> object:
+                scenario_shas[label] = ctx.cand_sha
+                return result
+            return run
+
+        sc = {"outcome": "failed", "status": "blocked", "blockers": ["not run in this test"], "artifacts": []}
+        q = "factory.qualification."
+        fakes = {"check_hosted_authorization": (True, ""), "observe_identity_and_permissions": (True, {}, []),
+                 "check_branch_protection_and_topology": (True, {}, []), "check_seed_and_workflow_capabilities": (True, {}, []),
+                 "get_remote_file_content": (200, "subtract test_subtract", ""),
+                 "get_remote_commit": (200, {"sha": base}, ""), "resolve_agy_bin": None,
+                 "integrate_approved_child": SimpleNamespace(status="blocked", landed_sha=None, tested_sha=None, blockers=[]),
+                 "assert_landed_landing_properties": (False, {}, ["not landed in this test"])}
+        with contextlib.ExitStack() as st:
+            gh = st.enter_context(_DisposableGitHubServer(bare_repo=bare, owner=owner, repo=name))
+            gh.pulls[1] = copy.deepcopy(pr)
+            # file:// so the clone receives only reachable objects, not the not-yet-pushed candidate (a local path hardlinks all).
+            st.enter_context(mock.patch(q + "HOSTED_CLONE_URL_TEMPLATE", f"file://{origin}/{{repo_slug}}.git"))
+            st.enter_context(mock.patch(q + "HOSTED_API_ORIGIN", gh.base_url))
+            # #108 F4: preparation's CI/QA wait is bounded by this module constant, so a wrong-head regression fails fast.
+            st.enter_context(mock.patch.object(qualification, "GATED_CI_QA_LIMIT_S", 15))
+            for fn, rv in fakes.items():
+                st.enter_context(mock.patch(q + fn, return_value=rv))
+            st.enter_context(mock.patch(q + "get_remote_pulls", side_effect=_pulls))
+            st.enter_context(mock.patch.object(qualification.deliver_module, "enforce_delivery_approval", side_effect=_gate))
+            st.enter_context(mock.patch(q + "run_scenario_2_prereq_missing_and_denied", _scenario("sc2", sc)))
+            st.enter_context(mock.patch(q + "run_scenario_3_competing_base_rejection", _scenario("sc3", (sc, HEAD_BRANCH, base, 3))))
+            st.enter_context(mock.patch(q + "run_scenario_4_renewed_verification_after_base_change", _scenario("sc4", sc)))
+            st.enter_context(_entry(ci_gate, "evaluate_child_pr_ci_gate"))
+            st.enter_context(_entry(automated_qa, "evaluate_child_qa"))
+            st.enter_context(mock.patch(q + "hosted_scenario_context", _ctx))
+            if move_head:
+                gh.on_patch_pull = _advance
+            res = qualification.run_hosted_qualification(
+                REPO, case / "ev", live_enabled=True, integrator_token="valid-int-tok", competitor_token="valid-comp-tok",
+                base_url=gh.base_url)
+            self.assertEqual(len(gates), 1, f"scenario 1 did not evaluate its delivery gate once: {res['blockers']}")
+            gate_kw, gate = gates[0]
+            child, child_dir, home, repo = gate_kw["child"], Path(gate_kw["child_dir"]), gate_kw["home"], gate_kw["repo"]
+            ev = approval.load_prerequisite_evidence(child_dir, home)
+            ci_eval = approval.evaluate_ci_prerequisite(cand, base, ev["ci_record"], repo=repo, home=home,
+                                                        child=child, conf=gate_kw["conf"])
+            qa_eval = approval.evaluate_qa_prerequisite(
+                cand, base, ev["qa_record"], child_dir=child_dir, home=home, repo=repo, child=child,
+                expected_tested_sha=ci_eval.get("tested_sha")) if isinstance(ev["qa_record"], dict) else {"status": "qa-missing"}
+            qa_rounds = sorted((child_dir / "automated-qa").glob("round-*/record.json"))
+            scenario_shas["sc1"] = res["scenarios"]["confirmed_landing"]["candidate_sha"]
+            return SimpleNamespace(rec=res["preparation"], ev=ev, ci_eval=ci_eval, qa_eval=qa_eval, cand=cand, base=base,
+                                   target=target[0], captured=captured, child_dir=child_dir, qa_rounds=qa_rounds,
+                                   gate_kw=gate_kw, gate=gate, scenario_shas=scenario_shas)
+
+    def _named(self, r: SimpleNamespace, prefix: str) -> None:
+        """Preparation names `prefix` among its own blockers (reviewer blockers always block, so `blocked` alone says nothing)."""
+        self.assertEqual(r.rec["status"], "blocked")
+        own = [b for b in r.rec["blockers"] if not b.startswith(_REVIEWER_BLOCKERS)]
+        self.assertTrue(any(b.startswith(prefix) for b in own), f"no {prefix!r} blocker in {own}")
+
+    def test_hosted_preparation_writes_gate_format_ci_and_qa(self) -> None:
+        """#108 AC1/AC3: passing required checks give a ci-verification.json and an automated_qa record for the exact
+        head, both accepted by the delivery gate's own CI and QA checks, and both exactly as the entry points made them.
+        In the hosted order, scenarios 1-4 get the candidate preparation verified (F1), and scenario 1's delivery gate
+        reads the folder preparation wrote, so its CI and QA prerequisites verify (F2)."""
+        r = self._gated_prepare()
+        self.assertEqual(r.scenario_shas, dict.fromkeys(("sc1", "sc2", "sc3", "sc4"), r.cand), "scenarios got another SHA")
+        self.assertEqual((r.gate_kw["candidate_sha"], r.gate["candidate_sha"]), (r.cand, r.cand), r.gate_kw)
+        gate_pre = r.gate.get("prerequisites") or {}
+        self.assertEqual(((gate_pre.get("ci") or {}).get("status"), (gate_pre.get("automated_qa") or {}).get("status")),
+                         ("verified", "qa-verified"), f"scenario 1's gate did not read preparation's records: {gate_pre}")
+        self.assertEqual(r.ci_eval["status"], "verified", r.ci_eval)
+        self.assertEqual(r.qa_eval["status"], "qa-verified", r.qa_eval)
+        self.assertEqual((r.ev["ci_record"]["candidate_sha"], r.ev["qa_record"]["candidate_sha"]), (r.cand, r.cand))
+        self.assertEqual(r.ev["ci_record"]["selection_plan"]["changed_paths"], ["src/calc.py", "tests/test_calc.py"],
+                         "CI selection did not see the candidate's diff (was the candidate fetched after the clone?)")
+        self.assertEqual(r.ev["ci_record"], r.captured["evaluate_child_pr_ci_gate"], "persisted CI record is not the CI gate's output")
+        self.assertEqual(r.ev["qa_record"], r.captured["evaluate_child_qa"], "persisted QA record is not automated QA's output")
+        ci, qa = r.rec["prerequisites"]["ci"], r.rec["prerequisites"]["qa"]
+        self.assertEqual((ci.get("status"), ci.get("candidate_sha")), ("verified", r.cand), ci)
+        self.assertEqual((qa.get("qa_verified"), qa.get("candidate_sha")), (True, r.cand), qa)
+        # Real reviewers are #104: they still block, but nothing else does.
+        self.assertEqual(r.rec["status"], "blocked")
+        self.assertEqual([b for b in r.rec["blockers"] if not b.startswith(_REVIEWER_BLOCKERS)], [], r.rec["blockers"])
+
+    def test_hosted_preparation_blocks_on_rejected_or_unavailable_ci_and_qa(self) -> None:
+        """#108 AC2/AC3: the gate's own checks reject failed, missing or other-head CI and a failing QA case, and
+        preparation names the reason; QA does not run on a candidate whose CI did not verify; an entry point that
+        cannot run leaves no record and blocks as unavailable."""
+        for name, kw in (("failed required check", dict(ci="fail")), ("missing required check", dict(ci="missing")),
+                         ("evidence for a different head", dict(move_head=True))):
+            with self.subTest(name):
+                r = self._gated_prepare(**kw)
+                ci_rec = r.ev["ci_record"]
+                self.assertIsInstance(ci_rec, dict, "the CI gate's record is persisted even when it does not verify")
+                self.assertEqual(ci_rec["candidate_sha"], r.cand)
+                self.assertNotEqual(r.ci_eval["status"], "verified", r.ci_eval)
+                self.assertNotEqual(r.rec["prerequisites"]["ci"].get("status"), "verified")
+                self._named(r, "ci-not-verified")
+                self.assertTrue(ci_rec["blockers"], ci_rec)
+                for b in ci_rec["blockers"]:
+                    self.assertTrue(any(b in pb for pb in r.rec["blockers"]), f"gate reason {b!r} not named in {r.rec['blockers']}")
+                if not kw.get("move_head"):
+                    self.assertTrue(any(r.target in pb for pb in r.rec["blockers"]), r.rec["blockers"])
+                self.assertNotIn("evaluate_child_qa", r.captured, "QA ran on a candidate whose CI did not verify")
+                self.assertEqual(r.qa_rounds, [])
+        with self.subTest("QA case failing on the candidate"):
+            r = self._gated_prepare(src=CALC_CANDIDATE_SRC.replace("return a + b", "return a - b"))
+            self.assertEqual(r.ci_eval["status"], "verified", r.ci_eval)
+            self.assertEqual(r.ev["qa_record"]["candidate_sha"], r.cand)
+            self.assertNotEqual(r.qa_eval["status"], "qa-verified", r.qa_eval)
+            self.assertIsNot(r.rec["prerequisites"]["qa"].get("qa_verified"), True)
+            self._named(r, "qa-not-verified")
+            self.assertTrue(any("QA-CALC-1" in b or "CRIT-CALC-1" in b for b in r.rec["blockers"]), r.rec["blockers"])
+        for fn, key in (("evaluate_child_pr_ci_gate", "ci"), ("evaluate_child_qa", "qa")):
+            with self.subTest(f"{fn} cannot run: unavailable, nothing hand-written"):
+                r = self._gated_prepare(raise_in=fn)
+                if key == "ci":
+                    self.assertFalse((r.child_dir / "ci-verification.json").exists(), "a CI record was synthesized")
+                self.assertEqual(r.qa_rounds if key == "qa" else [], [], "a QA record was synthesized")
+                self.assertEqual(r.rec["prerequisites"][key].get("status"), "unavailable", r.rec["prerequisites"][key])
+                self.assertNotEqual(r.ci_eval["status"] if key == "ci" else r.qa_eval["status"],
+                                    "verified" if key == "ci" else "qa-verified")
+                self._named(r, f"{key}-unavailable")
 
     def test_factory_has_no_test_imports(self) -> None:
         """#97/#102 AC1: no .py under factory/ imports tests/support code or adds tests/ to sys.path; qualification keeps only the hosted path."""

@@ -6,9 +6,9 @@ from collections.abc import Iterator
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
-from factory import ci_gate, config as config_module, deliver as deliver_module, gitio
+from factory import automated_qa, ci_gate, config as config_module, deliver as deliver_module, gitio
 from factory.deliver_checks import collect_redaction_secrets, git_timed
 from factory.errors import UsageError
 from factory.independent_review import approval as approval_mod
@@ -827,6 +827,67 @@ def assert_landed_landing_properties(
     return len(blockers) == 0, details, blockers
 
 
+GATED_CI_QA_LIMIT_S = 900  # preparation's CI and QA wait (#108); read at call time
+
+
+def _gated_ci_and_qa(
+    ctx: Any, base_url: str, repo_slug: str, token: str, pr_data: dict[str, Any], *,
+    head_branch: str, base_branch: str, candidate_sha: str, base_sha: str, tokens: list[str],
+) -> tuple[dict[str, Any], dict[str, Any], list[str]]:
+    """CI and QA evidence from the factory's own entry points for the exact candidate head (#108); nothing synthesized."""
+    limit_s = GATED_CI_QA_LIMIT_S
+    child = {**ctx.child_contract, "head_branch": head_branch}
+    parent = {"gid": "qualification-67", "name": "Protected repository qualification (#67)", "criteria": []}
+    p = urlparse(base_url)
+    fast = p.scheme == "http" and p.hostname in ("127.0.0.1", "localhost", "::1")  # deliver.py's loopback settings
+    blockers: list[str] = []
+    try:
+        fetch_remote_repo(ctx.repo, repo_slug, token)  # the gate and QA read the candidate from the scenario clone
+        diff = gitio.git(ctx.repo, "diff", "--name-only", f"{base_sha}...{candidate_sha}")
+        changed = tuple(diff.output.split()) if diff.ok else ()
+        pr_info = {"number": int(pr_data.get("number") or 0), "url": pr_data.get("html_url"), "state": pr_data.get("state"),
+                   "merged": bool(pr_data.get("merged")), "head_ref": head_branch, "base_ref": base_branch,
+                   "head_sha": candidate_sha, "base_sha": base_sha, "pr_confirmed": True}
+        ci = ci_gate.evaluate_child_pr_ci_gate(
+            repo=ctx.repo, home=ctx.home, child_dir=ctx.child_dir, base_url=base_url, token=token, repo_slug=repo_slug,
+            parent=parent, child=child, conf=ctx.conf, pr_info=pr_info, head_branch=head_branch,
+            candidate_sha=candidate_sha, base_branch=base_branch, base_sha=base_sha, scope_detail={}, trace=[],
+            deadline=time.monotonic() + limit_s, limit_s=limit_s, changed_paths=changed,
+            poll_interval_s=0.05 if fast else 2.0, max_missing_polls=3 if fast else 15,
+            artifact_retry_delay_s=0.0 if fast else 2.0,
+        )
+    except Exception as exc:  # the entry point could not run: no record, unavailable, blocked
+        msg = str(redact_qualification_tokens(str(exc), tokens))
+        unavail = {"status": "unavailable", "reason": f"ci-gate-unavailable: {msg}", "candidate_sha": candidate_sha}
+        return unavail, {**unavail, "qa_verified": False, "reason": "ci-not-run"}, [f"ci-unavailable: {msg}"]
+    atomic_json(ctx.child_dir / "ci-verification.json", redact_qualification_tokens(ci, tokens), ctx.home)
+    ci_ok = ci.get("status") == "verified" and ci.get("verified") is True
+    blockers += [f"ci-not-verified ({ci.get('status')}) for {candidate_sha}: {b}" for b in (ci.get("blockers") or [])]
+    if not ci_ok:
+        blockers += [] if ci.get("blockers") else [f"ci-not-verified: CI gate status {ci.get('status')!r} for {candidate_sha}"]
+        return ci, {"status": "not-run", "qa_verified": False, "reason": "ci-not-verified", "candidate_sha": candidate_sha}, blockers
+    child_record = {
+        "gid": child.get("gid"), "candidate_sha": candidate_sha, "base_sha": base_sha, "tested_sha": ci.get("tested_sha"),
+        "head_branch": head_branch, "base_branch": base_branch, "status": ci.get("status"), "verified": ci.get("verified"),
+        "ci_verified": ci_ok, "ci_verification": ci, "pr": ci.get("pr"), "diff": {"changed_paths": list(changed)},
+    }
+    try:
+        qa = automated_qa.evaluate_child_qa(
+            repo=ctx.repo, home=ctx.home, child_dir=ctx.child_dir, base_url=base_url, token=token, repo_slug=repo_slug,
+            parent=parent, child=child, child_record=child_record, conf=ctx.conf,
+            qa_cases=automated_qa.load_qa_cases_file(ctx.repo / "qa" / "qa-cases.json"),
+            deadline=time.monotonic() + limit_s, limit_s=limit_s,
+        )
+    except Exception as exc:
+        msg = str(redact_qualification_tokens(str(exc), tokens))
+        return ci, {"status": "unavailable", "qa_verified": False, "reason": msg, "candidate_sha": candidate_sha}, blockers + [f"qa-unavailable: {msg}"]
+    if qa.get("qa_verified") is not True:
+        failed = [c.get("criterion_id") for c in (qa.get("criterion_coverage") or []) if not c.get("passed")]
+        blockers.append(f"qa-not-verified ({qa.get('status')}) for {candidate_sha}: failed criteria {failed}, "
+                        f"open findings {qa.get('open_finding_ids')}")
+    return ci, qa, blockers
+
+
 def prepare_qualification_candidate(
     base_url: str,
     repo_slug: str,
@@ -847,8 +908,12 @@ def prepare_qualification_candidate(
     existing_pr: dict[str, Any] | None = None,
     live_enabled: bool = True,
     required_contexts: tuple[str, ...] = ("build",),
+    scenario_ctx: Any = None,
 ) -> dict[str, Any]:
-    """Prepare genuine qualification candidate, PR, and prerequisite evidence."""
+    """Prepare genuine qualification candidate, PR, and prerequisite evidence.
+
+    With `scenario_ctx` (#108), CI and QA come from the delivery chain's own entry points for the exact head.
+    """
     evidence_dir = Path(evidence_dir)
     evidence_dir.mkdir(parents=True, exist_ok=True)
     tokens = [integrator_token or "", competitor_token or ""]
@@ -961,33 +1026,45 @@ def prepare_qualification_candidate(
     pr_head_sha = (pr_data or {}).get("head", {}).get("sha", pr_head_sha)
     pr_base_sha = (pr_data or {}).get("base", {}).get("sha", pr_base_sha)
 
-    # 3. CI Gate Verification
-    if not allow_test_origin and pr_head_sha != "unavailable":
-        ok_ci, ci_rec, ci_blockers = poll_ci_check(
-            base_url, repo_slug, pr_head_sha, pr_base_sha, integrator_token, ledger=local_ledger,
-        )
+    # 3-4. CI gate and automated QA for the exact candidate head.
+    if scenario_ctx is not None:
+        if pr_data and pr_head_sha != "unavailable":
+            ci_rec, qa_rec, gated = _gated_ci_and_qa(
+                scenario_ctx, base_url, repo_slug, integrator_token, pr_data, head_branch=head_branch,
+                base_branch=target_branch, candidate_sha=pr_head_sha, base_sha=pr_base_sha, tokens=tokens,
+            )
+        else:
+            ci_rec = qa_rec = {"status": "unavailable", "reason": "no-candidate-pr", "qa_verified": False}
+            gated = ["ci-unavailable: no candidate pull request to verify"]
+        ok_ci, ok_qa = ci_rec.get("status") == "verified", qa_rec.get("qa_verified") is True
+        prep_blockers.extend(gated)
     else:
-        ok_ci, ci_rec, ci_blockers = check_qualification_pr_ci(
-            base_url, repo_slug, pr_head_sha, pr_base_sha, integrator_token,
-            required_contexts=required_contexts, ledger=local_ledger,
-        )
-    prep_blockers.extend(ci_blockers)
+        if not allow_test_origin and pr_head_sha != "unavailable":
+            ok_ci, ci_rec, ci_blockers = poll_ci_check(
+                base_url, repo_slug, pr_head_sha, pr_base_sha, integrator_token, ledger=local_ledger,
+            )
+        else:
+            ok_ci, ci_rec, ci_blockers = check_qualification_pr_ci(
+                base_url, repo_slug, pr_head_sha, pr_base_sha, integrator_token,
+                required_contexts=required_contexts, ledger=local_ledger,
+            )
+        prep_blockers.extend(ci_blockers)
 
-    # 4. Automated QA against a checkout of the exact candidate commit; never the seed copy.
-    pdir = product_dir
-    if pdir is None and not allow_test_origin and pr_head_sha != "unavailable":
-        pdir = evidence_dir / "candidate-checkout"
-        try:
-            safe_dir(pdir, create=False)  # refuse a symlinked checkout; never write through the link
-            shutil.rmtree(pdir, ignore_errors=True)  # never reuse a leftover checkout
-            clone_remote_repo(pdir, repo_slug, integrator_token)
-            fetch_remote_repo(pdir, repo_slug, integrator_token)
-            subprocess.run(["git", "checkout", "-q", "--detach", pr_head_sha], cwd=pdir, check=True, capture_output=True)
-        except (RuntimeError, subprocess.CalledProcessError, UsageError) as exc:
-            prep_blockers.append(f"candidate-checkout-failed: {exc}")
-            pdir = None
-    ok_qa, qa_rec, qa_blockers = _qa_on_candidate(pdir, pr_head_sha, qa_cases)
-    prep_blockers.extend(qa_blockers)
+        # 4. Automated QA against a checkout of the exact candidate commit; never the seed copy.
+        pdir = product_dir
+        if pdir is None and not allow_test_origin and pr_head_sha != "unavailable":
+            pdir = evidence_dir / "candidate-checkout"
+            try:
+                safe_dir(pdir, create=False)  # refuse a symlinked checkout; never write through the link
+                shutil.rmtree(pdir, ignore_errors=True)  # never reuse a leftover checkout
+                clone_remote_repo(pdir, repo_slug, integrator_token)
+                fetch_remote_repo(pdir, repo_slug, integrator_token)
+                subprocess.run(["git", "checkout", "-q", "--detach", pr_head_sha], cwd=pdir, check=True, capture_output=True)
+            except (RuntimeError, subprocess.CalledProcessError, UsageError) as exc:
+                prep_blockers.append(f"candidate-checkout-failed: {exc}")
+                pdir = None
+        ok_qa, qa_rec, qa_blockers = _qa_on_candidate(pdir, pr_head_sha, qa_cases)
+        prep_blockers.extend(qa_blockers)
 
     # 5. Security & independent review: only a reviewer-produced record counts; an executable on PATH is not a review.
     # Preparation does not run a reviewer, so both records stay unavailable and block.
@@ -1248,7 +1325,7 @@ def run_scenario_1_confirmed_landing(
     code, base_c, _ = get_remote_commit(base_url, repo_slug, base_branch, integrator_token, ledger=sc_ledger)
     base_sha = base_c.get("sha", ctx.base_sha) if code == 200 else ctx.base_sha
     main_sha_before = gitio.remote_ref(ctx.repo, "main") or gitio.commit_sha(ctx.repo, "refs/heads/main")
-    sc1_child = safe_dir(ctx.home / "attempt-sc1", create=True)
+    sc1_child = ctx.child_dir  # preparation's CI and QA records live here; the delivery gate reads them (#108)
     pr_num, cand_sha = 1, ctx.cand_sha
     if not allow_test_origin:
         code_pr, pr_live, _ = _http_req("GET", f"{base_url.rstrip('/')}/repos/{repo_slug}/pulls/5", integrator_token, base_url, [], time.monotonic() + 15.0, 15)
@@ -1637,25 +1714,34 @@ def run_hosted_qualification(
         "recorded_at": approval_mod.now(),
     }
 
-    # 4. Candidate preparation (observes preflight blockers or prepares candidate)
-    prep_record = prepare_qualification_candidate(
-        base_url, repo_slug, evidence_dir,
-        target_branch=branch,
-        integrator_token=integrator_token,
-        competitor_token=competitor_token,
-        ledger=ledger,
-        allow_test_origin=allow_test_origin,
-        live_enabled=live_enabled,
-    )
-
+    # 4. Open the hosted scenario context first: preparation records CI and QA evidence into its child folder (#108).
     scenarios: dict[str, Any] = {}
     scenario_blockers: list[str] = []
-    if not all_preflight_blockers and base_url.rstrip("/") != HOSTED_API_ORIGIN:
-        scenario_blockers.append(f"scenario-context-unavailable: hosted scenarios need a clone from {HOSTED_API_ORIGIN}, not {base_url}")
-    elif not all_preflight_blockers:
-        ws_root = safe_dir(evidence_dir / "workspace", create=True)
-        with contextlib.suppress(_ScenarioContextUnavailable), hosted_scenario_context(
-                ws_root, repo_slug, integrator_token, branch=branch, blockers=scenario_blockers) as ctx:
+    with contextlib.ExitStack() as stack:
+        ctx = None
+        if not all_preflight_blockers and base_url.rstrip("/") != HOSTED_API_ORIGIN:
+            scenario_blockers.append(f"scenario-context-unavailable: hosted scenarios need a clone from {HOSTED_API_ORIGIN}, not {base_url}")
+        elif not all_preflight_blockers:
+            ws_root = safe_dir(evidence_dir / "workspace", create=True)
+            with contextlib.suppress(_ScenarioContextUnavailable):
+                ctx = stack.enter_context(hosted_scenario_context(
+                    ws_root, repo_slug, integrator_token, branch=branch, blockers=scenario_blockers))
+
+        # 5. Candidate preparation (observes preflight blockers or prepares candidate)
+        prep_record = prepare_qualification_candidate(
+            base_url, repo_slug, evidence_dir,
+            target_branch=branch,
+            integrator_token=integrator_token,
+            competitor_token=competitor_token,
+            ledger=ledger,
+            allow_test_origin=allow_test_origin,
+            live_enabled=live_enabled,
+            scenario_ctx=ctx,
+        )
+
+        if ctx is not None:
+            if prep_record.get("candidate_sha") not in (None, "unavailable"):
+                ctx.cand_sha = prep_record["candidate_sha"]  # the context opened before the candidate existed (#108)
             # 1. Scenario 1: Confirmed landing
             sc1_res = run_scenario_1_confirmed_landing(
                 base_url, repo_slug, evidence_dir, ctx, integrator_token, competitor_token,
@@ -1686,7 +1772,7 @@ def run_hosted_qualification(
             )
             scenarios["renewed_verification_after_base_change"] = sc4_res
 
-    # 5. Evidence index reduction
+    # 6. Evidence index reduction
     parent_index = build_parent_evidence_index(scenarios, f_rev, mode="hosted")
     reduced_index, all_qual, red_blockers = reduce_evidence_index(
         parent_index, preflight_record, scenarios, preparation=prep_record,
