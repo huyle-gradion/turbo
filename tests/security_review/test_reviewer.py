@@ -193,5 +193,24 @@ class SecurityReviewerTest(unittest.TestCase):
             self.assertEqual(security_review.main(["--repo", str(repo), "--home", str(repo), "--task", "900"]), 2)
 
 
+    def test_single_fenced_json_object_is_accepted_and_prompt_forbids_fences(self) -> None:
+        sha = "c" * 40
+        approved = json.dumps({"outcome": "approved", "findings": []})
+        blocking = json.dumps({"outcome": "changes-requested", "findings": [{"policy_id": "SEC-POL-01", "rule": "hardcoded-secret", "severity": "critical", "blocking": True, "file_path": "src/a.py", "line": 2, "evidence": "API_SECRET = 's'"}]})
+        for raw in (approved, blocking):
+            expected = security_review._parse_reviewer_findings(raw, sha, 1)
+            self.assertEqual(expected[1], [])
+            for fenced in (f"```json\n{raw}\n```", f"```\n{raw}\n```", f"  \n```json\n{raw}\n```\n  "):
+                with self.subTest(fenced=fenced):
+                    self.assertEqual(security_review._parse_reviewer_findings(fenced, sha, 1), expected)
+        for bad in (f"Here it is:\n```json\n{approved}\n```", f"```json\n{approved}\n```\nDone.", f"```json\n{approved}\n```\n```json\n{approved}\n```",
+                    f"```json\n{approved}\n", f"```json\n[{approved}]\n```"):
+            with self.subTest(bad=bad):
+                findings, issues = security_review._parse_reviewer_findings(bad, sha, 1)
+                self.assertEqual(findings, [])
+                self.assertRegex(issues[0], "JSON")
+        prompt = security_review.build_security_reviewer_prompt(PARSED_CHILD, "a" * 40, sha, {"changed_paths": ["src/a.py"]}, [])
+        self.assertRegex(prompt, r"(?i)without markdown fences")
+
 if __name__ == "__main__":
     unittest.main()

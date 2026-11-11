@@ -222,7 +222,7 @@ class ThermosRegressionsTest(unittest.TestCase):
             root = Path(tmp)
             repo, home, _, base_sha, cand_sha, conf, child_dir = self._setup_clean_candidate(root)
             for idx, bad_resp in enumerate((
-                "{malformed", "```json\n{\"outcome\": \"approved\", \"findings\": []}\n```",
+                "{malformed", "Review:\n```json\n{\"outcome\": \"approved\", \"findings\": []}\n```",
                 json.dumps({"outcome": "approved"}),
                 json.dumps({"outcome": "approved", "findings": [{"policy_id": "SEC-POL-01", "rule": "hardcoded-secret", "severity": "critical", "blocking": True, "file_path": "src/chat_bridge/auth.py"}]}),
                 json.dumps({"outcome": "changes-requested", "findings": []}),
