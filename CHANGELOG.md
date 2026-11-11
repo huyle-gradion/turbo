@@ -14,6 +14,13 @@ All notable changes to this project are documented here. The format follows [Kee
 - Unit tests, two disposable smoke demonstrations, and Ubuntu Python 3.11 CI.
 - MIT license, contribution workflow, security policy, issue and pull-request templates, and this changelog.
 
+### Changed
+
+- `deliver` now runs two sessions per child (#117). A test-author session, whose prompt carries `ROLE: test-author`, commits failing tests only and declares its red run on a `TURBO-RED: <json>` line. The factory runs that command itself at the test-author commit, sandboxed without network. An implementer session then runs in its own isolated home and must leave every test-author file byte-identical, and the red command must pass at the candidate. This applies to the initial delivery only, not to repair rounds.
+- New refusal statuses, none of which opens a pull request: `test-author-failed`, `red-refused`, `test-files-modified` and `green-failed`.
+- New evidence file `test-separation.json`, at `evidence.test_separation_path` and copied to `child.test_separation`. It records both session identities (host conversation IDs, so separate invocations, not separate models or people), the test-author commit, the red and green runs, and the byte-identity result. Usage and cost in `measurements` are summed across both sessions. The record schema stays at 1.
+- `missing-tests` is no longer reachable on the `deliver` path, because the test-author commit always supplies the tests.
+
 ### Fixed
 
 - Protected-path configuration rejects padded, blank, absolute, and parent-traversing entries at both the CLI and stored-config boundaries. Command configuration rejects blank executables while preserving literal data arguments.

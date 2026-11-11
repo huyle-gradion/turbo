@@ -7,7 +7,7 @@ import hashlib, json, math, os, re, shutil, subprocess, sys, time
 from pathlib import Path
 from typing import Any
 
-from factory import ci_gate, config as config_module, gitio, intake as intake_module, runner, worker as worker_module
+from factory import ci_gate, config as config_module, gitio, intake as intake_module, runner, test_author, worker as worker_module
 from factory.ci_gate import SHA40_RE
 from factory.config import now
 from factory.deliver_checks import (
@@ -126,6 +126,7 @@ def _build_worker_prompt(
     child: dict[str, Any],
     feature_branch: str,
     approved_lessons: tuple[tuple[str, str], ...] = (),
+    test_author_note: str = "",
 ) -> str:
     criteria_lines = "\n".join(
         f"- {c['id']}: {c['description']} (Verification: {c['verification']})"
@@ -146,8 +147,8 @@ def _build_worker_prompt(
         f"Constraints: {scope.get('constraints') or 'none'}\n"
         f"Acceptance criteria:\n{criteria_lines}\n"
         f"{lessons_section}"
-        "Implement the bounded change and relevant tests within scope, run verification checks, "
-        "and commit your changes to the current worktree HEAD. Do not push or touch main.\n"
+        + (test_author_note or "Implement the bounded change and relevant tests within scope, run verification checks, "
+           "and commit your changes to the current worktree HEAD. Do not push or touch main.\n")
     )
 
 
@@ -739,7 +740,9 @@ def _execute_delivery(paths: RuntimePaths, spec: DeliverSpec, *, require_final_a
         if policy_res is not None and policy_res.kind == "lesson":
             approved_lessons = ((policy_res.target_path, policy_res.content_bytes.decode("utf-8", errors="replace")),)
         prompt_text = _build_worker_prompt(intake_res.parent, child, feature_branch, approved_lessons=approved_lessons)
-        argv = (spec.agy_bin, "--print", prompt_text, "--output-format", "stream-json", "--sandbox", "--mode", "auto")
+        argv = test_author.agy_argv(spec.agy_bin, prompt_text)
+        authored: test_author.Authored | None = None
+        sep_path = child_dir / "test-separation.json"
         if policy_res is not None and policy_res.kind == "skill":
             skill_dest = isolated_home / ".gemini" / "antigravity-cli" / policy_res.target_path
             skill_dest.parent.mkdir(parents=True, exist_ok=True)
@@ -751,6 +754,26 @@ def _execute_delivery(paths: RuntimePaths, spec: DeliverSpec, *, require_final_a
             tool_dest.chmod(0o755)
             worker_env["PATH"] = f"{tool_bin}:{worker_env.get('PATH', '')}"
         if worker_module.probes_passed(probes):
+            authored = test_author.run_test_author(
+                agy_bin=spec.agy_bin, prompt=test_author.build_prompt(intake_res.parent, child, feature_branch),
+                worktree=worktree_dir, child_dir=child_dir, home=paths.home, child=child, base_sha=base_sha,
+                secrets=secrets, deadline=deadline, limit_s=limit_s,
+            )
+            measurements = worker_module.extract_measurements(test_author.summed_final([authored.final_result]), int((time.monotonic() - started) * 1000), spec.rates)
+            if authored.status != "ok":
+                atomic_json(sep_path, redact_value(authored.record, secrets), paths.home)
+                return _finish(
+                    authored.status, authored.blockers,
+                    {"gid": child_gid, "name": child["name"], "status": authored.status, "verified": False, "pr": None,
+                     "base_branch": feature_branch, "base_sha": base_sha, "test_separation": authored.record},
+                    measurements, {**base_evidence, "test_separation_path": str(sep_path), "test_author_stdout_path": str(authored.stdout_path)},
+                )
+            ta_sha = authored.record["test_author"]["commit_sha"]
+            prompt_text = _build_worker_prompt(
+                intake_res.parent, child, feature_branch, approved_lessons=approved_lessons,
+                test_author_note=test_author.implementer_note(ta_sha, authored.files),
+            )
+            argv = test_author.agy_argv(spec.agy_bin, prompt_text)
             builder_timeout = max(1, int(math.ceil(remaining_seconds(deadline, "builder execution", limit_s))))
             try:
                 exit_code, stdout_text, stderr_text, worker_ms, timed_out = worker_module.execute_stream(
@@ -761,7 +784,10 @@ def _execute_delivery(paths: RuntimePaths, spec: DeliverSpec, *, require_final_a
                 events, final_result, parse_error, probes = [], None, None, []
             else:
                 events, final_result, parse_error = worker_module.parse_stream_events(stdout_text)
-                measurements = worker_module.extract_measurements(final_result, int((time.monotonic() - started) * 1000), spec.rates)
+                measurements = worker_module.extract_measurements(
+                    test_author.summed_final([authored.final_result, final_result]), int((time.monotonic() - started) * 1000), spec.rates,
+                )
+                measurements["usage"]["provenance"] += "; summed over the test-author and implementer sessions"
                 measurements["builder_elapsed_ms"] = worker_ms
                 if timed_out or time.monotonic() >= deadline:
                     raise AttemptTimeoutError(f"builder timed out after {limit_s}s")
@@ -772,6 +798,11 @@ def _execute_delivery(paths: RuntimePaths, spec: DeliverSpec, *, require_final_a
         stdout_path = write_evidence(child_dir, "builder-stdout", stdout_text, paths.home)
         stderr_path = write_evidence(child_dir, "builder-stderr", stderr_text, paths.home)
         candidate_sha = gitio.head(worktree_dir)
+        sep = dict(authored.record) if authored is not None else None
+        sep_ta_sha = sep["test_author"]["commit_sha"] if sep is not None else None
+        if sep is not None:
+            sep["implementer"] = {"conversation_id": str((final_result or {}).get("conversation_id") or "") or None}
+            sep["byte_identity"] = test_author.byte_identity(worktree_dir, candidate_sha, authored.files)
         dirty_after = gitio.status_porcelain(worktree_dir)
         cand_diff_text = (
             git_timed(worktree_dir, deadline, limit_s, "candidate diff", "diff", "--binary", base_sha, candidate_sha).output
@@ -817,18 +848,32 @@ def _execute_delivery(paths: RuntimePaths, spec: DeliverSpec, *, require_final_a
             builder_status, blockers = "builder-failed", [f"builder exited with code {exit_code} and result status {res_status!r}"]
         elif dirty_after:
             builder_status, blockers = "uncommitted-changes", [f"builder left uncommitted changes in worktree: {dirty_after}"]
-        elif candidate_sha == base_sha or not diff_info["changed_paths"]:
+        elif candidate_sha in (base_sha, sep_ta_sha) or not diff_info["changed_paths"]:
             builder_status, blockers = "missing-implementation", ["builder produced no committed changes relative to the feature branch base"]
         elif not gitio.is_ancestor(worktree_dir, base_sha, candidate_sha):
             builder_status, blockers = "scope-violation", ["builder rewrote history or diverged from the feature branch base"]
+        elif sep is not None and sep["byte_identity"]["modified"]:
+            builder_status, blockers = "test-files-modified", [
+                f"implementer modified, deleted or renamed test-author file {p}" for p in sep["byte_identity"]["modified"]
+            ]
         elif post_conflicts:
             builder_status, blockers = "spec-check-conflict", post_conflicts
         elif not scope_ok:
             builder_status, blockers = "scope-violation", list(scope_violations)
         elif not diff_info["has_implementation_changes"]:
             builder_status, blockers = "missing-implementation", ["builder committed test changes only without implementation changes"]
-        elif not diff_info["has_test_changes"]:
-            builder_status, blockers = "missing-tests", ["builder committed implementation changes without relevant test changes"]
+        if sep is not None and authored is not None and builder_status == "completed":
+            green = test_author.run_check(
+                worktree_dir, child_dir, paths.home, "green", sep["red"]["command"], authored.argv, secrets, deadline, limit_s,
+            )
+            green.pop("output")
+            sep["green"] = green
+            if green["exit"] != 0:
+                builder_status, blockers = "green-failed", [
+                    f"red command {sep['red']['command']!r} still fails at candidate {candidate_sha} (exit {green['exit']})"
+                ]
+        if sep is not None:
+            atomic_json(sep_path, redact_value(sep, secrets), paths.home)
 
         if policy_res is not None and policy_res.kind == "check" and builder_status == "completed":
             try:
@@ -974,7 +1019,7 @@ def _execute_delivery(paths: RuntimePaths, spec: DeliverSpec, *, require_final_a
             "diff": diff_info, "scope_check": scope_detail,
             "verification_checks": ci_verification.get("checks", []) if isinstance(ci_verification, dict) else [],
             "ci_verification": ci_verification, "approval": approval_rec, "integration": integration_rec, "pr": pr_info,
-            "policy_consumption": policy_consumption,
+            "policy_consumption": policy_consumption, "test_separation": sep,
             "safety": {
                 "sandbox_flag": "--sandbox", "permission_mode": "auto", "bypass_permissions_used": False,
                 "isolated_home": str(isolated_home), "stripped_env_keys": stripped_keys, "probes": probes,
@@ -990,6 +1035,9 @@ def _execute_delivery(paths: RuntimePaths, spec: DeliverSpec, *, require_final_a
             "github_evidence_sha256": runner.digest_text(gh_trace_text), "github_requests": gh_trace,
             "policy_consumption": policy_consumption,
         }
+        if sep is not None:
+            evidence["test_separation_path"] = str(sep_path)
+            evidence["test_author_stdout_path"] = str(authored.stdout_path)
         if retained_file is not None:
             evidence["retained_consumed_policy_path"] = str(retained_file)
         if (child_dir / "ci-verification.json").is_file():
