@@ -124,8 +124,8 @@ class QualificationCredentialSafetyTests(unittest.TestCase):
         root.setLevel(logging.DEBUG)
         raised: BaseException | None = None
         try:
-            with mock.patch.object(qualification.subprocess, "run", rec.run), \
-                 mock.patch.object(qualification.subprocess, "Popen", rec.popen), \
+            with mock.patch.object(subprocess, "run", rec.run), \
+                 mock.patch.object(subprocess, "Popen", rec.popen), \
                  mock.patch.object(qualification.time, "sleep", lambda _s: None), \
                  mock.patch.dict(os.environ, CALLER_GIT_CONFIG), \
                  contextlib.redirect_stderr(stderr):
