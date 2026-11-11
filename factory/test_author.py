@@ -9,12 +9,12 @@ command must pass there.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-import hashlib, json, math, os
+import hashlib, json, math, os, shutil, subprocess
 from pathlib import Path
 from typing import Any
 
 from factory import gitio, runner, worker as worker_module
-from factory.deliver_checks import AttemptTimeoutError, _verification_argv, inspect_diff_categories, remaining_seconds
+from factory.deliver_checks import AttemptTimeoutError, _verification_argv, inspect_diff_categories, is_test_path, remaining_seconds
 from factory.intake import redact_value
 from factory.paths import safe_dir, write_evidence
 
@@ -89,34 +89,68 @@ def _declaration(response: Any) -> dict[str, Any] | None:
     return None
 
 
+def _git(worktree: Path, *args: str) -> str:
+    """Git with replace objects disabled, so `git replace` cannot change what the factory reads."""
+    return gitio.git(worktree, "--no-replace-objects", *args).output
+
+
 def _blob_sha(worktree: Path, rev: str, path: str) -> str | None:
-    code, data = gitio._git_bytes(worktree, "cat-file", "blob", f"{rev}:{path}")
+    code, data = gitio._git_bytes(worktree, "--no-replace-objects", "cat-file", "blob", f"{rev}:{path}")
     return hashlib.sha256(data).hexdigest() if code == 0 else None
 
 
+def _materialize(repo: Path, sha: str, dest: Path) -> None:
+    """Write the committed tree of `sha` into `dest` from raw objects: no index, hooks, filters or replace objects."""
+    run = lambda *a, data=None: subprocess.run(  # noqa: E731
+        ["git", "--no-replace-objects", *a], cwd=repo, input=data, capture_output=True, check=True, timeout=120,
+        env={**os.environ, "GIT_NO_REPLACE_OBJECTS": "1"},
+    ).stdout
+    entries = [e.split(b"\t", 1) for e in run("ls-tree", "-r", "-z", "--full-tree", sha).split(b"\0") if e]
+    blobs = [(meta.split(), path.decode()) for meta, path in entries if meta.split()[1] == b"blob"]
+    data, pos = run("cat-file", "--batch", data=b"".join(m[2] + b"\n" for m, _ in blobs)), 0
+    for (mode, _, _), path in blobs:
+        end = data.index(b"\n", pos)
+        size = int(data[pos:end].split()[2])
+        body, pos = data[end + 1:end + 1 + size], end + 2 + size
+        target = dest / path
+        if not target.resolve().is_relative_to(dest.resolve()):
+            raise ValueError(f"tree path escapes the checkout: {path!r}")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if mode == b"120000":
+            target.symlink_to(body.decode())
+        else:
+            target.write_bytes(body)
+            target.chmod(0o755 if mode == b"100755" else 0o644)
+
+
 def run_check(
-    worktree: Path, child_dir: Path, home: Path, stem: str, command: str, argv: tuple[str, ...],
+    worktree: Path, sha: str, child_dir: Path, home: Path, stem: str, command: str, argv: tuple[str, ...],
     secrets: tuple[str, ...], deadline: float, limit_s: int,
 ) -> dict[str, Any]:
-    """Run `argv` at the worktree HEAD in the OS sandbox without network. `output` is unredacted, for marker matching only."""
-    run_home = safe_dir(child_dir / "test-separation" / f"{stem}-home", create=True, root=home)
-    env, _ = worker_module.sanitized_env(dict(os.environ), worktree, run_home)
+    """Run `argv` in a fresh checkout of `sha`, sandboxed without network. `output` is unredacted, for marker matching only."""
+    sep_dir = safe_dir(child_dir / "test-separation", create=True, root=home)
+    run_home, tree = safe_dir(sep_dir / f"{stem}-home", create=True, root=home), sep_dir / f"{stem}-checkout"
+    shutil.rmtree(tree, ignore_errors=True)
+    tree.mkdir()
+    env, _ = worker_module.sanitized_env(dict(os.environ), tree, run_home)
     env["GIT_OPTIONAL_LOCKS"] = env["PYTHONNOUSERSITE"] = "1"
     timeout_s = max(1, int(math.ceil(remaining_seconds(deadline, f"{stem} run", limit_s))))
-    head = gitio.head(worktree)
     try:
+        _materialize(worktree, sha, tree)
         code, out, err, _, timed_out = worker_module.execute_stream(
-            worktree, argv, env, timeout_s, isolated_home=run_home, allow_network=False,
+            tree, argv, env, timeout_s, isolated_home=run_home, allow_network=False,
         )
-    except (worker_module.SandboxUnavailableError, OSError) as exc:
+    except (worker_module.SandboxUnavailableError, OSError, ValueError, subprocess.SubprocessError) as exc:
         code, out, err, timed_out = None, "", f"[factory] {stem} execution error: {exc}\n", False
+    finally:
+        shutil.rmtree(tree, ignore_errors=True)
     if timed_out:
         raise AttemptTimeoutError(f"{stem} run timed out after {limit_s}s")
     text = redact_value(out + err, secrets)
     path = write_evidence(child_dir, f"{stem}-output", text, home)
     return {
         "command": command, "argv": list(argv), "exit": code, "output_sha256": runner.digest_text(text),
-        "output_path": str(path), "head_sha": head, "provenance": "observed-factory-execution", "output": out + err,
+        "output_path": str(path), "head_sha": sha, "provenance": "observed-factory-execution", "output": out + err,
     }
 
 
@@ -166,24 +200,37 @@ def run_test_author(
         return _out("red-refused", f"red command {command!r} is not one of the child's criterion verification commands")
     if not any(t in expect for t in tests):
         return _out("red-refused", f"expected-failure marker {expect!r} names none of the declared tests {tests}")
+    added = "\n".join(
+        ln[1:] for ln in _git(worktree, "diff", "--no-renames", "--unified=0", base_sha, ta_sha).splitlines()
+        if ln.startswith("+") and not ln.startswith("+++")
+    )
+    if not added.strip():
+        return _out("red-refused", "test-author commit adds no line to any test file")
+    if missing := [t for t in tests if t not in added]:
+        return _out("red-refused", f"declared tests {missing} do not appear in the test-author commit's added lines")
     argv = _verification_argv(command)
     if argv is None:
         return _out("red-refused", f"red command {command!r} is not executable")
-    red = run_check(worktree, child_dir, home, "red", command, argv, secrets, deadline, limit_s)
+    red = run_check(worktree, ta_sha, child_dir, home, "red", command, argv, secrets, deadline, limit_s)
     output = red.pop("output")
     record["red"] = {**red, "expect": expect}
     if red["exit"] == 0:
         return _out("red-refused", f"red command {command!r} passed (exit 0) at the test-author commit {ta_sha}")
     if red["exit"] is None or expect not in output:
         return _out("red-refused", f"red command failed without the expected marker {expect!r} (exit {red['exit']})")
-    names = gitio.git(worktree, "diff", "--no-renames", "--diff-filter=AMT", "--name-only", base_sha, ta_sha).output.splitlines()
+    names = _git(worktree, "diff", "--no-renames", "--diff-filter=AMT", "--name-only", base_sha, ta_sha).splitlines()
     files = [{"path": p, "sha256": _blob_sha(worktree, ta_sha, p) or ""} for p in sorted(n for n in names if n)]
     return _out("ok", "", argv, files)
 
 
-def byte_identity(worktree: Path, candidate_sha: str, files: list[dict[str, str]]) -> dict[str, Any]:
+def byte_identity(worktree: Path, ta_sha: str, candidate_sha: str, files: list[dict[str, str]]) -> dict[str, Any]:
+    """Byte identity of the test-author files, plus every test path the implementer added, changed, deleted or renamed."""
     modified = [f["path"] for f in files if _blob_sha(worktree, candidate_sha, f["path"]) != f["sha256"]]
-    return {"result": "modified" if modified else "identical", "files": files, "modified": modified}
+    changed = _git(worktree, "diff", "--no-renames", "--name-only", ta_sha, candidate_sha).splitlines()
+    return {
+        "result": "modified" if modified else "identical", "files": files, "modified": modified,
+        "test_paths_changed": sorted(p for p in changed if p and is_test_path(p)),
+    }
 
 
 def summed_final(finals: list[dict[str, Any] | None]) -> dict[str, Any]:

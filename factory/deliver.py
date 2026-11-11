@@ -802,7 +802,7 @@ def _execute_delivery(paths: RuntimePaths, spec: DeliverSpec, *, require_final_a
         sep_ta_sha = sep["test_author"]["commit_sha"] if sep is not None else None
         if sep is not None:
             sep["implementer"] = {"conversation_id": str((final_result or {}).get("conversation_id") or "") or None}
-            sep["byte_identity"] = test_author.byte_identity(worktree_dir, candidate_sha, authored.files)
+            sep["byte_identity"] = test_author.byte_identity(worktree_dir, sep_ta_sha, candidate_sha, authored.files)
         dirty_after = gitio.status_porcelain(worktree_dir)
         cand_diff_text = (
             git_timed(worktree_dir, deadline, limit_s, "candidate diff", "diff", "--binary", base_sha, candidate_sha).output
@@ -852,10 +852,8 @@ def _execute_delivery(paths: RuntimePaths, spec: DeliverSpec, *, require_final_a
             builder_status, blockers = "missing-implementation", ["builder produced no committed changes relative to the feature branch base"]
         elif not gitio.is_ancestor(worktree_dir, base_sha, candidate_sha):
             builder_status, blockers = "scope-violation", ["builder rewrote history or diverged from the feature branch base"]
-        elif sep is not None and sep["byte_identity"]["modified"]:
-            builder_status, blockers = "test-files-modified", [
-                f"implementer modified, deleted or renamed test-author file {p}" for p in sep["byte_identity"]["modified"]
-            ]
+        elif sep is not None and (touched := sorted({*sep["byte_identity"]["modified"], *sep["byte_identity"]["test_paths_changed"]})):
+            builder_status, blockers = "test-files-modified", [f"implementer added, modified, deleted or renamed test path {p}" for p in touched]
         elif post_conflicts:
             builder_status, blockers = "spec-check-conflict", post_conflicts
         elif not scope_ok:
@@ -864,7 +862,7 @@ def _execute_delivery(paths: RuntimePaths, spec: DeliverSpec, *, require_final_a
             builder_status, blockers = "missing-implementation", ["builder committed test changes only without implementation changes"]
         if sep is not None and authored is not None and builder_status == "completed":
             green = test_author.run_check(
-                worktree_dir, child_dir, paths.home, "green", sep["red"]["command"], authored.argv, secrets, deadline, limit_s,
+                worktree_dir, candidate_sha, child_dir, paths.home, "green", sep["red"]["command"], authored.argv, secrets, deadline, limit_s,
             )
             green.pop("output")
             sep["green"] = green
