@@ -196,7 +196,10 @@ def integrate_approved_child(
     review_record: Any = None, repo_slug: str | None = None, base_url: str | None = None, token: str | None = None,
     merge_method: str = "merge", commit_title: str | None = None, commit_message: str | None = None,
     on_before_merge: Callable[[], None] | None = None, deadline: float | None = None, limit_s: int = 30,
+    drop_merge_response: bool = False,
 ) -> IntegrationResult:
+    """`drop_merge_response` is client-side fault injection for qualification (#67): the real merge request is sent and
+    its response discarded, so the result is uncertain until a later call reconciles it from the provider."""
     secrets: list[str] = list(collect_redaction_secrets())
     if token:
         for t in (token, quote(token, safe="")):
@@ -482,6 +485,8 @@ def integrate_approved_child(
     outcome, status, landed_sha = "rejected", "rejected", None
     try:
         m_code, m_data, m_msg = _http_req("PUT", f"{eff_base_url}/repos/{repo_slug}/pulls/{pr_number}/merge", eff_token, eff_base_url, trace, dl, limit_s, payload=payload)
+        if drop_merge_response:
+            m_code, m_data, m_msg = 0, {}, "merge response dropped by client-side fault injection"
     except (AttemptTimeoutError, Exception) as exc:
         status, outcome, mut_outcome = "uncertain", "uncertain", "uncertain"
         conf_status = "uncertain"

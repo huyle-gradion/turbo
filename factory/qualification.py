@@ -1,7 +1,7 @@
 """Protected repository qualification harness (#67)."""
 from __future__ import annotations
 
-import argparse, base64, contextlib, json, os, shutil, subprocess, sys, time
+import argparse, base64, contextlib, json, os, shutil, subprocess, sys, threading, time
 from collections.abc import Iterator
 from pathlib import Path
 from types import SimpleNamespace
@@ -88,7 +88,7 @@ REAL_SETUP_METADATA: dict[str, Any] = {
     "known_gaps": [
         "feature/demo currently holds only README.md; seed CI workflow, product fixture, and factory policy are not yet installed.",
         "Branch protection required status check contexts are empty (contexts: []); nonempty check contexts pending setup in a later slice.",
-        "Hosted qualification execution is not implemented yet; run_hosted_qualification returns blocked / hosted-scenarios-pending-human-setup.",
+        "Hosted scenarios 1-6 are implemented; no live qualified run on the disposable repository is recorded yet.",
     ],
 }
 
@@ -1712,6 +1712,171 @@ def run_scenario_4_renewed_verification_after_base_change(
     return sc_data
 
 
+def _prepare_own(base_url: str, repo_slug: str, sdir: Path, ctx: Any, branch: str, integrator_token: str,
+                 competitor_token: str, ledger: QualificationLedger, base_branch: str, opened: list[int] | None,
+                 approve: bool = True) -> tuple[SimpleNamespace, dict[str, Any], int, str, str]:
+    """Prepare one candidate of this run in its own child folder; its PR is recorded for cleanup."""
+    c = _candidate_ctx(ctx, branch)
+    prep = prepare_qualification_candidate(
+        base_url, repo_slug, sdir / branch.removeprefix(CANDIDATE_BRANCH_PREFIX), target_branch=base_branch,
+        head_branch=branch, integrator_token=integrator_token, competitor_token=competitor_token, ledger=ledger,
+        file_changes=_calc_changes(branch), approve=approve, scenario_ctx=c)
+    pr = prep.get("pr") or {}
+    n = int(pr.get("number") or 0)
+    if opened is not None and n: opened.append(n)
+    return c, prep, n, str(pr.get("head_sha") or ""), str(pr.get("base_sha") or "")
+
+
+def _attempt(c: Any, ctx: Any, repo_slug: str, base_url: str, token: str, pr_num: int, cand: str, base: str,
+             branch: str, base_branch: str, **kw: Any) -> Any:
+    """One merge attempt through the factory boundary, gated on the candidate's own records."""
+    return integrate_approved_child(
+        repo=c.repo, home=ctx.home, child_dir=c.child_dir, child={**ctx.child_contract, "head_branch": branch},
+        conf=ctx.conf, pr_number=pr_num, candidate_sha=cand, base_sha=base, head_branch=branch, base_branch=base_branch,
+        approval_record=_delivery_gate(c, cand, base, c.child_dir, branch), repo_slug=repo_slug, base_url=base_url,
+        token=token, **kw)
+
+
+def _attempt_record(res: Any) -> dict[str, Any]:
+    """The retained result of one attempt; its provider requests are read from the attempt's own trace."""
+    if not hasattr(res, "status"):
+        return {"status": "error", "error": str(res), "requests": []}
+    rec = {k: getattr(res, k, None) for k in ("status", "outcome", "mutation_outcome", "landed_sha", "tested_sha", "reconciled")}
+    return {**rec, "blockers": list(getattr(res, "blockers", None) or []),
+            "requests": [f"{t.get('method')} {t.get('status')}" for t in getattr(res, "trace", None) or []]}
+
+
+def _puts(rec: dict[str, Any]) -> int:
+    return sum(1 for r in rec["requests"] if r.startswith("PUT "))
+
+
+def run_scenario_5_concurrency_and_uncertain_reconciliation(
+    base_url: str, repo_slug: str, evidence_dir: Path, ctx: Any,
+    integrator_token: str, competitor_token: str, *,
+    base_branch: str = "feature/demo", ledger: QualificationLedger | None = None,
+    allow_test_origin: bool = False, run_id: str = "", opened: list[int] | None = None,
+) -> dict[str, Any]:
+    """Scenario 5: two overlapping attempts on one candidate land it once; a head changed after approval is refused
+    before the merge; a merge whose response the client drops (fault injection) is uncertain, then reconciled."""
+    sdir = safe_dir(evidence_dir / "scenarios" / "concurrency_and_uncertain_reconciliation", create=True)
+    tokens = [integrator_token, competitor_token]
+    sc_ledger = ledger or QualificationLedger(sdir / "operation-ledger.jsonl", tokens)
+    main_sha_before = _read_remote_main(base_url, repo_slug, integrator_token, sc_ledger)
+    prep = lambda suffix, **kw: _prepare_own(base_url, repo_slug, sdir, ctx, f"{CANDIDATE_BRANCH_PREFIX}{run_id}-{suffix}",
+                                             integrator_token, competitor_token, sc_ledger, base_branch, opened, **kw)
+    go = lambda c, n, cand, base, branch, **kw: _attempt(c, ctx, repo_slug, base_url, integrator_token, n, cand, base,
+                                                         branch, base_branch, **kw)
+
+    # Concurrent attempts: both pass every factory check, meet at the pre-merge boundary, then merge at once. The
+    # second attempt uses its own clone, so the two attempts never share a git working copy.
+    c_race, _, race_pr, race_sha, race_base = prep("sc5-race")
+    race_branch = f"{CANDIDATE_BRANCH_PREFIX}{run_id}-sc5-race"
+    clone2 = ctx.repo.parent / "race-clone"
+    shutil.rmtree(clone2, ignore_errors=True)
+    clone_remote_repo(clone2, repo_slug, integrator_token)
+    for repo in (ctx.repo, clone2):
+        fetch_remote_repo(repo, repo_slug, integrator_token)
+    barrier, results = threading.Barrier(2, timeout=120), [None, None]
+
+    def _race(i: int, c: Any) -> None:
+        try: results[i] = go(c, race_pr, race_sha, race_base, race_branch, on_before_merge=barrier.wait)
+        except Exception as exc:  # an attempt that raised is recorded; the other is released from the barrier
+            results[i] = exc
+            barrier.abort()
+
+    threads = [threading.Thread(target=_race, args=(i, c)) for i, c in
+               enumerate((c_race, SimpleNamespace(**{**vars(c_race), "repo": clone2})))]
+    for t in threads: t.start()
+    for t in threads: t.join(timeout=600)
+    race = [_attempt_record(r) for r in results]
+    confirmed = [r for r in race if r["status"] == "confirmed"]
+    race_ok = len(confirmed) == 1 and all(r["mutation_outcome"] != "succeeded" for r in race if r["status"] != "confirmed")
+
+    # Changed head: the approved head is replaced by a new commit before the attempt; the attempt names the old head.
+    c_ch, prep_ch, ch_pr, ch_sha, ch_base = prep("sc5-head")
+    ch_branch = f"{CANDIDATE_BRANCH_PREFIX}{run_id}-sc5-head"
+    approved = ((prep_ch.get("prerequisites") or {}).get("github_review") or {}).get("commit_id") == ch_sha
+    new_head, _ = create_qualification_candidate_commit(
+        base_url, repo_slug, ch_sha, ch_branch, integrator_token,
+        file_changes={"tests/test_calc.py": CALC_CANDIDATE_TEST + f"\n# head changed after approval {ch_branch}\n"},
+        message=f"test: change {ch_branch} after approval (#67)", ledger=sc_ledger)
+    fetch_remote_repo(ctx.repo, repo_slug, integrator_token)
+    ch_res = _attempt_record(go(c_ch, ch_pr, ch_sha, ch_base, ch_branch))
+    ch_ok = (approved and bool(new_head) and new_head != ch_sha and ch_res["status"] == "stale-candidate-revision"
+             and ch_res["mutation_outcome"] == "not-attempted" and _puts(ch_res) == 0)
+
+    # Uncertain outcome: the client sends the real merge and drops its response; a normal second call reconciles it.
+    c_un, _, un_pr, un_sha, un_base = prep("sc5-uncertain")
+    un_branch = f"{CANDIDATE_BRANCH_PREFIX}{run_id}-sc5-uncertain"
+    fetch_remote_repo(ctx.repo, repo_slug, integrator_token)
+    first = _attempt_record(go(c_un, un_pr, un_sha, un_base, un_branch, drop_merge_response=True))
+    second = _attempt_record(go(c_un, un_pr, un_sha, un_base, un_branch))
+    un_ok = (first["status"] == first["outcome"] == "uncertain" and first["landed_sha"] is None and second["status"] == "confirmed"
+             and second["reconciled"] is True and bool(second["landed_sha"]) and _puts(first) + _puts(second) == 1)
+
+    main_sha_after = _read_remote_main(base_url, repo_slug, integrator_token, sc_ledger)
+    main_preserved = _main_preserved(main_sha_before, main_sha_after)
+    passed = race_ok and ch_ok and un_ok and main_preserved is True
+    sc_data = {
+        "name": "concurrency_and_uncertain_reconciliation", "scenario": "concurrency_and_uncertain_reconciliation",
+        "status": "verified" if passed else "failed", "outcome": "verified" if passed else "failed",
+        "concurrent_attempts": {"observed": race_ok, "pr_number": race_pr, "candidate_sha": race_sha, "base_sha": race_base,
+                                "results": race},
+        "changed_head": {"observed": ch_ok, "pr_number": ch_pr, "approved_sha": ch_sha, "approved": approved,
+                         "new_head_sha": new_head or None, **ch_res},
+        "uncertain": {"observed": un_ok, "pr_number": un_pr, "fault_injected": True,
+                      "fault_injection": "client-side: merge request sent, response discarded",
+                      "merge_requests_sent": _puts(first) + _puts(second),
+                      "first": first, "reconciled": second},
+        "candidate_sha": un_sha, "base_sha": un_base, "tested_sha": second["tested_sha"], "landed_sha": second["landed_sha"],
+        "main_preserved": main_preserved, "main_sha_before": main_sha_before, "main_sha_after": main_sha_after,
+        "simulated": allow_test_origin, "artifacts": [str(sdir / "scenario-result.json")],
+        "recorded_at": approval_mod.now(),
+    }
+    atomic_json(sdir / "scenario-result.json", redact_qualification_tokens(sc_data, tokens), evidence_dir)
+    return sc_data
+
+
+def run_scenario_6_wrong_target_rejected(
+    base_url: str, repo_slug: str, evidence_dir: Path, ctx: Any,
+    integrator_token: str, competitor_token: str, *,
+    base_branch: str = "feature/demo", ledger: QualificationLedger | None = None,
+    allow_test_origin: bool = False, run_id: str = "", opened: list[int] | None = None,
+) -> dict[str, Any]:
+    """Scenario 6: a verified candidate of this run aimed at `main`, or at a feature branch other than the one its PR
+    targets, is refused before any provider mutation; `main` is read before and after."""
+    sdir = safe_dir(evidence_dir / "scenarios" / "wrong_target_rejected", create=True)
+    tokens = [integrator_token, competitor_token]
+    sc_ledger = ledger or QualificationLedger(sdir / "operation-ledger.jsonl", tokens)
+    main_sha_before = _read_remote_main(base_url, repo_slug, integrator_token, sc_ledger)
+    branch = f"{CANDIDATE_BRANCH_PREFIX}{run_id}-sc6"
+    c6, _, pr_num, cand, base = _prepare_own(base_url, repo_slug, sdir, ctx, branch, integrator_token, competitor_token,
+                                             sc_ledger, base_branch, opened, approve=False)
+    fetch_remote_repo(ctx.repo, repo_slug, integrator_token)
+    expected = {"main": "unintended-target", f"feature/qual-{run_id}-not-intended": "branch-ref-mismatch"}
+    attempts = []
+    for target, want in expected.items():
+        rec = _attempt_record(_attempt(c6, ctx, repo_slug, base_url, integrator_token, pr_num, cand, base, branch, target))
+        mutations = [r for r in rec["requests"] if not r.startswith("GET ")]
+        attempts.append({"base_branch": target, "expected_status": want, "provider_mutations": mutations,
+                         "observed": rec["status"] == want and rec["mutation_outcome"] == "not-attempted" and not mutations,
+                         **rec})
+    main_sha_after = _read_remote_main(base_url, repo_slug, integrator_token, sc_ledger)
+    main_preserved = _main_preserved(main_sha_before, main_sha_after)
+    passed = all(a["observed"] for a in attempts) and main_preserved is True
+    sc_data = {
+        "name": "wrong_target_rejected", "scenario": "wrong_target_rejected",
+        "status": "verified" if passed else "failed", "outcome": "verified" if passed else "failed",
+        "pr_number": pr_num, "head_branch": branch, "intended_base_branch": base_branch, "attempts": attempts,
+        "candidate_sha": cand, "base_sha": base,
+        "main_preserved": main_preserved, "main_sha_before": main_sha_before, "main_sha_after": main_sha_after,
+        "simulated": allow_test_origin, "artifacts": [str(sdir / "scenario-result.json")],
+        "recorded_at": approval_mod.now(),
+    }
+    atomic_json(sdir / "scenario-result.json", redact_qualification_tokens(sc_data, tokens), evidence_dir)
+    return sc_data
+
+
 class _ScenarioContextUnavailable(Exception):
     """The hosted repository cannot supply a scenario context; the reason is recorded as a blocker."""
 
@@ -1988,6 +2153,20 @@ def run_hosted_qualification(
             )
             scenarios["renewed_verification_after_base_change"] = sc4_res
 
+            # 5-6. Concurrency, changed head and uncertain outcome; wrong targets refused. They add four more candidates
+            # and two merges, so they run only after scenarios 1-4 verified; otherwise they are recorded as not run.
+            earlier_verified = all(s.get("outcome") == "verified" for s in scenarios.values())
+            for name, run_sc in (("concurrency_and_uncertain_reconciliation", run_scenario_5_concurrency_and_uncertain_reconciliation),
+                                 ("wrong_target_rejected", run_scenario_6_wrong_target_rejected)):
+                if earlier_verified:
+                    scenarios[name] = run_sc(
+                        base_url, repo_slug, evidence_dir, ctx, integrator_token, competitor_token, base_branch=branch,
+                        ledger=ledger, allow_test_origin=allow_test_origin, run_id=run_id, opened=opened)
+                else:
+                    scenarios[name] = {"name": name, "scenario": name, "status": "not-run", "outcome": "unavailable",
+                                       "blockers": ["not-run: scenarios 1-4 did not all verify"],
+                                       "simulated": allow_test_origin, "artifacts": []}
+
     # 6. Evidence index reduction
     parent_index = build_parent_evidence_index(scenarios, f_rev, mode="hosted")
     reduced_index, all_qual, red_blockers = reduce_evidence_index(
@@ -1996,14 +2175,15 @@ def run_hosted_qualification(
 
     run_blockers = list(dict.fromkeys(all_preflight_blockers + id_blockers + prep_record.get("blockers", []) + scenario_blockers
                                       + red_blockers))
-    final_blockers = run_blockers + ["hosted-scenarios-5-and-6-pending-slice-5"]
-    outcome = _run_outcome(scenarios, run_blockers, "slice-4-verified")
+    # Qualified only when every AC is hosted-verified, nothing blocks, and the run was not against a test origin.
+    qualified = all_qual and not run_blockers and not allow_test_origin
+    outcome = _run_outcome(scenarios, run_blockers, "simulated-verified" if allow_test_origin else "hosted-verified")
     res = {
         "schema": 1, "role": "hosted-qualification-summary", "factory_revision": f_rev,
-        "status": "in-progress-slice-4-complete" if outcome == "slice-4-verified" else "blocked",
-        "outcome": outcome,
-        "qualified": False,
-        "repo_slug": repo_slug, "blockers": final_blockers,
+        "status": "qualified" if qualified else ("simulated" if outcome == "simulated-verified" else "blocked"),
+        "outcome": outcome if qualified or outcome != "hosted-verified" else "unavailable",
+        "qualified": qualified,
+        "repo_slug": repo_slug, "blockers": run_blockers,
         "run_id": run_id, "preflight": preflight_record, "preparation": prep_record, "scenarios": scenarios, "cleanup": cleanup,
         "parent_evidence_index": reduced_index, "mode": "hosted",
         "simulated": allow_test_origin, "recorded_at": approval_mod.now(),
