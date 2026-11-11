@@ -14,8 +14,76 @@ permissions:
   contents: read
 
 jobs:
-  test:
-    name: Unit tests and smoke scripts
+  plan:
+    name: Plan
+    runs-on: ubuntu-latest
+    outputs:
+      jobs: ${{ steps.plan.outputs.jobs }}
+      smoke: ${{ steps.plan.outputs.smoke }}
+      mode: ${{ steps.plan.outputs.mode }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Plan from the trusted base
+        id: plan
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          WORK=$(mktemp -d)
+          : > "$WORK/changed"
+          : > "$WORK/deleted"
+          PLANNER=scripts/ci_plan.py
+          if [ "$EVENT" = pull_request ]; then
+            git diff --no-renames --name-only "$BASE_SHA"...HEAD > "$WORK/changed"
+            git diff --no-renames --diff-filter=D --name-only "$BASE_SHA"...HEAD > "$WORK/deleted"
+            mkdir "$WORK/trusted"
+            git archive "$BASE_SHA" | tar -x -C "$WORK/trusted"
+            if [ -f "$WORK/trusted/scripts/ci_plan.py" ]; then
+              PLANNER="$WORK/trusted/scripts/ci_plan.py"
+            else
+              echo "Base has no planner; forcing the full suite with the candidate planner"
+              EVENT=push
+            fi
+          fi
+          if ! python3 -I "$PLANNER" --repo . --changed-file "$WORK/changed" \
+              --deleted-file "$WORK/deleted" --event "$EVENT" > "$WORK/plan.json"; then
+            echo "Planner failed; forcing the full suite"
+            python3 -I "$PLANNER" --repo . --event push > "$WORK/plan.json"
+          fi
+          echo "CI plan (planner $PLANNER, base ${BASE_SHA:-none}):"
+          cat "$WORK/plan.json"
+          python3 -I - "$WORK/plan.json" "$EVENT" >> "$GITHUB_OUTPUT" <<'PY'
+          import json, pathlib, sys
+          plan = json.load(open(sys.argv[1], encoding="utf-8"))
+          if sys.argv[2] != "pull_request" and plan["mode"] != "full":
+              sys.exit("a forced full plan must be mode full")
+          if plan["mode"] == "full":
+              planned = sorted(t for job in plan["jobs"] for t in job["tests"])
+              if planned != sorted(p.as_posix() for p in pathlib.Path("tests").rglob("test_*.py")):
+                  sys.exit("a full plan must run every test file exactly once")
+          if plan["mode"] != "docs-only" and not plan["jobs"]:
+              sys.exit("a plan that runs tests must have jobs")
+          for job in plan["jobs"]:
+              if not job["tests"] or any(not t.startswith("tests/") or not t.endswith(".py")
+                                         or any(c.isspace() or c in "*?[" for c in t) for t in job["tests"]):
+                  sys.exit(f"unsafe or empty test list in {job['name']}")
+          print("jobs=" + json.dumps(plan["jobs"], separators=(",", ":")))
+          print("smoke=" + ("true" if plan["smoke"] else "false"))
+          print("mode=" + plan["mode"])
+          PY
+
+  guards:
+    name: Essential safety guards
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -34,38 +102,84 @@ jobs:
       - name: Essential safety guards (always run)
         run: PYTHONPATH=tests:. PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests/test_bundle.py tests/test_cli_paths.py tests/test_evidence_integrity.py -v
 
-      - name: Full unit test suite (push to main)
-        if: github.event_name != 'pull_request'
-        run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v
+  tests:
+    name: ${{ matrix.job.name }}
+    needs: plan
+    if: needs.plan.outputs.jobs != '[]'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        job: ${{ fromJSON(needs.plan.outputs.jobs) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Selected or full regression suite (trusted base policy)
-        if: github.event_name == 'pull_request'
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install bubblewrap
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends bubblewrap
+
+      - name: Unit tests
         env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          TESTS: ${{ join(matrix.job.tests, ' ') }}
         run: |
-          CHANGED=$(git diff --name-only "$BASE_SHA"...HEAD)
-          DELETED=$(git diff --diff-filter=D --name-only "$BASE_SHA"...HEAD)
-          CHAIN_DIFF=$(git diff --name-only "$BASE_SHA"...HEAD -- .github factory.json bin scripts guards tests/support.py tests/test_bundle.py tests/test_cli_paths.py tests/test_evidence_integrity.py factory/ci_selection.py factory/ci_gate.py factory/deliver_checks.py factory/config.py factory/gates.py factory/runner.py factory/sandbox.py)
-          TRUSTED_DIR=$(mktemp -d)
-          trap 'rm -rf "$TRUSTED_DIR"' EXIT
-          git archive "$BASE_SHA" | tar -x -C "$TRUSTED_DIR"
-          if [ -n "$CHAIN_DIFF" ] || [ ! -f "$TRUSTED_DIR/factory/ci_selection.py" ]; then
-            echo "Verification chain modified or base selector absent; forcing full suite on candidate checkout"
-            PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v
-          else
-            PLAN=$(python3 -I -c 'import json, pathlib, sys; sys.path.insert(0, sys.argv[1]); from factory.ci_selection import select_ci_test_plan; print(json.dumps(select_ci_test_plan(changed_paths=tuple(sys.argv[2].splitlines()), deleted_paths=tuple(sys.argv[3].splitlines()), repo=pathlib.Path("."))))' "$TRUSTED_DIR" "$CHANGED" "$DELETED")
-            echo "CI selection plan (from trusted base $BASE_SHA): $PLAN"
-            MODE=$(python3 -I -c 'import json, sys; print(json.loads(sys.argv[1])["mode"])' "$PLAN")
-            if [ "$MODE" = "full-suite" ]; then
-              PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v
-            else
-              TESTS=$(python3 -I -c 'import json, sys; print(" ".join(json.loads(sys.argv[1])["affected_tests"]))' "$PLAN")
-              PYTHONPATH=tests:. PYTHONDONTWRITEBYTECODE=1 python3 -m unittest $TESTS -v
-            fi
-          fi
+          set -f
+          # Import as discover -s tests would (tests/pkg/test_x.py -> pkg.test_x).
+          MODULES=
+          for path in $TESTS; do
+            module=${path#tests/}
+            module=${module%.py}
+            MODULES="$MODULES ${module//\//.}"
+          done
+          PYTHONPATH=tests:. PYTHONDONTWRITEBYTECODE=1 python3 -m unittest $MODULES -v
+
+  smoke:
+    name: Smoke scripts
+    needs: plan
+    if: needs.plan.outputs.smoke == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install bubblewrap
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends bubblewrap
 
       - name: Manual profile smoke
         run: bash scripts/smoke.sh
 
       - name: Native-turbo profile smoke
         run: bash scripts/smoke-turbo.sh
+
+  ci:
+    name: Unit tests and smoke scripts
+    needs: [plan, guards, tests, smoke]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every planned job to pass
+        env:
+          PLAN: ${{ needs.plan.result }}
+          GUARDS: ${{ needs.guards.result }}
+          TESTS: ${{ needs.tests.result }}
+          SMOKE: ${{ needs.smoke.result }}
+          MODE: ${{ needs.plan.outputs.mode }}
+        run: |
+          echo "mode=$MODE plan=$PLAN guards=$GUARDS tests=$TESTS smoke=$SMOKE"
+          [ "$PLAN" = success ] && [ "$GUARDS" = success ] || exit 1
+          for result in "$TESTS" "$SMOKE"; do
+            case "$result" in success|skipped) ;; *) exit 1 ;; esac
+          done

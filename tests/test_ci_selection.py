@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import re
 import subprocess
 import sys
+import textwrap
 import tempfile
 import unittest
 
@@ -210,14 +212,64 @@ class CiSelectionTest(unittest.TestCase):
                 ci_selection.detect_spec_check_conflicts(excluded_glob_child, conf, ("src/app.py",), repo=repo)
             )
 
-    def test_ci_workflow_triggers_on_feature_branches_and_runs_trusted_selector_without_mutating_candidate_checkout(self) -> None:
+    def test_ci_workflow_plans_from_the_trusted_base_and_always_runs_guards(self) -> None:
         wf_text = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
-        self.assertIn("feature/**", wf_text)
-        self.assertNotIn("git checkout \"$BASE_SHA\"", wf_text)
-        self.assertIn("from factory.ci_selection import select_ci_test_plan", wf_text)
-        wf_plan_lines = [line.strip() for line in wf_text.splitlines() if line.strip().startswith("PLAN=$(python3 -I -c")]
-        self.assertEqual(len(wf_plan_lines), 1)
-        wf_plan_cmd = wf_plan_lines[0]
+        jobs = dict(re.findall(r"^  ([\w-]+):\n(.*?)(?=^  [\w-]+:\n|\Z)", wf_text.split("\njobs:\n", 1)[1], re.M | re.S))
+        self.assertIn("feature/**", wf_text.split("\njobs:\n", 1)[0].split("pull_request:", 1)[1])
+        self.assertNotIn('git checkout "$BASE_SHA"', wf_text)
+        self.assertIn('git archive "$BASE_SHA"', jobs["plan"])
+        diffs = re.findall(r"git diff [^\n]*", jobs["plan"])
+        self.assertTrue(len(diffs) >= 2 and all("--no-renames" in d for d in diffs), "a rename counts as a delete")
+        self.assertTrue(any("--diff-filter=D" in d and '"$WORK/deleted"' in d for d in diffs))
+        on_error = re.search(r'if ! python3 -I "\$PLANNER".*?; then(.*?)\n\s*fi\n', jobs["plan"], re.S)
+        self.assertIn("--event push", on_error.group(1), "a planner error forces the full suite")
+        validator = textwrap.dedent(jobs["plan"].split("<<'PY'\n", 1)[1].split("\n          PY\n", 1)[0])
+        full = [t.relative_to(ROOT).as_posix() for t in (ROOT / "tests").rglob("test_*.py")]
+        for event, mode, tests, ok in (("push", "full", full, True), ("push", "full", full[1:], False),
+                                       ("push", "docs-only", [], False), ("pull_request", "docs-only", [], True),
+                                       ("pull_request", "areas", ["tests/test a.py"], False)):
+            with tempfile.TemporaryDirectory() as tmp, self.subTest(validator=(event, mode, len(tests))):
+                plan_file = Path(tmp) / "plan.json"
+                jobs_out = [{"name": "shard:1", "tests": tests}] if tests else []
+                plan_file.write_text(json.dumps({"mode": mode, "jobs": jobs_out, "smoke": True}), encoding="utf-8")
+                ran = subprocess.run([sys.executable, "-I", "-", str(plan_file), event], input=validator,
+                                     cwd=ROOT, capture_output=True, text=True)
+                self.assertEqual(ran.returncode == 0, ok, ran.stderr)
+        needs = re.search(r"(?m)^    needs: \[(.*)\]$", jobs["ci"]).group(1)
+        self.assertEqual(set(needs.split(", ")), {"plan", "guards", "tests", "smoke"})
+        reads = dict(re.findall(r"(?m)^          (\w+): \$\{\{ needs\.(\w+)\.result \}\}$", jobs["ci"]))
+        self.assertEqual(set(reads.values()), {"plan", "guards", "tests", "smoke"})
+        unit = jobs["tests"].split("- name: Unit tests\n", 1)[1].split("run: |\n", 1)[1]
+        with tempfile.TemporaryDirectory() as tmp:
+            stub = Path(tmp) / "python3"
+            stub.write_text('#!/bin/sh\nprintf "%s\\n" "$@"\n', encoding="utf-8")
+            stub.chmod(0o755)
+            ran = subprocess.run(["bash", "-c", textwrap.dedent(unit)], capture_output=True, text=True, env={
+                "PATH": f"{tmp}:/usr/bin:/bin", "TESTS": "tests/automated_qa/test_automated_qa.py tests/test_deliver.py"})
+        argv = ran.stdout.split()
+        self.assertEqual([a for a in argv[argv.index("unittest") + 1:] if not a.startswith("-")],
+                         ["automated_qa.test_automated_qa", "test_deliver"], "shards import as discover -s tests does")
+        gate = jobs["ci"].split("run: |\n", 1)[1]
+        ok_runs = ({}, {"tests": "skipped", "smoke": "skipped"})
+        bad_runs = ({"plan": "failure"}, {"plan": "skipped"}, {"guards": "failure"}, {"tests": "failure"},
+                    {"tests": "cancelled"}, {"smoke": "failure"}, {"smoke": "cancelled"})
+        for results, ok in [(r, True) for r in ok_runs] + [(r, False) for r in bad_runs]:
+            with self.subTest(aggregate=results):
+                env = {var: results.get(job, "success") for var, job in reads.items()}
+                ran = subprocess.run(["bash", "-c", gate], env={**env, "MODE": "areas", "PATH": "/usr/bin:/bin"},
+                                     capture_output=True, text=True)
+                self.assertEqual(ran.returncode == 0, ok, ran.stdout)
+        fallback = re.search(r'if \[ -f "\$WORK/trusted/scripts/ci_plan\.py" \]; then\s*PLANNER="\$WORK/trusted/(.*?)"\s*else(.*?)\n\s*fi\n', jobs["plan"], re.S)
+        self.assertIsNotNone(fallback, "the plan job must prefer the planner from the trusted base tree")
+        self.assertEqual(fallback.group(1), "scripts/ci_plan.py")
+        self.assertIn("EVENT=push", fallback.group(2), "a base without a planner forces the full suite")
+        self.assertNotRegex(jobs["guards"], r"(?m)^    if:", "essential guards always run")
+        self.assertRegex(jobs["ci"], r"(?m)^    name: Unit tests and smoke scripts$")
+        self.assertRegex(jobs["ci"], r"(?m)^    if: always\(\)$")
+        self.assertIn("${{ join(matrix.job.tests, ' ') }}", jobs["tests"].split("env:", 1)[1].split("run:", 1)[0])
+        run_scripts = re.findall(r"^( +)run: (?:\|\n((?:\1 .*\n|\n)*)|(.*))", wf_text, re.M)
+        self.assertGreaterEqual(len(run_scripts), 5)
+        self.assertFalse([r for r in run_scripts if "${{" in r[1] + r[2]], "no expression is inlined into a script")
 
         with tempfile.TemporaryDirectory() as tmp:
             repo = make_repo(Path(tmp))
@@ -227,9 +279,8 @@ class CiSelectionTest(unittest.TestCase):
             (repo / "scripts").mkdir(exist_ok=True)
             (repo / "scripts" / "smoke.sh").write_text("#!/bin/sh\necho base-smoke\n", encoding="utf-8")
             (repo / "tests").mkdir(exist_ok=True)
-            (repo / "tests" / "test_intake_eval.py").write_text("import unittest\n", encoding="utf-8")
-            (repo / "tests" / "test_intake.py").write_text("import unittest\n", encoding="utf-8")
-            (repo / "tests" / "test_deliver.py").write_text("import unittest\n", encoding="utf-8")
+            for name in ("test_intake_eval.py", "test_intake.py", "test_deliver.py"):
+                (repo / "tests" / name).write_text("import unittest\n", encoding="utf-8")
             git(repo, "add", ".")
             git(repo, "commit", "-q", "-m", "trusted base")
             base_sha = git(repo, "rev-parse", "HEAD")
@@ -246,25 +297,6 @@ class CiSelectionTest(unittest.TestCase):
                 plan["affected_tests"],
                 ["tests/test_intake_eval.py", "tests/test_intake.py", "tests/test_deliver.py"],
             )
-            wf_exec = subprocess.run(
-                [
-                    "bash",
-                    "-e",
-                    "-c",
-                    f'CHANGED=$(git diff --name-only "{base_sha}"...HEAD)\n'
-                    f'DELETED=$(git diff --diff-filter=D --name-only "{base_sha}"...HEAD)\n'
-                    'TRUSTED_DIR=$(mktemp -d)\n'
-                    'trap \'rm -rf "$TRUSTED_DIR"\' EXIT\n'
-                    f'git archive "{base_sha}" | tar -x -C "$TRUSTED_DIR"\n'
-                    f'{wf_plan_cmd}\n'
-                    'printf "%s" "$PLAN"\n',
-                ],
-                cwd=str(repo),
-                capture_output=True,
-                text=True,
-                check=True,
-            )
-            self.assertEqual(json.loads(wf_exec.stdout)["affected_tests"], plan["affected_tests"])
             self.assertEqual(git(repo, "status", "--porcelain"), "")
 
             (repo / "factory" / "ci_selection.py").write_text(
