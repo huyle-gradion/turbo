@@ -130,13 +130,16 @@ class IntegrationBehaviorTest(unittest.TestCase):
                     ("AC3 unknown", unknown, False, "rejected-provider-error"),
                     ("AC2 moved base, misleading message", approvals, True, "rejected-competing-base"),
                     ("AC2 real race", None, True, "rejected-competing-base"),
+                    ("failed post-405 base re-read", approvals, "reread-fails", "rejected-provider-error"),
                 )
                 for name, msg, moves, expected in cases:
                     with self.subTest(name):
                         git(ctx.bare, "update-ref", f"refs/heads/{b_branch}", ctx.base_sha)
+                        ctx.gh.get_status = 200  # the server hook below fails every GET after the merge request
+                        ctx.gh.on_before_merge = (lambda *_: setattr(ctx.gh, "get_status", 500)) if moves == "reread-fails" else None
                         ctx.gh.merge_status, ctx.gh.merge_override = (405, {"message": msg}) if msg else (200, None)
                         n_put = sum(r["method"] == "PUT" for r in ctx.gh.requests)
-                        res = self._call(ctx, gate, b_branch, on_before_merge=advance_competing_base if moves else None)
+                        res = self._call(ctx, gate, b_branch, on_before_merge=advance_competing_base if moves is True else None)
                         self.assertEqual((res.status, res.outcome, res.landed_sha), (expected, "rejected", None))
                         self.assertFalse(ctx.gh.pulls[1]["merged"])
                         self.assertEqual(sum(r["method"] == "PUT" for r in ctx.gh.requests) - n_put, 1)
@@ -144,13 +147,18 @@ class IntegrationBehaviorTest(unittest.TestCase):
                         self.assertEqual(rec["status"], expected)
                         self.assertIn(rec["mutation_outcome"], ("rejected", "denied"))  # qualification._denial_source == "provider"
                         text = " ".join(rec["blockers"]).lower()
-                        if moves:
+                        if moves is True:
                             self.assertIn("base branch was modified", text)
                         else:
                             self.assertTrue(any(msg in b for b in rec["blockers"]) and any(msg in b for b in res.blockers))
                             self.assertNotIn("base branch was modified", text)
                             self.assertNotIn("competing", text)
-                ctx.gh.merge_status, ctx.gh.merge_override = 200, None
+                            res_text = " ".join(res.blockers).lower()
+                            self.assertNotIn("competing", res_text)
+                            self.assertNotIn("base branch was modified", res_text)
+                            if moves == "reread-fails":
+                                self.assertIn("could not re-read base", text)
+                ctx.gh.merge_status, ctx.gh.merge_override, ctx.gh.get_status, ctx.gh.on_before_merge = 200, None, 200, None
 
     def test_changed_head_and_changed_base(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_str:
