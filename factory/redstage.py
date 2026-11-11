@@ -46,7 +46,7 @@ def red(paths: RuntimePaths, issue: int, *, test: str, selector: str, command: s
         raise UsageError("red needs an explicit --expect marker")
     run = lifecycle.enforce_limits(paths, run)
     run = lifecycle.require_budget(paths, run)
-    gitio.require_clean(paths.repo)
+    gitio.require_clean(paths.repo, operator_repo=True)
     if gitio.branch(paths.repo) != run.branch:
         raise UsageError(f"current branch is not {run.branch}")
     head = gitio.head(paths.repo)
@@ -95,7 +95,7 @@ def stage(paths: RuntimePaths, issue: int, commit: str) -> StageContract:
         raise UsageError(f"issue {issue} is {run.phase}; stage needs red evidence")
     if run.red is None or run.red_sha is None:
         raise UsageError("no red evidence; run red first")
-    gitio.require_clean(paths.repo)
+    gitio.require_clean(paths.repo, operator_repo=True)
     if gitio.branch(paths.repo) != run.branch:
         raise UsageError(f"current branch is not {run.branch}")
     head = gitio.head(paths.repo)

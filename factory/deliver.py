@@ -393,7 +393,7 @@ def _execute_delivery(paths: RuntimePaths, spec: DeliverSpec, *, require_final_a
 
     eff_factory_repo = Path(spec.policy_repo).resolve() if spec.policy_repo else FACTORY_ROOT
     policy_res, policy_blockers = resolve_delivery_policy(spec, eff_factory_repo)
-    factory_dirty = bool(gitio.status_porcelain(eff_factory_repo))
+    factory_dirty = bool(gitio.status_porcelain(eff_factory_repo, operator_repo=True))
     if policy_blockers:
         st = f"policy-{policy_res.status}" if policy_res is not None else "policy-selection-failed"
         fail_policy = {

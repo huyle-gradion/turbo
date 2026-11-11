@@ -50,7 +50,7 @@ def require_passing(run: Run) -> ReplayEvidence:
 def _require_staged(paths: RuntimePaths, run: Run) -> str:
     if run.red is None or run.expected_green_sha is None:
         raise UsageError("no red evidence or staged commit; run red and stage first")
-    if gitio.status_porcelain(paths.repo):
+    if gitio.status_porcelain(paths.repo, operator_repo=True):
         raise PolicyError("working tree is dirty; replay needs a clean tree")
     if gitio.branch(paths.repo) != run.branch:
         raise PolicyError(f"current branch is not {run.branch}")

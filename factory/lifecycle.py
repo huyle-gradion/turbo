@@ -194,7 +194,7 @@ def resume(paths: RuntimePaths, issue: int, pr_state: str) -> ResumeEntry:
     run = require_run(paths, issue)
     reasons: list[str] = []
     current_branch = gitio.branch(paths.repo)
-    dirty_text = gitio.status_porcelain(paths.repo)
+    dirty_text = gitio.status_porcelain(paths.repo, operator_repo=True)
     current_head = gitio.head(paths.repo)
     previous_phase = run.phase
 
