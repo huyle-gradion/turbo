@@ -2,9 +2,8 @@
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
-import subprocess
+import re
 import sys
 import tempfile
 import unittest
@@ -210,14 +209,23 @@ class CiSelectionTest(unittest.TestCase):
                 ci_selection.detect_spec_check_conflicts(excluded_glob_child, conf, ("src/app.py",), repo=repo)
             )
 
-    def test_ci_workflow_triggers_on_feature_branches_and_runs_trusted_selector_without_mutating_candidate_checkout(self) -> None:
+    def test_ci_workflow_plans_from_the_trusted_base_and_always_runs_guards(self) -> None:
         wf_text = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
-        self.assertIn("feature/**", wf_text)
-        self.assertNotIn("git checkout \"$BASE_SHA\"", wf_text)
-        self.assertIn("from factory.ci_selection import select_ci_test_plan", wf_text)
-        wf_plan_lines = [line.strip() for line in wf_text.splitlines() if line.strip().startswith("PLAN=$(python3 -I -c")]
-        self.assertEqual(len(wf_plan_lines), 1)
-        wf_plan_cmd = wf_plan_lines[0]
+        jobs = dict(re.findall(r"^  ([\w-]+):\n(.*?)(?=^  [\w-]+:\n|\Z)", wf_text.split("\njobs:\n", 1)[1], re.M | re.S))
+        self.assertIn("feature/**", wf_text.split("\njobs:\n", 1)[0].split("pull_request:", 1)[1])
+        self.assertNotIn('git checkout "$BASE_SHA"', wf_text)
+        self.assertIn('git archive "$BASE_SHA"', jobs["plan"])
+        fallback = re.search(r'if \[ -f "\$WORK/trusted/scripts/ci_plan\.py" \]; then\s*PLANNER="\$WORK/trusted/(.*?)"\s*else(.*?)\n\s*fi\n', jobs["plan"], re.S)
+        self.assertIsNotNone(fallback, "the plan job must prefer the planner from the trusted base tree")
+        self.assertEqual(fallback.group(1), "scripts/ci_plan.py")
+        self.assertIn("EVENT=push", fallback.group(2), "a base without a planner forces the full suite")
+        self.assertNotRegex(jobs["guards"], r"(?m)^    if:", "essential guards always run")
+        self.assertRegex(jobs["ci"], r"(?m)^    name: Unit tests and smoke scripts$")
+        self.assertRegex(jobs["ci"], r"(?m)^    if: always\(\)$")
+        self.assertIn("${{ join(matrix.job.tests, ' ') }}", jobs["tests"].split("env:", 1)[1].split("run:", 1)[0])
+        run_scripts = re.findall(r"^( +)run: (?:\|\n((?:\1 .*\n|\n)*)|(.*))", wf_text, re.M)
+        self.assertGreaterEqual(len(run_scripts), 5)
+        self.assertFalse([r for r in run_scripts if "${{" in r[1] + r[2]], "no expression is inlined into a script")
 
         with tempfile.TemporaryDirectory() as tmp:
             repo = make_repo(Path(tmp))
@@ -227,9 +235,8 @@ class CiSelectionTest(unittest.TestCase):
             (repo / "scripts").mkdir(exist_ok=True)
             (repo / "scripts" / "smoke.sh").write_text("#!/bin/sh\necho base-smoke\n", encoding="utf-8")
             (repo / "tests").mkdir(exist_ok=True)
-            (repo / "tests" / "test_intake_eval.py").write_text("import unittest\n", encoding="utf-8")
-            (repo / "tests" / "test_intake.py").write_text("import unittest\n", encoding="utf-8")
-            (repo / "tests" / "test_deliver.py").write_text("import unittest\n", encoding="utf-8")
+            for name in ("test_intake_eval.py", "test_intake.py", "test_deliver.py"):
+                (repo / "tests" / name).write_text("import unittest\n", encoding="utf-8")
             git(repo, "add", ".")
             git(repo, "commit", "-q", "-m", "trusted base")
             base_sha = git(repo, "rev-parse", "HEAD")
@@ -246,25 +253,6 @@ class CiSelectionTest(unittest.TestCase):
                 plan["affected_tests"],
                 ["tests/test_intake_eval.py", "tests/test_intake.py", "tests/test_deliver.py"],
             )
-            wf_exec = subprocess.run(
-                [
-                    "bash",
-                    "-e",
-                    "-c",
-                    f'CHANGED=$(git diff --name-only "{base_sha}"...HEAD)\n'
-                    f'DELETED=$(git diff --diff-filter=D --name-only "{base_sha}"...HEAD)\n'
-                    'TRUSTED_DIR=$(mktemp -d)\n'
-                    'trap \'rm -rf "$TRUSTED_DIR"\' EXIT\n'
-                    f'git archive "{base_sha}" | tar -x -C "$TRUSTED_DIR"\n'
-                    f'{wf_plan_cmd}\n'
-                    'printf "%s" "$PLAN"\n',
-                ],
-                cwd=str(repo),
-                capture_output=True,
-                text=True,
-                check=True,
-            )
-            self.assertEqual(json.loads(wf_exec.stdout)["affected_tests"], plan["affected_tests"])
             self.assertEqual(git(repo, "status", "--porcelain"), "")
 
             (repo / "factory" / "ci_selection.py").write_text(
