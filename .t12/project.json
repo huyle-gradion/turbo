@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "name": "turbo",
+  "gates": [
+    { "name": "unit", "command": ["python3", "-m", "unittest", "discover", "-s", "tests", "-q"] },
+    { "name": "smoke", "command": ["bash", "scripts/smoke.sh"] },
+    { "name": "smoke-turbo", "command": ["bash", "scripts/smoke-turbo.sh"] }
+  ],
+  "required_reviews": ["reviewer"],
+  "protected_paths": [".github", "AGENTS.md"],
+  "security_review_paths": ["factory"],
+  "intake": { "adapter": "github-issues", "repo": "huyle-gradion/turbo", "label": "factory" }
+}
